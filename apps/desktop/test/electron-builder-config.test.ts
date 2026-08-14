@@ -47,6 +47,16 @@ const macConfigSchema = z
     icon: z.string().min(1),
     identity: z.string().nullable().optional(),
     notarize: z.boolean(),
+    target: z.tuple([
+      z.object({
+        arch: z.never().optional(),
+        target: z.literal("dmg"),
+      }),
+      z.object({
+        arch: z.never().optional(),
+        target: z.literal("zip"),
+      }),
+    ]),
   })
   .passthrough();
 
@@ -113,6 +123,11 @@ const desktopPackageJsonSchema = z
     // Optional: the desktop app no longer pins per-architecture plugin build
     // binaries, so it may declare none at all.
     optionalDependencies: z.record(z.string(), z.string()).optional(),
+    scripts: z.object({
+      "desktop:build": z.string().min(1),
+      "desktop:build:mac:arm64": z.string().min(1),
+      "desktop:build:mac:x64": z.string().min(1),
+    }),
     type: z.never().optional(),
   })
   .passthrough();
@@ -300,6 +315,32 @@ describe("electron-builder signing config", () => {
     await expect(
       access(resolve(desktopPackageRoot, hookPath)),
     ).resolves.toBeUndefined();
+  });
+
+  it("lets CLI flags select exactly one architecture per matrix job", async () => {
+    const configText = await readFile(
+      resolve(desktopPackageRoot, "electron-builder.config.json"),
+      "utf8",
+    );
+    const config = electronBuilderConfigSchema.parse(JSON.parse(configText));
+    const packageJsonText = await readFile(
+      resolve(desktopPackageRoot, "package.json"),
+      "utf8",
+    );
+    const packageJson = desktopPackageJsonSchema.parse(
+      JSON.parse(packageJsonText),
+    );
+
+    expect(config.mac.target).toEqual([{ target: "dmg" }, { target: "zip" }]);
+    expect(packageJson.scripts["desktop:build:mac:arm64"]).toContain(
+      "--mac --arm64",
+    );
+    expect(packageJson.scripts["desktop:build:mac:x64"]).toContain(
+      "--mac --x64",
+    );
+    expect(packageJson.scripts["desktop:build"]).toContain(
+      "--mac --arm64 --x64",
+    );
   });
 
   it("passes the standalone platform through to better-sqlite3 prebuild-install", () => {
