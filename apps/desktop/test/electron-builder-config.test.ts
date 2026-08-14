@@ -30,6 +30,7 @@ const nativeModulesScript: {
       platform: string;
     };
   };
+  prunePackagedSourceMaps(rootPath: string): Promise<number>;
   resolveBetterSqlite3PrebuildArguments(options: {
     arch: string;
     electronVersion: string;
@@ -382,6 +383,44 @@ describe("electron-builder signing config", () => {
     expect(config.files).toContain("!**/*.map");
   });
 
+  it("prunes dependency source maps that electron-builder still collects", async () => {
+    const appOutDir = await mkdtemp(
+      resolve(tmpdir(), "bb-desktop-source-maps-"),
+    );
+    const nestedDirectory = resolve(
+      appOutDir,
+      "resources",
+      "app.asar.unpacked",
+      "node_modules",
+      "example",
+    );
+    const rootSourceMap = resolve(appOutDir, "main.js.map");
+    const dependencySourceMap = resolve(nestedDirectory, "index.js.map");
+    const runtimeFile = resolve(nestedDirectory, "index.js");
+
+    try {
+      await mkdir(nestedDirectory, { recursive: true });
+      await Promise.all([
+        writeFile(rootSourceMap, "root source map"),
+        writeFile(dependencySourceMap, "dependency source map"),
+        writeFile(runtimeFile, "runtime code"),
+      ]);
+
+      await expect(
+        nativeModulesScript.prunePackagedSourceMaps(appOutDir),
+      ).resolves.toBe(2);
+      await expect(access(rootSourceMap)).rejects.toMatchObject({
+        code: "ENOENT",
+      });
+      await expect(access(dependencySourceMap)).rejects.toMatchObject({
+        code: "ENOENT",
+      });
+      await expect(access(runtimeFile)).resolves.toBeUndefined();
+    } finally {
+      await rm(appOutDir, { force: true, recursive: true });
+    }
+  });
+
   it("copies the app scaffold template as a dedicated file set", async () => {
     const configText = await readFile(
       resolve(desktopPackageRoot, "electron-builder.config.json"),
@@ -534,7 +573,9 @@ describe("electron-builder signing config", () => {
 
     expect(config.appId).toBe("com.playbookmedia.marketing-harness.nightly");
     expect(config.productName).toBe("marketing-harness Nightly");
-    expect(config.artifactName).toBe("marketing-harness-nightly-${version}-${arch}.${ext}");
+    expect(config.artifactName).toBe(
+      "marketing-harness-nightly-${version}-${arch}.${ext}",
+    );
     expect(config.linux.icon).toBe("assets/icon-nightly.png");
     // A shared Linux binary name would let one channel shadow the other on
     // PATH, and the two channels are meant to be installed side by side.
