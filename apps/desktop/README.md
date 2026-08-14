@@ -155,11 +155,13 @@ The rebranded desktop is a separate installation and does not replace or
 auto-migrate an existing `bb` desktop installation.
 
 `build-desktop.yml` builds the macOS arm64 and x64 artifacts in parallel with
-the Linux build, then publishes every architecture from one job. The publisher
-recombines the two macOS updater metadata files before release. The moving
-release resets all of its assets on each publish, so a single publisher is what
-keeps one platform from deleting the other's binaries. Each platform has its
-own update feed file inside the same release tag:
+the Linux build. arm64 uses a native Apple Silicon runner and x64 uses an Intel
+runner. The packaging hook removes production source maps before code signing,
+notarization, and archive compression. One publisher then recombines the two
+macOS updater metadata files before release. The moving release resets all of
+its assets on each publish, so a single publisher is what keeps one platform
+from deleting the other's binaries. Each platform has its own update feed file
+inside the same release tag:
 
 | Platform | Artifacts               | electron-updater metadata | Version feed                 |
 | -------- | ----------------------- | ------------------------- | ---------------------------- |
