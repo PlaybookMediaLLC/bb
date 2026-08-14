@@ -1,5 +1,11 @@
 const { spawn } = require("node:child_process");
-const { chmod, readFile, readdir, writeFile } = require("node:fs/promises");
+const {
+  chmod,
+  readFile,
+  readdir,
+  unlink,
+  writeFile,
+} = require("node:fs/promises");
 const { createRequire } = require("node:module");
 const path = require("node:path");
 
@@ -100,6 +106,35 @@ async function findNativePackageDirectories(rootPath, packageName) {
   return (await findPackageDirectories(rootPath, [packageName])).get(
     packageName,
   );
+}
+
+async function prunePackagedSourceMaps(rootPath) {
+  const pendingDirectories = [rootPath];
+  let removedFileCount = 0;
+
+  while (pendingDirectories.length > 0) {
+    const directoryPath = pendingDirectories.pop();
+    if (directoryPath === undefined) {
+      continue;
+    }
+
+    const entries = await readdir(directoryPath, { withFileTypes: true });
+    await Promise.all(
+      entries.map(async (entry) => {
+        const entryPath = path.join(directoryPath, entry.name);
+        if (entry.isDirectory()) {
+          pendingDirectories.push(entryPath);
+          return;
+        }
+        if (entry.name.endsWith(".map")) {
+          await unlink(entryPath);
+          removedFileCount += 1;
+        }
+      }),
+    );
+  }
+
+  return removedFileCount;
 }
 
 async function chmodIfPresent(filePath, mode) {
@@ -266,6 +301,12 @@ function resolveArchName(context) {
 }
 
 async function afterPack(context) {
+  const removedSourceMapCount = await prunePackagedSourceMaps(
+    context.appOutDir,
+  );
+  console.log(
+    `Removed ${removedSourceMapCount} production source maps before signing.`,
+  );
   await preparePackagedNativeModules(context.appOutDir, {
     arch: resolveArchName(context),
     electronVersion: resolveElectronVersion(),
@@ -322,6 +363,7 @@ async function main() {
 
 module.exports = afterPack;
 module.exports.findNativePackageDirectories = findNativePackageDirectories;
+module.exports.prunePackagedSourceMaps = prunePackagedSourceMaps;
 module.exports.prepareNodePtyPackageDirectory = prepareNodePtyPackageDirectory;
 module.exports.prepareBetterSqlite3PackageDirectory =
   prepareBetterSqlite3PackageDirectory;
