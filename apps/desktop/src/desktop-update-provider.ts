@@ -6,10 +6,10 @@ import {
 export type DesktopReleaseChannel = "latest" | "nightly";
 
 export interface DesktopReleaseInfo {
-  applicationName: "bb" | "bb Nightly";
+  applicationName: "marketing-harness" | "marketing-harness Nightly";
   channel: DesktopReleaseChannel;
   iconFileName: "icon.png" | "icon-nightly.png";
-  releaseTag: "desktop-latest" | "desktop-nightly";
+  releaseTag: "marketing-harness-latest" | "marketing-harness-nightly";
   updateReleaseBaseUrl: string;
 }
 
@@ -17,14 +17,18 @@ export function createDesktopReleaseInfo(
   channel: DesktopReleaseChannel,
 ): DesktopReleaseInfo {
   const nightly = channel === "nightly";
-  const releaseTag = nightly ? "desktop-nightly" : "desktop-latest";
+  const releaseTag = nightly
+    ? "marketing-harness-nightly"
+    : "marketing-harness-latest";
 
   return {
-    applicationName: nightly ? "bb Nightly" : "bb",
+    applicationName: nightly
+      ? "marketing-harness Nightly"
+      : "marketing-harness",
     channel,
     iconFileName: nightly ? "icon-nightly.png" : "icon.png",
     releaseTag,
-    updateReleaseBaseUrl: `https://github.com/get-bb/bb/releases/download/${releaseTag}/`,
+    updateReleaseBaseUrl: `https://github.com/PlaybookMediaLLC/bb/releases/download/${releaseTag}/`,
   };
 }
 

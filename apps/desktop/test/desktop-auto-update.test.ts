@@ -208,7 +208,7 @@ function createDeferredDownload(): DeferredDownload {
 }
 
 describe("desktop auto-update service", () => {
-  it("configures electron-updater for the desktop-latest GitHub release assets", () => {
+  it("configures electron-updater for the marketing-harness-latest GitHub release assets", () => {
     const updater = new DesktopAutoUpdaterAdapterStub();
     const messages = createLoggerMessages();
 

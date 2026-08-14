@@ -147,8 +147,10 @@ CI enforces this lockstep. Direct edits that leave
 versions fail the build. Never edit either package version directly for a
 release; use `scripts/bump-version.mjs` so both files move together.
 
-The desktop release tag uses the locked version: `desktop-v<version>` for
-immutable releases and `desktop-latest` for the moving pointer.
+The desktop release tag uses the locked version: `marketing-harness-v<version>` for
+immutable releases and `marketing-harness-latest` for the moving pointer.
+Pushing that version tag runs the complete stable build and publication
+pipeline. Manual workflow dispatch remains available for QA builds.
 
 `build-desktop.yml` builds macOS and Linux in parallel jobs, then publishes
 both from one job. The moving release resets all of its assets on each publish,
@@ -179,17 +181,18 @@ a dry run validates only the npm package path.
 
 The nightly desktop is a separate installation:
 
-- product name: `bb Nightly`
-- bundle identifier: `dev.bb.desktop.nightly`
-- Linux binary name: `bb-nightly`, so it never shadows stable `bb` on PATH
-- app/update release: `desktop-nightly`
+- product name: `marketing-harness Nightly`
+- bundle identifier: `com.playbookmedia.marketing-harness.nightly`
+- Linux binary name: `marketing-harness-nightly`, so it never shadows stable
+  `marketing-harness` on PATH
+- app/update release: `marketing-harness-nightly`
 - update metadata: `nightly-mac.yml` and `nightly-linux.yml`
 - version feeds: `desktop-version.json` (macOS) and
   `desktop-version-linux.json` (Linux)
 - icon: `assets/icon-nightly.icns` and `assets/icon-nightly.png`
 
 Download it from
-[`desktop-nightly`](https://github.com/get-bb/bb/releases/tag/desktop-nightly)
+[`marketing-harness-nightly`](https://github.com/PlaybookMediaLLC/bb/releases/tag/marketing-harness-nightly)
 or run the CLI build with:
 
 ```bash
@@ -223,12 +226,13 @@ GitHub Actions secrets:
 | `APPLE_APP_PASSWORD`         | App-specific password from `appleid.apple.com` under Sign-In and Security.                                                                                                             |
 | `APPLE_TEAM_ID`              | Developer Team ID from `developer.apple.com/account` membership details.                                                                                                               |
 
-Once those secrets are present, the next `Build Desktop` workflow run with
+Once those secrets are present, the next `Build marketing-harness Desktop`
+workflow run with
 `publish=true` and `release_channel=stable` signs the `.app`, notarizes it, and
-publishes the signed `.dmg` / `.zip` assets to `desktop-latest`. If no required
+publishes the signed `.dmg` / `.zip` assets to `marketing-harness-latest`. If no required
 signing secrets are configured, the workflow still builds unsigned artifacts, but
 the release job publishes only `desktop-version.json` and withholds unsigned
-binaries from `desktop-latest`. If only some required signing secrets are set,
+binaries from `marketing-harness-latest`. If only some required signing secrets are set,
 the workflow fails before packaging so a misconfigured release cannot silently
 produce unsigned or signed-but-not-notarized artifacts.
 
@@ -236,14 +240,14 @@ produce unsigned or signed-but-not-notarized artifacts.
 
 The renderer update toast keeps using `desktop-version.json` as the lightweight
 feature surface. The installer path uses `electron-updater` against the same
-`desktop-latest` release asset directory and reads `latest-mac.yml`. These
+`marketing-harness-latest` release asset directory and reads `latest-mac.yml`. These
 checks run in parallel on launch, hourly, and when the app becomes active: the
 JSON feed can show "update available" even when CI has published metadata only,
 while the Electron updater only flips the toast to "ready to install" after a
 signed update has actually downloaded. Local dev builds skip Electron auto-update
 unless `BB_DESKTOP_AUTO_UPDATE=1` is set.
 
-`bb Nightly` follows the equivalent isolated `desktop-nightly` release and
+`marketing-harness Nightly` follows the equivalent isolated `marketing-harness-nightly` release and
 `nightly-mac.yml`; it never reads or moves the stable feed. The scheduled
 workflow requires the complete signing/notarization secret set before
 publishing nightly desktop assets.
@@ -251,8 +255,8 @@ publishing nightly desktop assets.
 To verify a downloaded or unpacked build:
 
 ```bash
-spctl --assess --verbose /path/to/bb.app
-codesign --verify --deep --strict --verbose=2 /path/to/bb.app
+spctl --assess --verbose /path/to/marketing-harness.app
+codesign --verify --deep --strict --verbose=2 /path/to/marketing-harness.app
 ```
 
 ## Debugging

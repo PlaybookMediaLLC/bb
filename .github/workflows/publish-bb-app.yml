@@ -41,6 +41,7 @@ concurrency:
   cancel-in-progress: false
 
 env:
+  MARKETING_HARNESS_RELEASE_REPOSITORY: ${{ github.repository }}
   RELEASE_ALLOW_PRERELEASE_LATEST: ${{ github.event_name == 'schedule' && 'false' || inputs.allow_prerelease_latest }}
   RELEASE_DRY_RUN: ${{ github.event_name == 'schedule' && 'false' || inputs.dry_run }}
   RELEASE_NPM_TAG: ${{ github.event_name == 'schedule' && 'nightly' || inputs.npm_tag }}
@@ -225,7 +226,7 @@ jobs:
           } >> "$GITHUB_STEP_SUMMARY"
 
   nightly-desktop-macos:
-    name: Build bb Nightly desktop (macOS)
+    name: Build marketing-harness Nightly desktop (macOS)
     if: ${{ github.event_name == 'schedule' || (inputs.npm_tag == 'nightly' && inputs.dry_run == false) }}
     needs: publish
     runs-on: macos-15-intel
@@ -336,7 +337,7 @@ jobs:
       - name: Upload nightly desktop workflow artifacts
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
-          name: bb-nightly-desktop-macos-arm64-x64-${{ steps.nightly_version.outputs.version }}
+          name: marketing-harness-nightly-desktop-macos-arm64-x64-${{ steps.nightly_version.outputs.version }}
           retention-days: 14
           path: |
             apps/desktop/release/*.dmg
@@ -347,7 +348,7 @@ jobs:
           if-no-files-found: error
 
   nightly-desktop-linux:
-    name: Build bb Nightly desktop (Linux)
+    name: Build marketing-harness Nightly desktop (Linux)
     if: ${{ github.event_name == 'schedule' || (inputs.npm_tag == 'nightly' && inputs.dry_run == false) }}
     needs: publish
     # Pinned rather than ubuntu-latest so the glibc the AppImage links against
@@ -422,7 +423,7 @@ jobs:
       - name: Upload nightly desktop workflow artifacts
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
-          name: bb-nightly-desktop-linux-x64-${{ steps.nightly_version.outputs.version }}
+          name: marketing-harness-nightly-desktop-linux-x64-${{ steps.nightly_version.outputs.version }}
           retention-days: 14
           path: |
             apps/desktop/release/*.AppImage
@@ -432,7 +433,7 @@ jobs:
           if-no-files-found: error
 
   nightly-desktop-publish:
-    name: Publish bb Nightly desktop
+    name: Publish marketing-harness Nightly desktop
     needs:
       - nightly-desktop-macos
       - nightly-desktop-linux
@@ -460,18 +461,18 @@ jobs:
             exit 1
           fi
 
-          echo "Publishing bb Nightly ${MACOS_VERSION} for macOS and Linux."
+          echo "Publishing marketing-harness Nightly ${MACOS_VERSION} for macOS and Linux."
 
       - name: Download macOS nightly desktop artifacts
         uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
         with:
-          name: bb-nightly-desktop-macos-arm64-x64-${{ needs.nightly-desktop-macos.outputs.version }}
+          name: marketing-harness-nightly-desktop-macos-arm64-x64-${{ needs.nightly-desktop-macos.outputs.version }}
           path: release/macos
 
       - name: Download Linux nightly desktop artifacts
         uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
         with:
-          name: bb-nightly-desktop-linux-x64-${{ needs.nightly-desktop-linux.outputs.version }}
+          name: marketing-harness-nightly-desktop-linux-x64-${{ needs.nightly-desktop-linux.outputs.version }}
           path: release/linux
 
       - name: Publish moving nightly desktop release
@@ -481,7 +482,7 @@ jobs:
         run: |
           set -euo pipefail
 
-          nightly_tag="desktop-nightly"
+          nightly_tag="marketing-harness-nightly"
           macos_dir="release/macos"
           linux_dir="release/linux"
 
@@ -525,8 +526,8 @@ jobs:
           if gh release view "$nightly_tag" >/dev/null 2>&1; then
             gh release edit "$nightly_tag" \
               --target "$GITHUB_SHA" \
-              --title "bb Nightly" \
-              --notes "Latest automated bb Nightly build from main. Nightly builds may be unstable." \
+              --title "marketing-harness Nightly" \
+              --notes "Latest automated marketing-harness Nightly build from main. Nightly builds may be unstable." \
               --prerelease \
               --latest=false
 
@@ -540,8 +541,8 @@ jobs:
           else
             gh release create "$nightly_tag" "${release_assets[@]}" \
               --target "$GITHUB_SHA" \
-              --title "bb Nightly" \
-              --notes "Latest automated bb Nightly build from main. Nightly builds may be unstable." \
+              --title "marketing-harness Nightly" \
+              --notes "Latest automated marketing-harness Nightly build from main. Nightly builds may be unstable." \
               --prerelease \
               --latest=false
           fi
@@ -551,13 +552,13 @@ jobs:
           VERSION: ${{ needs.nightly-desktop-macos.outputs.version }}
         run: |
           {
-            echo "## bb Nightly desktop"
+            echo "## marketing-harness Nightly desktop"
             echo
             echo "- version: \`$VERSION\`"
-            echo "- app identity: \`dev.bb.desktop.nightly\`"
+            echo "- app identity: \`com.playbookmedia.marketing-harness.nightly\`"
             echo "- platforms: macOS arm64 + x64 (signed), Linux x64 AppImage"
-            echo "- release: https://github.com/get-bb/bb/releases/tag/desktop-nightly"
-            echo "- macOS update feed: https://github.com/get-bb/bb/releases/download/desktop-nightly/desktop-version.json"
-            echo "- Linux update feed: https://github.com/get-bb/bb/releases/download/desktop-nightly/desktop-version-linux.json"
+            echo "- release: https://github.com/${GITHUB_REPOSITORY}/releases/tag/marketing-harness-nightly"
+            echo "- macOS update feed: https://github.com/${GITHUB_REPOSITORY}/releases/download/marketing-harness-nightly/desktop-version.json"
+            echo "- Linux update feed: https://github.com/${GITHUB_REPOSITORY}/releases/download/marketing-harness-nightly/desktop-version-linux.json"
             echo "- retention for workflow artifacts: 14 days"
           } >> "$GITHUB_STEP_SUMMARY"

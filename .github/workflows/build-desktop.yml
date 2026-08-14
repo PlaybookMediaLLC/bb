@@ -1,6 +1,9 @@
-name: Build Desktop
+name: Build marketing-harness Desktop
 
 on:
+  push:
+    tags:
+      - "marketing-harness-v*"
   workflow_dispatch:
     inputs:
       publish:
@@ -9,7 +12,7 @@ on:
         type: boolean
         default: false
       release_channel:
-        description: "Release channel. Only stable can update desktop-latest."
+        description: "Release channel. Only stable can update marketing-harness-latest."
         required: true
         type: choice
         default: qa
@@ -19,6 +22,7 @@ on:
 
 env:
   CSC_IDENTITY_AUTO_DISCOVERY: "false"
+  MARKETING_HARNESS_RELEASE_REPOSITORY: ${{ github.repository }}
   NODE_VERSION: "22.x"
   PNPM_VERSION: "9.15.0"
 
@@ -129,7 +133,7 @@ jobs:
       - name: Upload desktop workflow artifacts
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
-          name: bb-desktop-macos-arm64-x64
+          name: marketing-harness-desktop-macos-arm64-x64
           path: |
             apps/desktop/release/*.dmg
             apps/desktop/release/*.zip
@@ -190,7 +194,7 @@ jobs:
       - name: Upload desktop workflow artifacts
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
-          name: bb-desktop-linux-x64
+          name: marketing-harness-desktop-linux-x64
           path: |
             apps/desktop/release/*.AppImage
             apps/desktop/release/*.blockmap
@@ -218,12 +222,17 @@ jobs:
         id: release_plan
         env:
           HAS_SIGNING_SECRETS: ${{ needs.macos.outputs.has_signing_secrets }}
-          INPUT_PUBLISH: ${{ inputs.publish }}
-          RELEASE_CHANNEL: ${{ inputs.release_channel }}
+          INPUT_PUBLISH: ${{ github.event_name == 'push' || inputs.publish }}
+          RELEASE_CHANNEL: ${{ github.event_name == 'push' && 'stable' || inputs.release_channel }}
         run: |
           set -euo pipefail
 
           VERSION="$(node -p "require('./apps/desktop/package.json').version")"
+          EXPECTED_TAG="marketing-harness-v${VERSION}"
+          if [[ "${GITHUB_EVENT_NAME}" == "push" && "${GITHUB_REF_NAME}" != "$EXPECTED_TAG" ]]; then
+            echo "::error::Release tag ${GITHUB_REF_NAME} does not match desktop package version ${VERSION}; expected ${EXPECTED_TAG}."
+            exit 1
+          fi
           IS_PRERELEASE="false"
           if [[ "$VERSION" == *-* ]]; then
             IS_PRERELEASE="true"
@@ -254,14 +263,14 @@ jobs:
         if: steps.release_plan.outputs.should_publish == 'true'
         uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
         with:
-          name: bb-desktop-macos-arm64-x64
+          name: marketing-harness-desktop-macos-arm64-x64
           path: release/macos
 
       - name: Download Linux desktop artifacts
         if: steps.release_plan.outputs.should_publish == 'true'
         uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
         with:
-          name: bb-desktop-linux-x64
+          name: marketing-harness-desktop-linux-x64
           path: release/linux
 
       - name: Publish stable desktop release feed
@@ -273,8 +282,8 @@ jobs:
         run: |
           set -euo pipefail
 
-          VERSION_TAG="desktop-v${VERSION}"
-          LATEST_TAG="desktop-latest"
+          VERSION_TAG="marketing-harness-v${VERSION}"
+          LATEST_TAG="marketing-harness-latest"
           MACOS_DIR="release/macos"
           LINUX_DIR="release/linux"
 
@@ -324,8 +333,8 @@ jobs:
 
           gh release create "$VERSION_TAG" "${RELEASE_ASSETS[@]}" \
             --target "$GITHUB_SHA" \
-            --title "bb desktop ${VERSION}" \
-            --notes "bb desktop ${VERSION}" \
+            --title "marketing-harness desktop ${VERSION}" \
+            --notes "marketing-harness desktop ${VERSION}" \
             --latest
 
           git tag -f "$LATEST_TAG" "$GITHUB_SHA"
@@ -334,11 +343,11 @@ jobs:
           if gh release view "$LATEST_TAG" >/dev/null 2>&1; then
             gh release edit "$LATEST_TAG" \
               --target "$GITHUB_SHA" \
-              --title "bb desktop latest" \
-              --notes "Latest stable bb desktop release metadata." \
+              --title "marketing-harness desktop latest" \
+              --notes "Latest stable marketing-harness desktop release metadata." \
               --latest=false
 
-            # desktop-latest is a moving release, but --clobber only replaces
+            # marketing-harness-latest is a moving release, but --clobber only replaces
             # assets with matching names. Preserve the release page and reset
             # assets in-place so versioned binaries cannot accumulate and
             # JSON-only publishes cannot leave stale binaries from an older
@@ -353,8 +362,8 @@ jobs:
           else
             gh release create "$LATEST_TAG" "${RELEASE_ASSETS[@]}" \
               --target "$GITHUB_SHA" \
-              --title "bb desktop latest" \
-              --notes "Latest stable bb desktop release metadata." \
+              --title "marketing-harness desktop latest" \
+              --notes "Latest stable marketing-harness desktop release metadata." \
               --latest=false
           fi
 
@@ -366,7 +375,7 @@ jobs:
           VERSION: ${{ steps.release_plan.outputs.version }}
         run: |
           {
-            echo "## bb desktop artifacts"
+            echo "## marketing-harness desktop artifacts"
             echo
             echo "- arm64 and x64 macOS .dmg/.zip artifacts, latest-mac.yml, and desktop-version.json uploaded as workflow artifacts"
             echo "- x64 Linux .AppImage, latest-linux.yml, and desktop-version-linux.json uploaded as workflow artifacts"
@@ -374,6 +383,6 @@ jobs:
             echo "- prerelease version: ${IS_PRERELEASE}"
             echo "- stable release publication requested and allowed: ${SHOULD_PUBLISH}"
             echo "- macOS release binary upload enabled: ${PUBLISH_MACOS_BINARIES}"
-            echo "- macOS feed URL: https://github.com/get-bb/bb/releases/download/desktop-latest/desktop-version.json"
-            echo "- Linux feed URL: https://github.com/get-bb/bb/releases/download/desktop-latest/desktop-version-linux.json"
+            echo "- macOS feed URL: https://github.com/${GITHUB_REPOSITORY}/releases/download/marketing-harness-latest/desktop-version.json"
+            echo "- Linux feed URL: https://github.com/${GITHUB_REPOSITORY}/releases/download/marketing-harness-latest/desktop-version-linux.json"
           } >> "$GITHUB_STEP_SUMMARY"
