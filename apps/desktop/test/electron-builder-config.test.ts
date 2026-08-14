@@ -52,7 +52,7 @@ const macConfigSchema = z
 const linuxConfigSchema = z
   .object({
     category: z.literal("Development"),
-    executableName: z.enum(["bb", "bb-nightly"]),
+    executableName: z.enum(["marketing-harness", "marketing-harness-nightly"]),
     icon: z.string().min(1),
     target: z.tuple([
       z
@@ -484,7 +484,7 @@ describe("electron-builder signing config", () => {
 
     expect(config.linux).toMatchObject({
       category: "Development",
-      executableName: "bb",
+      executableName: "marketing-harness",
       target: [{ arch: ["x64"], target: "AppImage" }],
     });
     await expect(
@@ -513,7 +513,7 @@ describe("electron-builder signing config", () => {
     }
   });
 
-  it("keeps the updater provider pointed at desktop-latest release assets", async () => {
+  it("keeps the updater provider pointed at marketing-harness-latest release assets", async () => {
     const configText = await readFile(
       resolve(desktopPackageRoot, "electron-builder.config.json"),
       "utf8",
@@ -522,7 +522,7 @@ describe("electron-builder signing config", () => {
 
     expect(config.publish[0]).toMatchObject(DESKTOP_AUTO_UPDATE_FEED_CONFIG);
     expect(DESKTOP_AUTO_UPDATE_FEED_CONFIG.url).toBe(
-      "https://github.com/get-bb/bb/releases/download/desktop-latest/",
+      "https://github.com/PlaybookMediaLLC/bb/releases/download/marketing-harness-latest/",
     );
   });
 
@@ -532,13 +532,13 @@ describe("electron-builder signing config", () => {
     });
     const nightlyRelease = createDesktopReleaseInfo("nightly");
 
-    expect(config.appId).toBe("dev.bb.desktop.nightly");
-    expect(config.productName).toBe("bb Nightly");
-    expect(config.artifactName).toBe("bb-nightly-${version}-${arch}.${ext}");
+    expect(config.appId).toBe("com.playbookmedia.marketing-harness.nightly");
+    expect(config.productName).toBe("marketing-harness Nightly");
+    expect(config.artifactName).toBe("marketing-harness-nightly-${version}-${arch}.${ext}");
     expect(config.linux.icon).toBe("assets/icon-nightly.png");
     // A shared Linux binary name would let one channel shadow the other on
     // PATH, and the two channels are meant to be installed side by side.
-    expect(config.linux.executableName).toBe("bb-nightly");
+    expect(config.linux.executableName).toBe("marketing-harness-nightly");
     expect(config.mac.icon).toBe("assets/icon-nightly.icns");
     await expect(
       access(resolve(desktopPackageRoot, config.mac.icon)),

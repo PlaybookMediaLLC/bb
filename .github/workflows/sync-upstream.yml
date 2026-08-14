@@ -1,0 +1,44 @@
+name: Sync upstream branch
+
+on:
+  schedule:
+    - cron: "17 */12 * * *"
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+concurrency:
+  group: sync-upstream-branch
+  cancel-in-progress: true
+
+jobs:
+  sync:
+    name: Mirror upstream main
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+
+    steps:
+      - name: Checkout fork
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: 0
+
+      - name: Fetch upstream main
+        run: git fetch --no-tags https://github.com/get-bb/bb.git main
+
+      - name: Update upstream branch
+        # The explicit lease prevents this scheduled mirror from overwriting a
+        # branch update that landed after the remote state was observed.
+        run: |
+          remote_sha="$(git ls-remote --heads origin refs/heads/upstream | awk '{print $1}')"
+          git push --force-with-lease="refs/heads/upstream:${remote_sha}" origin FETCH_HEAD:refs/heads/upstream
+
+      - name: Summarize
+        run: |
+          {
+            echo "## Upstream sync"
+            echo
+            echo "Mirrored get-bb/bb main to ${GITHUB_REPOSITORY}@upstream."
+            echo "Commit: $(git rev-parse FETCH_HEAD)"
+          } >> "$GITHUB_STEP_SUMMARY"

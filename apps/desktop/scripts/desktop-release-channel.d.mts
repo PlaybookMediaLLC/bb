@@ -7,13 +7,15 @@ export interface DesktopUpdateMetadataFileNames {
 }
 
 export interface DesktopReleaseConfig {
-  appId: "dev.bb.desktop" | "dev.bb.desktop.nightly";
-  applicationName: "bb" | "bb Nightly";
+  appId:
+    | "com.playbookmedia.marketing-harness"
+    | "com.playbookmedia.marketing-harness.nightly";
+  applicationName: "marketing-harness" | "marketing-harness Nightly";
   artifactName: string;
   iconFileName: "icon.png" | "icon-nightly.png";
-  linuxExecutableName: "bb" | "bb-nightly";
+  linuxExecutableName: "marketing-harness" | "marketing-harness-nightly";
   macIconPath: "assets/icon.icns" | "assets/icon-nightly.icns";
-  releaseTag: "desktop-latest" | "desktop-nightly";
+  releaseTag: "marketing-harness-latest" | "marketing-harness-nightly";
   updateMetadataFileNames: DesktopUpdateMetadataFileNames;
 }
 
