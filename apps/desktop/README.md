@@ -112,7 +112,7 @@ Linux gets both update paths, but they are not equivalent:
   install and reports that a newer release exists.
 - Self-installing auto-update runs only inside an AppImage whose directory the
   app can write to. electron-updater detects the AppImage through the `APPIMAGE`
-  environment variable, and its install step unlinks the running file *before*
+  environment variable, and its install step unlinks the running file _before_
   moving the replacement in — so a read-only directory would delete the app and
   leave nothing behind. Both the startup check and the install handler verify
   write and search access on the parent directory first.
@@ -154,11 +154,12 @@ pipeline. Manual workflow dispatch remains available for QA builds.
 The rebranded desktop is a separate installation and does not replace or
 auto-migrate an existing `bb` desktop installation.
 
-`build-desktop.yml` builds macOS and Linux in parallel jobs, then publishes
-both from one job. The moving release resets all of its assets on each publish,
-so a single publisher is what keeps one platform from deleting the other's
-binaries. Each platform has its own update feed file inside the same release
-tag:
+`build-desktop.yml` builds the macOS arm64 and x64 artifacts in parallel with
+the Linux build, then publishes every architecture from one job. The publisher
+recombines the two macOS updater metadata files before release. The moving
+release resets all of its assets on each publish, so a single publisher is what
+keeps one platform from deleting the other's binaries. Each platform has its
+own update feed file inside the same release tag:
 
 | Platform | Artifacts               | electron-updater metadata | Version feed                 |
 | -------- | ----------------------- | ------------------------- | ---------------------------- |
