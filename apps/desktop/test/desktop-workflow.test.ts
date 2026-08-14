@@ -12,10 +12,16 @@ type WorkflowStep = {
 type DesktopWorkflow = {
   jobs: {
     macos: {
+      "runs-on": string;
       steps: WorkflowStep[];
       strategy: {
         matrix: {
           arch: string[];
+          include: Array<{
+            arch: string;
+            host_arch: string;
+            runner: string;
+          }>;
         };
       };
     };
@@ -48,6 +54,11 @@ describe("desktop release workflow", () => {
   it("signs and notarizes macOS architectures in parallel", async () => {
     const workflow = await readDesktopWorkflow();
     expect(workflow.jobs.macos.strategy.matrix.arch).toEqual(["arm64", "x64"]);
+    expect(workflow.jobs.macos["runs-on"]).toBe("${{ matrix.runner }}");
+    expect(workflow.jobs.macos.strategy.matrix.include).toEqual([
+      { arch: "arm64", host_arch: "arm64", runner: "macos-15" },
+      { arch: "x64", host_arch: "x86_64", runner: "macos-15-intel" },
+    ]);
 
     const packageStep = requireStep(
       workflow.jobs.macos.steps,
