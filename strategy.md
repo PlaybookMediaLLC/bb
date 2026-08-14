@@ -982,6 +982,52 @@ Exit criteria:
 - Duplicate execution cannot duplicate spend.
 - Unexpected spend or state drift triggers a deterministic stop path.
 
+### Phase 7: Marketing Agent OS
+
+The long-term product should become the control plane for agent-operated marketing. Earlier phases prove individual closed loops; this phase makes multiple agents durable members of a governed marketing organization.
+
+Deliver:
+
+- durable agent identities, roles, capabilities, and ownership boundaries
+- brand-scoped and campaign-scoped agent teams
+- objective assignment with measurable success criteria
+- delegated permissions and time-bounded authority
+- agent-specific channel, budget, claim, and approval policies
+- coordination across research, strategy, copy, creative, distribution, and analysis agents
+- workload queues, priorities, dependencies, service levels, and escalation paths
+- model routing by task quality, cost, latency, privacy, and tool requirements
+- automatic fallback between eligible models without changing campaign ownership
+- agent activity, decision, cost, and outcome histories
+- cross-agent handoffs through typed domain artifacts rather than hidden transcript context
+- reusable marketing-team templates for founder-led, growth, agency, and enterprise operations
+- portfolio-level operation across multiple isolated Brand workspaces
+- human intervention controls for pause, reassignment, correction, and emergency shutdown
+
+The control plane must answer six questions for every operating agent:
+
+1. **Memory:** What does this company know, believe, permit, and prohibit?
+2. **Objectives:** Which measurable business result does the agent own?
+3. **Capabilities:** Which tools, models, channels, data, and actions may it use?
+4. **Governance:** Which actions require approval, and which limits can never be overridden?
+5. **Coordination:** Which agent owns each responsibility, dependency, and handoff?
+6. **Accountability:** What did the agent decide, execute, spend, and achieve?
+
+Acceptance workflow:
+
+> Build and operate a marketing team for this brand. Generate qualified pipeline for the approved ICP, coordinate the organic campaign across eligible channels, stay within the configured model and execution budget, request approval for consequential actions, and recommend the next experiment from measured results.
+
+Exit criteria:
+
+- A founder can assign a business outcome without manually decomposing the marketing work.
+- Each agent operates within explicit role, data, tool, budget, and approval boundaries.
+- Agent handoffs remain inspectable, typed, resumable, and independent of one model vendor.
+- The system can explain which agent made each decision and which evidence supported it.
+- Model and execution costs are attributable to a Brand, Campaign, objective, and agent.
+- A failed, unavailable, or degraded model can be replaced without losing durable work state.
+- Multiple Brand workspaces operate concurrently without memory, credential, or policy leakage.
+- Human operators can pause or constrain the entire marketing team deterministically.
+- The system demonstrates repeatable marketing outcomes across internal products before external commercialization.
+
 ## Explicit non-goals for the initial release
 
 The first release will not:
@@ -1003,7 +1049,31 @@ Initial positioning:
 
 Long-term positioning:
 
-> An AI-native marketing department operating system.
+> The control plane for agent-operated marketing.
+
+Long-term category:
+
+> Marketing Agent OS: the operating system where companies deploy, govern, and improve AI agents that run marketing on their behalf.
+
+Founder-facing promise:
+
+> Your always-on AI marketing team, governed by you.
+
+Expanded positioning:
+
+> Give Marketing Harness your company knowledge and business goal. Its agents research, plan, create, publish, measure, and improve campaigns while you control the brand, permissions, budget, and approvals.
+
+The category narrative is that existing marketing software was built for humans clicking through disconnected tools. Agent-operated companies need a new control layer that gives agents durable memory, measurable objectives, bounded capabilities, governance, coordination, and accountability.
+
+Marketing Harness should not compete primarily as a copy generator, generic assistant, or scheduler:
+
+- generation products create individual artifacts
+- CRM and marketing-automation products store records and execute configured funnels
+- publishing products distribute completed assets
+- agencies supply human labor and coordination
+- Marketing Harness operates and governs the complete agent-run marketing function across those systems
+
+The word **Harness** should communicate both leverage and control: the product coordinates powerful agents while keeping their authority observable and bounded.
 
 The initial promise is intentionally narrower and more credible. The product earns the larger positioning by demonstrating safe, closed-loop execution over time.
 
