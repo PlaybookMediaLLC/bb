@@ -165,6 +165,301 @@ It stores:
 
 Agents should not silently convert a weak observation into a permanent brand fact. Important memories require provenance and, where appropriate, approval.
 
+## Website-to-outcome onboarding
+
+The default founder experience should begin with the company website rather than an empty assistant. Marketing Harness should use public company evidence to draft a specialized marketing agent, verify that understanding with the founder, produce an ICP, and then work toward a measurable business outcome under explicit approval policy.
+
+This experience may feel similar to the URL-first setup offered by products such as Cossistant or Chatbase, but the output is fundamentally different. Marketing Harness is not merely creating a support chatbot over scraped pages. It is creating a governed marketing knowledge base and a supervised operating agent that can plan campaigns, produce assets, coordinate distribution, and report results.
+
+```mermaid
+flowchart LR
+    A[Company URL] --> B[Public-source discovery]
+    B --> C[Evidence and source snapshots]
+    C --> D[Business and brand extraction]
+    D --> E[Draft Brand Memory and ICP]
+    E --> F[Founder verification]
+    F --> G[Approved company model]
+    G --> H[Outcome selection]
+    H --> I[Campaign planning and production]
+    I --> J[Approval packet]
+    J --> K[Publishing and measurement]
+    K --> L[Reviewed learnings]
+    L --> G
+```
+
+### Founder experience
+
+The founder's responsibilities should be limited to the decisions where human context and accountability matter most:
+
+- provide the company URL and optional source material
+- correct the system's understanding of the business
+- identify the most valuable customer and current objective
+- confirm which claims are true and publishable
+- define deadlines, budgets, channels, and risk constraints
+- approve consequential actions
+
+Marketing Harness should handle:
+
+- public research and source collection
+- business, product, customer, and brand analysis
+- ICP and positioning hypotheses
+- campaign planning
+- copy and creative production
+- channel adaptation and scheduling
+- delivery reconciliation
+- performance reporting and next-step recommendations
+
+The product should therefore behave like a supervised marketing chief of staff. The founder provides goals, constraints, company truth, and approvals. Marketing Harness performs research, planning, production, coordination, execution, and reporting.
+
+### Step 1: provide the company website
+
+The founder enters a primary company URL. They may optionally add product documentation, sales material, customer research, public social profiles, or files that are not linked from the main website.
+
+The system discovers and prioritizes public sources such as:
+
+- home, about, product, feature, solution, and use-case pages
+- pricing, comparison, integration, and partner pages
+- customer stories, testimonials, case studies, and review links
+- blog, resource, documentation, help, and changelog pages
+- careers, press, investor, legal, privacy, and terms pages
+- XML sitemaps, page metadata, and structured data
+- linked public documents and downloadable assets
+- official public social profiles and video channels
+- public interviews, podcasts, press coverage, and directory listings
+
+Collection must respect robots.txt, authentication boundaries, provider terms, reasonable rate limits, and deletion requests. The system should never bypass access controls or present private, inferred, or third-party material as company-approved truth.
+
+### Step 2: preserve evidence before interpretation
+
+The ingestion layer should create source snapshots before agents derive conclusions. A snapshot records:
+
+- canonical URL and source type
+- retrieval time and content fingerprint
+- extracted title, text, metadata, and structured data
+- source ownership and first-party or third-party classification
+- freshness and accessibility state
+- links to any derived observations
+
+Every meaningful conclusion should retain provenance. The product must distinguish four knowledge states:
+
+1. **Observed fact**: directly supported by a cited source.
+2. **Reasonable inference**: derived from several observations but not explicitly stated.
+3. **Unverified hypothesis**: useful for planning but awaiting confirmation or evidence.
+4. **Founder-approved truth**: explicitly confirmed for use in marketing operations.
+
+Conflicting sources should remain visible rather than being silently reconciled. The newest page is not automatically the most authoritative page, and third-party claims should not override first-party policy without review.
+
+### Step 3: draft the company model
+
+The Research Agent converts source evidence into a structured draft covering:
+
+- company description, category, stage, and business model
+- products, plans, features, integrations, and pricing
+- problems solved and customer outcomes promised
+- target markets, industries, geographies, and company sizes
+- existing positioning, value propositions, and differentiators
+- direct competitors, indirect alternatives, and the status quo
+- proof points, testimonials, customers, case studies, and quantified claims
+- acquisition calls to action and existing conversion paths
+- legal, regulatory, policy, and brand constraints
+- public channel presence and observed publishing patterns
+
+The extraction process should also identify contradictions, missing evidence, stale pages, and unsupported claims. These become verification questions rather than hidden uncertainties.
+
+### Step 4: infer brand voice
+
+The system drafts a voice profile from representative first-party writing. It should analyze:
+
+- vocabulary and recurring phrases
+- sentence length and structural rhythm
+- level of formality and technical depth
+- use of humor, urgency, emotion, and metaphor
+- preferred perspective, such as founder-led, company-led, or customer-led
+- headline, call-to-action, and social-post patterns
+- words, claims, topics, and tones to avoid
+- differences between company, founder, product, and support voices
+
+The voice profile should include citations and representative examples. Frequency alone does not imply preference. A phrase copied across SEO templates may be less meaningful than a founder letter or carefully written product page.
+
+### Step 5: draft the customer and ICP model
+
+Marketing Harness should use the public evidence to produce an ICP hypothesis, not claim certainty about who actually buys. The draft should include:
+
+- primary and secondary ICPs
+- buyer, champion, user, blocker, and economic-buyer roles
+- jobs-to-be-done
+- pains, desired outcomes, and switching triggers
+- objections, anxieties, and perceived risks
+- company size, maturity, industry, geography, and technology signals
+- ability and willingness to pay
+- where the audience gathers and which channels are plausible
+- disqualifying characteristics and poor-fit segments
+- evidence supporting each conclusion
+- confidence and the questions required to validate it
+
+Website messaging frequently reflects an aspirational market rather than the customers that retain, expand, and advocate. The ICP cannot become trusted Brand Memory until the founder verifies it or outcome data supports it.
+
+### Step 6: founder verification
+
+The system presents a concise onboarding report rather than exposing raw crawl output. The report contains:
+
+- business summary
+- product catalog
+- positioning and differentiation
+- brand and founder voice guides
+- customer and ICP hypotheses
+- approved, questionable, and unsupported claims
+- known competitors and alternatives
+- recommended initial marketing opportunities
+- contradictions and high-impact questions
+
+The founder then completes a short correction interview:
+
+1. What did we misunderstand about the company or product?
+2. Which customer segment gets the strongest result?
+3. Which segment is most strategically or commercially valuable?
+4. Who buys, who uses, and who can block the purchase?
+5. Which public claims are accurate, outdated, or prohibited?
+6. Which competitors or alternatives matter in real sales conversations?
+7. What should the brand always or never sound like?
+8. What is the most important business objective now?
+9. Which deadline, budget, channel, legal, or approval constraints apply?
+
+Corrections must be stored as explicit decisions with an author and timestamp. Founder input can promote an inference into approved truth, reject it, or preserve it as an open hypothesis.
+
+### Step 7: establish Brand Memory
+
+After verification, the system creates the initial Brand Memory. It should be usable across agents and campaigns while retaining the distinction between evidence, policy, hypotheses, and decisions.
+
+The initial memory should contain:
+
+- approved company and product facts
+- source-backed product and pricing records
+- approved customer and ICP definitions
+- positioning and offer language
+- brand and founder voice profiles
+- claims policy and supporting evidence
+- visual identity and reusable source assets
+- competitors and alternatives
+- founder corrections and unresolved questions
+- source freshness and recrawl requirements
+
+Brand Memory must remain reviewable and reversible. A later crawl may propose changes, but it should not silently overwrite founder-approved truth or alter active campaign policy.
+
+### Step 8: recommend outcomes
+
+The first screen after verification should not be another empty chat box. Marketing Harness should recommend a small set of outcomes grounded in the company model, such as:
+
+- acquire the first design partners
+- generate qualified demo requests
+- launch a product or feature
+- test an ICP or positioning hypothesis
+- increase trial activation
+- build founder authority in a category
+- create a two-week organic campaign
+- re-engage inactive leads or customers
+- turn customer evidence into a campaign
+
+Each recommendation should explain why it fits the evidence, what inputs are missing, the expected effort, relevant channels, likely risks, and how success would be measured.
+
+The founder selects or defines an outcome and supplies:
+
+- target result and metric
+- target audience
+- deadline
+- available offer
+- budget, if applicable
+- eligible channels
+- approval policy
+- non-negotiable constraints
+
+### Step 9: work on the outcome
+
+The Marketing Director creates a Campaign and delegates bounded work to specialist agents. The founder should see the resulting operating package rather than the internal coordination burden.
+
+For the first organic campaign, the package should include:
+
+- objective, hypothesis, audience, and success criteria
+- positioning and message hierarchy
+- channel and publishing plan
+- two-week content calendar
+- source-backed copy and creative briefs
+- generated channel variants and placement previews
+- claims and compliance checks
+- measurement plan
+- explicit assumptions and unresolved risks
+
+The system may draft freely within policy, but consequential actions remain gated. It must not publish, spend money, alter a live account, or promote an unsupported claim without the required approval.
+
+### Step 10: present one approval packet
+
+The founder should receive a unified review experience containing the exact:
+
+- content and assets
+- source evidence and claims
+- target accounts and channels
+- publishing schedule
+- expected external side effects
+- budget or spend implications
+- measurement plan
+
+They can approve, edit, reject, or request a new direction. Rejections should capture a reason so future work improves. Approval creates a durable decision record linked to the asset versions and operations that were reviewed.
+
+### Step 11: execute, reconcile, and learn
+
+PostBridge should be the first publication provider. After approval, Marketing Harness schedules the publications, tracks provider identifiers, reconciles delivery status, exposes failures, and avoids claiming success until the provider confirms it.
+
+After publication, the system should:
+
+- capture immutable metric snapshots
+- compare performance with the campaign hypothesis
+- identify delivery, creative, audience, or positioning issues
+- recommend the next action or experiment
+- propose Brand Memory updates with evidence
+
+Performance observations should not automatically become permanent doctrine. The founder or an explicit policy approves durable changes, especially when data is sparse or causality is unclear.
+
+### Initial vertical slice
+
+The first implementation should prove the complete loop with deliberately narrow scope:
+
+1. accept one public company URL and optional public source URLs
+2. discover and ingest sitemap-linked first-party pages
+3. preserve cited source snapshots
+4. extract the business, products, voice, customer hypotheses, and claims
+5. generate a draft ICP and positioning report
+6. collect founder corrections and approval
+7. persist the initial Brand Memory
+8. recommend and select one outcome
+9. produce a two-week organic campaign
+10. present one approval packet
+11. publish approved content through PostBridge
+12. reconcile publication state and capture an initial performance report
+
+This vertical slice should exclude:
+
+- authenticated or access-control-bypassing crawling
+- broad third-party data enrichment
+- autonomous publication without an explicit policy
+- paid-media execution
+- CRM mutation
+- continuous web monitoring
+- automatic Brand Memory replacement
+- unsupported customer or revenue claims
+
+### Failure handling and trust boundaries
+
+The workflow must degrade safely:
+
+- If crawling fails, the founder can provide alternate URLs or files and see which sources are missing.
+- If extraction confidence is low, the system asks focused questions rather than fabricating completeness.
+- If sources disagree, the conflict remains visible until resolved.
+- If a provider is unavailable, approved work remains queued without being marked published.
+- If the founder rejects the company model, the draft can be discarded without contaminating durable Brand Memory.
+- If the direction changes, source snapshots and decision history remain intact while the active ICP or campaign is versioned.
+
+The load-bearing assumption is that public company material contains enough current truth to produce a useful first draft. The design survives that assumption failing by preserving provenance, labeling confidence, requiring founder verification, and allowing manual source input before execution.
+
 ### Campaign
 
 The central unit of work connecting an objective to execution and measurement.
