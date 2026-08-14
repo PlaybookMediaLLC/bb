@@ -41,7 +41,6 @@ concurrency:
   cancel-in-progress: false
 
 env:
-  MARKETING_HARNESS_RELEASE_REPOSITORY: ${{ github.repository }}
   RELEASE_ALLOW_PRERELEASE_LATEST: ${{ github.event_name == 'schedule' && 'false' || inputs.allow_prerelease_latest }}
   RELEASE_DRY_RUN: ${{ github.event_name == 'schedule' && 'false' || inputs.dry_run }}
   RELEASE_NPM_TAG: ${{ github.event_name == 'schedule' && 'nightly' || inputs.npm_tag }}
@@ -509,19 +508,18 @@ jobs:
           # Both platforms reset the same moving release, so a single job
           # assembles every asset. Splitting the reset across platform jobs
           # would let whichever finished last delete the other's binaries.
-          add_required_glob "$macos_dir/desktop-version.json"
-          add_required_glob "$macos_dir/nightly-mac.yml"
+          # Upload binaries before metadata so updater feeds never point to
+          # assets that are not available yet.
           add_required_glob "$macos_dir"/*.dmg
           add_required_glob "$macos_dir"/*.zip
           add_required_glob "$macos_dir"/*.blockmap
-          add_required_glob "$linux_dir/desktop-version-linux.json"
-          add_required_glob "$linux_dir/nightly-linux.yml"
           add_required_glob "$linux_dir"/*.AppImage
           # AppImage embeds its block map, so a sidecar file is not guaranteed.
           add_optional_glob "$linux_dir"/*.blockmap
-
-          git tag -f "$nightly_tag" "$GITHUB_SHA"
-          git push --force origin "refs/tags/${nightly_tag}"
+          add_required_glob "$macos_dir/nightly-mac.yml"
+          add_required_glob "$linux_dir/nightly-linux.yml"
+          add_required_glob "$macos_dir/desktop-version.json"
+          add_required_glob "$linux_dir/desktop-version-linux.json"
 
           if gh release view "$nightly_tag" >/dev/null 2>&1; then
             gh release edit "$nightly_tag" \
@@ -531,13 +529,14 @@ jobs:
               --prerelease \
               --latest=false
 
+            gh release upload "$nightly_tag" "${release_assets[@]}" --clobber
+
+            expected_assets="$(printf '%s\n' "${release_assets[@]}" | xargs -n1 basename)"
             gh release view "$nightly_tag" --json assets --jq '.assets[].name' | while IFS= read -r asset_name; do
-              if [[ -n "$asset_name" ]]; then
+              if [[ -n "$asset_name" ]] && ! grep -Fxq "$asset_name" <<< "$expected_assets"; then
                 gh release delete-asset "$nightly_tag" "$asset_name" --yes
               fi
             done
-
-            gh release upload "$nightly_tag" "${release_assets[@]}"
           else
             gh release create "$nightly_tag" "${release_assets[@]}" \
               --target "$GITHUB_SHA" \
@@ -546,6 +545,10 @@ jobs:
               --prerelease \
               --latest=false
           fi
+
+          # Move the nightly pointer only after the complete asset set exists.
+          git tag -f "$nightly_tag" "$GITHUB_SHA"
+          git push --force origin "refs/tags/${nightly_tag}"
 
       - name: Summarize nightly desktop release
         env:

@@ -28,9 +28,11 @@ jobs:
         run: git fetch --no-tags https://github.com/get-bb/bb.git main
 
       - name: Update upstream branch
-        # This branch is a read-only mirror by design, so it must exactly match
-        # upstream/main even when upstream rewrites history.
-        run: git push --force origin FETCH_HEAD:refs/heads/upstream
+        # The explicit lease prevents this scheduled mirror from overwriting a
+        # branch update that landed after the remote state was observed.
+        run: |
+          remote_sha="$(git ls-remote --heads origin refs/heads/upstream | awk '{print $1}')"
+          git push --force-with-lease="refs/heads/upstream:${remote_sha}" origin FETCH_HEAD:refs/heads/upstream
 
       - name: Summarize
         run: |

@@ -22,7 +22,6 @@ on:
 
 env:
   CSC_IDENTITY_AUTO_DISCOVERY: "false"
-  MARKETING_HARNESS_RELEASE_REPOSITORY: ${{ github.repository }}
   NODE_VERSION: "22.x"
   PNPM_VERSION: "9.15.0"
 
@@ -30,13 +29,18 @@ permissions:
   contents: read
 
 concurrency:
-  group: build-desktop-${{ github.ref }}
-  cancel-in-progress: true
+  # Every stable run can update the same moving release, so serialize across
+  # tags and manual dispatches instead of grouping by ref.
+  group: marketing-harness-desktop-release
+  cancel-in-progress: false
 
 jobs:
   macos:
     name: macOS arm64 + x64 desktop artifacts
     runs-on: macos-15-intel
+    # Protect signing and notarization credentials with environment deployment
+    # rules that only allow trusted release refs and reviewers.
+    environment: desktop-release
     timeout-minutes: 45
     outputs:
       has_signing_secrets: ${{ steps.signing.outputs.has_signing_secrets }}
@@ -228,6 +232,21 @@ jobs:
           set -euo pipefail
 
           VERSION="$(node -p "require('./apps/desktop/package.json').version")"
+          BB_APP_VERSION="$(node -p "require('./packages/bb-app/package.json').version")"
+          if [[ "$VERSION" != "$BB_APP_VERSION" ]]; then
+            echo "::error::Desktop version ${VERSION} does not match bb-app version ${BB_APP_VERSION}."
+            exit 1
+          fi
+
+          if [[ "${GITHUB_EVENT_NAME}" == "push" || "$INPUT_PUBLISH" == "true" ]]; then
+            git fetch --no-tags origin main
+            MAIN_SHA="$(git rev-parse origin/main)"
+            if [[ "${GITHUB_SHA}" != "$MAIN_SHA" ]]; then
+              echo "::error::Stable releases must target the current protected main commit ${MAIN_SHA}; got ${GITHUB_SHA}."
+              exit 1
+            fi
+          fi
+
           EXPECTED_TAG="marketing-harness-v${VERSION}"
           if [[ "${GITHUB_EVENT_NAME}" == "push" && "${GITHUB_REF_NAME}" != "$EXPECTED_TAG" ]]; then
             echo "::error::Release tag ${GITHUB_REF_NAME} does not match desktop package version ${VERSION}; expected ${EXPECTED_TAG}."
@@ -310,35 +329,35 @@ jobs:
           # Both platforms reset the same moving release, so a single job
           # assembles every asset. Splitting the reset across platform jobs
           # would let whichever finished last delete the other's binaries.
-          add_required_glob "$MACOS_DIR/desktop-version.json"
-          add_required_glob "$LINUX_DIR/desktop-version-linux.json"
-          add_required_glob "$LINUX_DIR/latest-linux.yml"
+          # Upload binaries before their metadata so clients never observe a
+          # feed that points at an asset which has not finished uploading.
           add_required_glob "$LINUX_DIR"/*.AppImage
           # AppImage embeds its block map, so a sidecar file is not guaranteed.
           add_optional_glob "$LINUX_DIR"/*.blockmap
 
           if [[ "$PUBLISH_MACOS_BINARIES" == "true" ]]; then
-            add_required_glob "$MACOS_DIR/latest-mac.yml"
             add_required_glob "$MACOS_DIR"/*.dmg
             add_required_glob "$MACOS_DIR"/*.zip
             add_required_glob "$MACOS_DIR"/*.blockmap
+            add_required_glob "$MACOS_DIR/latest-mac.yml"
           else
             echo "Signing/notarization gate is closed; publishing the macOS version feed without macOS binaries."
           fi
 
+          add_required_glob "$LINUX_DIR/latest-linux.yml"
+          add_required_glob "$LINUX_DIR/desktop-version-linux.json"
+          add_required_glob "$MACOS_DIR/desktop-version.json"
+
           if gh release view "$VERSION_TAG" >/dev/null 2>&1; then
-            echo "Release $VERSION_TAG already exists; refusing to mutate immutable desktop release."
-            exit 1
+            echo "Release $VERSION_TAG already exists; repairing any partial asset upload from an earlier attempt."
+            gh release upload "$VERSION_TAG" "${RELEASE_ASSETS[@]}" --clobber
+          else
+            gh release create "$VERSION_TAG" "${RELEASE_ASSETS[@]}" \
+              --target "$GITHUB_SHA" \
+              --title "marketing-harness desktop ${VERSION}" \
+              --notes "marketing-harness desktop ${VERSION}" \
+              --latest
           fi
-
-          gh release create "$VERSION_TAG" "${RELEASE_ASSETS[@]}" \
-            --target "$GITHUB_SHA" \
-            --title "marketing-harness desktop ${VERSION}" \
-            --notes "marketing-harness desktop ${VERSION}" \
-            --latest
-
-          git tag -f "$LATEST_TAG" "$GITHUB_SHA"
-          git push --force origin "refs/tags/${LATEST_TAG}"
 
           if gh release view "$LATEST_TAG" >/dev/null 2>&1; then
             gh release edit "$LATEST_TAG" \
@@ -347,18 +366,17 @@ jobs:
               --notes "Latest stable marketing-harness desktop release metadata." \
               --latest=false
 
-            # marketing-harness-latest is a moving release, but --clobber only replaces
-            # assets with matching names. Preserve the release page and reset
-            # assets in-place so versioned binaries cannot accumulate and
-            # JSON-only publishes cannot leave stale binaries from an older
-            # signed release.
+            # Upload and validate the new asset set before removing stale
+            # versioned binaries. This preserves the previous working feed if
+            # an upload fails midway.
+            gh release upload "$LATEST_TAG" "${RELEASE_ASSETS[@]}" --clobber
+
+            EXPECTED_ASSETS="$(printf '%s\n' "${RELEASE_ASSETS[@]}" | xargs -n1 basename)"
             gh release view "$LATEST_TAG" --json assets --jq '.assets[].name' | while IFS= read -r asset_name; do
-              if [[ -n "$asset_name" ]]; then
+              if [[ -n "$asset_name" ]] && ! grep -Fxq "$asset_name" <<< "$EXPECTED_ASSETS"; then
                 gh release delete-asset "$LATEST_TAG" "$asset_name" --yes
               fi
             done
-
-            gh release upload "$LATEST_TAG" "${RELEASE_ASSETS[@]}"
           else
             gh release create "$LATEST_TAG" "${RELEASE_ASSETS[@]}" \
               --target "$GITHUB_SHA" \
@@ -366,6 +384,11 @@ jobs:
               --notes "Latest stable marketing-harness desktop release metadata." \
               --latest=false
           fi
+
+          # Move the public pointer only after every release asset operation
+          # succeeds, so a failed upload leaves the previous release intact.
+          git tag -f "$LATEST_TAG" "$GITHUB_SHA"
+          git push --force origin "refs/tags/${LATEST_TAG}"
 
       - name: Summarize
         env:

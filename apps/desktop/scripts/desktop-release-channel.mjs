@@ -1,8 +1,6 @@
 export const DESKTOP_RELEASE_CHANNEL_ENV_NAME = "BB_DESKTOP_RELEASE_CHANNEL";
 
-const releaseRepository =
-  process.env.MARKETING_HARNESS_RELEASE_REPOSITORY?.trim() ||
-  "PlaybookMediaLLC/bb";
+const releaseRepository = "PlaybookMediaLLC/bb";
 
 export function resolveDesktopReleaseChannel(env) {
   const rawChannel = env[DESKTOP_RELEASE_CHANNEL_ENV_NAME]?.trim();

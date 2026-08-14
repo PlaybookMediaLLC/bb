@@ -151,6 +151,8 @@ The desktop release tag uses the locked version: `marketing-harness-v<version>` 
 immutable releases and `marketing-harness-latest` for the moving pointer.
 Pushing that version tag runs the complete stable build and publication
 pipeline. Manual workflow dispatch remains available for QA builds.
+The rebranded desktop is a separate installation and does not replace or
+auto-migrate an existing `bb` desktop installation.
 
 `build-desktop.yml` builds macOS and Linux in parallel jobs, then publishes
 both from one job. The moving release resets all of its assets on each publish,
@@ -225,6 +227,10 @@ GitHub Actions secrets:
 | `APPLE_ID`                   | Apple ID email for the Developer Program account.                                                                                                                                      |
 | `APPLE_APP_PASSWORD`         | App-specific password from `appleid.apple.com` under Sign-In and Security.                                                                                                             |
 | `APPLE_TEAM_ID`              | Developer Team ID from `developer.apple.com/account` membership details.                                                                                                               |
+
+Protect the `desktop-release` GitHub environment so only the protected `main`
+branch and trusted release tags can deploy, and require a reviewer before its
+signing credentials are exposed.
 
 Once those secrets are present, the next `Build marketing-harness Desktop`
 workflow run with
