@@ -31,6 +31,21 @@ type DesktopWorkflow = {
   };
 };
 
+type NightlyWorkflow = {
+  env: {
+    RELEASE_DRY_RUN: string;
+  };
+  jobs: {
+    "nightly-desktop-linux": {
+      needs: string;
+    };
+    "nightly-desktop-macos": {
+      needs: string;
+    };
+  };
+  "run-name": string;
+};
+
 const repositoryRoot = resolve(process.cwd(), "..", "..");
 
 async function readDesktopWorkflow(): Promise<DesktopWorkflow> {
@@ -40,6 +55,15 @@ async function readDesktopWorkflow(): Promise<DesktopWorkflow> {
       "utf8",
     ),
   ) as DesktopWorkflow;
+}
+
+async function readNightlyWorkflow(): Promise<NightlyWorkflow> {
+  return parseYaml(
+    await readFile(
+      resolve(repositoryRoot, ".github/workflows/publish-bb-app.yml"),
+      "utf8",
+    ),
+  ) as NightlyWorkflow;
 }
 
 function requireStep(steps: WorkflowStep[], name: string): WorkflowStep {
@@ -87,5 +111,18 @@ describe("desktop release workflow", () => {
     expect(mergeStep.run).toContain("release/macos/arm64");
     expect(mergeStep.run).toContain("release/macos/x64");
     expect(mergeStep.run).toContain("release/macos/combined");
+  });
+
+  it("does not require npm publish authorization for scheduled desktop nightlies", async () => {
+    const workflow = await readNightlyWorkflow();
+
+    expect(workflow["run-name"]).toContain(
+      "Build marketing-harness desktop nightly",
+    );
+    expect(workflow.env.RELEASE_DRY_RUN).toBe(
+      "${{ github.event_name == 'schedule' && 'true' || inputs.dry_run }}",
+    );
+    expect(workflow.jobs["nightly-desktop-macos"].needs).toBe("publish");
+    expect(workflow.jobs["nightly-desktop-linux"].needs).toBe("publish");
   });
 });

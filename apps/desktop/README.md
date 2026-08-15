@@ -177,12 +177,16 @@ Apple signing secrets.
 The scheduled `publish-bb-app.yml` workflow runs from `main` every day at
 3:00 AM Pacific (`America/Los_Angeles`, including daylight-saving changes). It
 derives a unique version such as `0.34.1-nightly.<run-id>.<attempt>` without
-committing that version, publishes `bb-app` with the npm `nightly` dist-tag,
-and builds the desktop app from that same lockstep version.
+committing that version, validates the `bb-app` package with an npm dry run, and
+builds the desktop app from that same lockstep version. The scheduled path does
+not publish the upstream-owned `bb-app` npm package because this fork does not
+own its trusted-publisher configuration.
 
 To publish or dry-run the channel manually from `main`, dispatch the same
-workflow with `npm_tag=nightly`. A non-dry run publishes both npm and desktop;
-a dry run validates only the npm package path.
+workflow with `npm_tag=nightly`. A non-dry run requires npm trusted-publisher
+authorization for this repository and publishes both npm and desktop; a dry run
+validates only the npm package path. Scheduled Marketing Harness nightlies
+always use the dry-run package path and continue into the desktop build.
 
 The nightly desktop is a separate installation:
 
@@ -197,8 +201,9 @@ The nightly desktop is a separate installation:
 - icon: `assets/icon-nightly.icns` and `assets/icon-nightly.png`
 
 Download it from
-[`marketing-harness-nightly`](https://github.com/PlaybookMediaLLC/bb/releases/tag/marketing-harness-nightly)
-or run the CLI build with:
+[`marketing-harness-nightly`](https://github.com/PlaybookMediaLLC/bb/releases/tag/marketing-harness-nightly).
+The npm `bb-app@nightly` command remains upstream-managed and is not published
+by this scheduled workflow:
 
 ```bash
 npx bb-app@nightly
