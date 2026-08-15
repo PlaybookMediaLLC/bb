@@ -17,11 +17,13 @@ desktop app is published at the same version (see "Publish The Desktop App").
 
 The automated nightly channel is the exception to the manual stable flow. The
 scheduled path in `publish-bb-app.yml` derives a unique next-patch prerelease,
-publishes it under npm's `nightly` dist-tag, then builds the separately
-installable `bb Nightly` app for macOS and Linux and publishes both at
-`desktop-nightly`. It does not commit the generated version or move either
-stable `latest` pointer. Each platform job derives the nightly version from the
-run ID, so the two jobs agree without sharing state. If the
+validates the npm package with a dry run, then builds the separately installable
+Marketing Harness Nightly app for macOS and Linux and publishes it at
+`marketing-harness-nightly`. The scheduled path does not attempt to publish the
+upstream-owned `bb-app` package because this repository is not its configured
+npm trusted publisher. It does not commit the generated version or move either
+stable `latest` pointer. Each platform job reuses the version reported by the
+package-validation job, so the two jobs agree across partial reruns. If the
 `npm-release` GitHub environment requires approval, scheduled runs will wait
 for that approval; remove the reviewer gate only if fully unattended nightly
 publishing is intended.
@@ -36,7 +38,8 @@ gh workflow run publish-bb-app.yml \
   -f dry_run=true
 ```
 
-Set `dry_run=false` to publish both npm and the signed desktop nightly.
+Set `dry_run=false` only when this repository has explicit npm trusted-publisher
+authorization. That path publishes both npm and the signed desktop nightly.
 
 ## Release Policy
 

@@ -29,7 +29,7 @@ on:
         type: boolean
         default: true
 
-run-name: ${{ github.event_name == 'schedule' && 'Publish bb-app + desktop nightly' || format('Publish bb-app ({0}{1})', inputs.npm_tag, inputs.dry_run && ', dry run' || '') }}
+run-name: ${{ github.event_name == 'schedule' && 'Build marketing-harness desktop nightly' || format('Publish bb-app ({0}{1})', inputs.npm_tag, inputs.dry_run && ', dry run' || '') }}
 
 # Only the npm publish job gets id-token: write, for npm trusted publishing.
 # The desktop build jobs must not inherit an OIDC token they never use.
@@ -42,7 +42,10 @@ concurrency:
 
 env:
   RELEASE_ALLOW_PRERELEASE_LATEST: ${{ github.event_name == 'schedule' && 'false' || inputs.allow_prerelease_latest }}
-  RELEASE_DRY_RUN: ${{ github.event_name == 'schedule' && 'false' || inputs.dry_run }}
+  # This fork does not own npm's bb-app trusted-publisher configuration. Keep
+  # the package validation in the scheduled path, but do not let an npm E404
+  # prevent the independently distributed Marketing Harness desktop nightly.
+  RELEASE_DRY_RUN: ${{ github.event_name == 'schedule' && 'true' || inputs.dry_run }}
   RELEASE_NPM_TAG: ${{ github.event_name == 'schedule' && 'nightly' || inputs.npm_tag }}
 
 jobs:
