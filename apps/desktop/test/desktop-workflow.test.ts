@@ -4,6 +4,7 @@ import { parse as parseYaml } from "yaml";
 import { describe, expect, it } from "vitest";
 
 type WorkflowStep = {
+  env?: Record<string, unknown>;
   name?: string;
   run?: string;
   with?: Record<string, unknown>;
@@ -98,6 +99,41 @@ describe("desktop release workflow", () => {
     expect(uploadStep.with?.name).toBe(
       "marketing-harness-desktop-macos-${{ matrix.arch }}",
     );
+  });
+
+  it("validates every Apple signing secret before packaging", async () => {
+    const workflow = await readDesktopWorkflow();
+    const validationStep = requireStep(
+      workflow.jobs.macos.steps,
+      "Validate macOS signing secrets",
+    );
+    const packageStep = requireStep(
+      workflow.jobs.macos.steps,
+      "Package ${{ matrix.arch }} desktop artifacts",
+    );
+
+    const expectedSecrets = {
+      APPLE_APP_PASSWORD: "${{ secrets.APPLE_APP_PASSWORD }}",
+      APPLE_ID: "${{ secrets.APPLE_ID }}",
+      APPLE_TEAM_ID: "${{ secrets.APPLE_TEAM_ID }}",
+      MACOS_CERTIFICATE_NAME: "${{ secrets.MACOS_CERTIFICATE_NAME }}",
+      MACOS_CERTIFICATE_P12: "${{ secrets.MACOS_CERTIFICATE_P12 }}",
+      MACOS_CERTIFICATE_PASSWORD:
+        "${{ secrets.MACOS_CERTIFICATE_PASSWORD }}",
+    };
+
+    expect(validationStep.env).toEqual(expectedSecrets);
+    for (const secretName of Object.keys(expectedSecrets)) {
+      expect(validationStep.run).toContain(`"${secretName}"`);
+    }
+    expect(packageStep.env).toEqual({
+      APPLE_APP_SPECIFIC_PASSWORD: "${{ secrets.APPLE_APP_PASSWORD }}",
+      APPLE_ID: "${{ secrets.APPLE_ID }}",
+      APPLE_TEAM_ID: "${{ secrets.APPLE_TEAM_ID }}",
+      CSC_KEY_PASSWORD: "${{ secrets.MACOS_CERTIFICATE_PASSWORD }}",
+      CSC_LINK: "${{ secrets.MACOS_CERTIFICATE_P12 }}",
+      CSC_NAME: "${{ secrets.MACOS_CERTIFICATE_NAME }}",
+    });
   });
 
   it("recombines architecture metadata before a stable publish", async () => {
