@@ -73,3 +73,5 @@
 
 - Do not assume. Inspect logs, query the database, call server APIs, or use the CLI to observe real state.
 - See [docs/debugging-and-qa.md](docs/debugging-and-qa.md) for dev ports/data dirs, entity-ID lookups, and the `scripts/bb-dev-app` local dev QA launcher.
+
+Fork note: this is a PlaybookMediaLLC fork. Read FORK.md before you change code. <!-- fork-seam -->
