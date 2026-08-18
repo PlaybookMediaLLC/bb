@@ -1,44 +1,71 @@
-name: Sync upstream branch
+name: Sync Upstream
 
+# Nightly fork sync. Fetches get-bb/bb, merges its main into the
+# long-lived "upstream" branch, and opens a PR from "upstream" to main when
+# the branch carries changes that main does not have. A human reviews and
+# merges the PR, so upstream code never lands on main unreviewed.
+# If the merge conflicts, the job fails and a human resolves it on the
+# "upstream" branch.
 on:
   schedule:
-    - cron: "17 */12 * * *"
+    # 08:00 UTC = midnight PST.
+    - cron: "0 8 * * *"
   workflow_dispatch:
 
+# Serialize runs so a manual dispatch cannot race the scheduled push.
+concurrency:
+  group: sync-upstream
+  cancel-in-progress: true
+
+# contents: write pushes the "upstream" branch.
+# pull-requests: write opens the sync PR.
 permissions:
   contents: write
-
-concurrency:
-  group: sync-upstream-branch
-  cancel-in-progress: true
+  pull-requests: write
 
 jobs:
   sync:
-    name: Mirror upstream main
+    name: Merge Upstream & Open PR
     runs-on: ubuntu-latest
-    timeout-minutes: 10
-
     steps:
-      - name: Checkout fork
-        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      # persist-credentials stays on (the default): the push step
+      # authenticates with the persisted GITHUB_TOKEN.
+      - name: Checkout
+        uses: actions/checkout@v7
         with:
+          # Full history: the merge needs the common ancestor.
           fetch-depth: 0
 
-      - name: Fetch upstream main
-        run: git fetch --no-tags https://github.com/get-bb/bb.git main
-
-      - name: Update upstream branch
-        # The explicit lease prevents this scheduled mirror from overwriting a
-        # branch update that landed after the remote state was observed.
+      - name: Merge upstream/main into the upstream branch
         run: |
-          remote_sha="$(git ls-remote --heads origin refs/heads/upstream | awk '{print $1}')"
-          git push --force-with-lease="refs/heads/upstream:${remote_sha}" origin FETCH_HEAD:refs/heads/upstream
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git remote add upstream https://github.com/get-bb/bb.git
+          git fetch upstream main
+          # Reuse the existing branch, or create it from main on the first run.
+          git checkout upstream || git checkout -b upstream
+          git merge --no-edit upstream/main
+          git push origin upstream
 
-      - name: Summarize
+      - name: Open PR against main
+        env:
+          GH_TOKEN: ${{ github.token }}
         run: |
-          {
-            echo "## Upstream sync"
-            echo
-            echo "Mirrored get-bb/bb main to ${GITHUB_REPOSITORY}@upstream."
-            echo "Commit: $(git rev-parse FETCH_HEAD)"
-          } >> "$GITHUB_STEP_SUMMARY"
+          # No delta against main: nothing to open.
+          if git diff --quiet origin/main upstream; then
+            echo "upstream branch matches main; no PR needed."
+            exit 0
+          fi
+          # An open sync PR already tracks the branch; the push above updated it.
+          if [ "$(gh pr list --head upstream --base main --state open --json number --jq length)" != "0" ]; then
+            echo "Sync PR already open; branch updated."
+            exit 0
+          fi
+          # REST, not "gh pr create": the GraphQL createPullRequest mutation
+          # rejects the Actions token with "Resource not accessible by
+          # integration" even with pull-requests: write granted.
+          gh api "repos/${GITHUB_REPOSITORY}/pulls" \
+            -f base=main \
+            -f head=upstream \
+            -f title="chore: sync upstream $(date -u +%F)" \
+            -f body="Nightly merge of get-bb/bb main into the upstream branch. Review the diff, then merge."
