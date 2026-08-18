@@ -491,18 +491,8 @@ jobs:
 
   nightly-desktop-macos:
     name: Build marketing-harness Nightly desktop (macOS)
-    # `!cancelled()` is required because publish-nightly is skipped on the
-    # scheduled and manual nightly paths, and a skipped need would otherwise
-    # skip this job too.
-    if: >-
-      ${{ !cancelled()
-      && needs.publish.result == 'success'
-      && (github.event_name == 'schedule'
-      || (inputs.npm_tag == 'nightly' && inputs.dry_run == false)
-      || needs.publish-nightly.result == 'success') }}
-    needs:
-      - publish
-      - publish-nightly
+    if: ${{ github.event_name == 'schedule' || (inputs.npm_tag == 'nightly' && inputs.dry_run == false) }}
+    needs: publish
     runs-on: macos-15-intel
     timeout-minutes: 45
     outputs:
@@ -628,16 +618,8 @@ jobs:
 
   nightly-desktop-linux:
     name: Build marketing-harness Nightly desktop (Linux)
-    # See the macOS job for why this condition uses `!cancelled()`.
-    if: >-
-      ${{ !cancelled()
-      && needs.publish.result == 'success'
-      && (github.event_name == 'schedule'
-      || (inputs.npm_tag == 'nightly' && inputs.dry_run == false)
-      || needs.publish-nightly.result == 'success') }}
-    needs:
-      - publish
-      - publish-nightly
+    if: ${{ github.event_name == 'schedule' || (inputs.npm_tag == 'nightly' && inputs.dry_run == false) }}
+    needs: publish
     # Pinned rather than ubuntu-latest so the glibc the AppImage links against
     # changes only when we choose it: the build machine's glibc sets the
     # minimum distro version users need.

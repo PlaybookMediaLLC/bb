@@ -555,9 +555,10 @@ describe("electron-builder signing config", () => {
     ).resolves.toBeUndefined();
   });
 
-  // An x64 macOS target forces the release job onto a slow Intel runner and
-  // notarizes twice, which tripled desktop release time when it last shipped.
-  it("packages macOS artifacts for arm64 only", async () => {
+  // This fork builds arm64 and x64 in parallel on native runners, so the
+  // config must not pin an arch list. The per-architecture CLI flags in the
+  // desktop:build:mac:* scripts select the arch for each matrix job.
+  it("packages macOS dmg and zip artifacts without an arch pin", async () => {
     const configText = await readFile(
       resolve(desktopPackageRoot, "electron-builder.config.json"),
       "utf8",
@@ -565,8 +566,8 @@ describe("electron-builder signing config", () => {
     const config = electronBuilderConfigSchema.parse(JSON.parse(configText));
 
     expect(config.mac.target).toEqual([
-      { arch: ["arm64"], target: "dmg" },
-      { arch: ["arm64"], target: "zip" },
+      { target: "dmg" },
+      { target: "zip" },
     ]);
   });
 
