@@ -34,8 +34,9 @@ The recommended way to start using bb is the desktop app:
 
 **[Download the latest desktop app](https://github.com/get-bb/bb/releases/tag/desktop-latest)**
 
-The desktop build supports macOS on Apple Silicon (arm64) and Intel (x64).
-Linux users should run bb with `npx` instead. On Windows, run bb inside
+The desktop app supports macOS on Apple Silicon (arm64). The Linux x64 AppImage
+is alpha: expect problems, and please report them. Intel Mac users should run bb
+with `npx` instead. On Windows, run bb inside
 [WSL2 (Windows Subsystem for Linux)](https://learn.microsoft.com/windows/wsl/install):
 install WSL2 first, then run the same `npx` command below from your WSL2 (Linux)
 shell. Native Windows PowerShell and CMD are not supported.
@@ -68,10 +69,12 @@ docs, start with
 ### Telemetry
 
 Production runs (the desktop app and `npx bb-app`) send anonymous usage
-telemetry (app starts, thread creation counts, and user message counts) to help
-us understand adoption. Identification is a random per-install id stored in your
-data dir — no user, host, project, workspace, or message content is ever
-attached. Development/source runs never send. Opt out any run with
+telemetry (app starts, thread creation counts, user message counts, and plugin
+installs) to help us understand adoption. Identification is a random per-install
+id stored in your data dir — no user, host, project, workspace, or message
+content is ever attached. Plugin install events name only public plugins
+(bundled plugins and `bb-community` marketplace entries); installs from a local
+path, a private git or npm source, or a third-party marketplace report no name. Development/source runs never send. Opt out any run with
 `BB_TELEMETRY=false`. See
 [`apps/server/src/services/system/telemetry.ts`](./apps/server/src/services/system/telemetry.ts).
 
@@ -218,3 +221,7 @@ The same error has other causes. A Node.js major-version change after the
 install causes it. A copy of `node_modules` from a different operating system,
 CPU architecture, or libc variant also causes it. To recover, install the
 package again, or run `npm rebuild better-sqlite3`.
+
+## Acknowledgements
+
+<a href="https://blacksmith.sh"><img src="assets/blacksmith-ci.png" alt="CI powered by Blacksmith" width="400"></a>

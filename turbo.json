@@ -77,7 +77,7 @@
     },
     "bb-app#build": {
       // copy-builtin-plugins bundles every plugin in BUNDLED_PLUGINS; the
-      // tasks plugin's app bundle imports the @bb/plugin-sdk root at runtime
+      // tasks plugin's app bundle imports the @get-bb/plugin-sdk root at runtime
       // (shared RPC contract), so the SDK dist must exist first.
       "dependsOn": [
         "@bb/app#build",
@@ -85,7 +85,7 @@
         "@bb/host-daemon#build",
         "@bb/cli#build",
         "@bb/sdk#build",
-        "@bb/plugin-sdk#build"
+        "@get-bb/plugin-sdk#build"
       ],
       "inputs": [
         "$TURBO_DEFAULT$",
@@ -111,9 +111,12 @@
       "outputs": ["app/**", "dist/**", "host-daemon/**", "server/**"]
     },
     "bb-plugin-tasks#build": {
-      // The tasks plugin's app bundle imports the @bb/plugin-sdk root at
+      // The tasks plugin's app bundle imports the @get-bb/plugin-sdk root at
       // runtime (shared RPC contract), so the SDK dist must exist first.
-      "dependsOn": ["topo", "@bb/plugin-sdk#build"]
+      "dependsOn": [
+        "topo",
+        "@get-bb/plugin-sdk#build"
+      ]
     },
     "@bb/desktop#build": {
       "dependsOn": ["bb-app#build"],
@@ -197,6 +200,13 @@
       "passThroughEnv": ["*"]
     },
     "@bb/server#dev": {
+      // The server installs first-party provider plugins during startup and
+      // builds their host artifacts. Those builds resolve the published
+      // `@get-bb/plugin-sdk/provider-bridge` entry from the SDK dist, so a
+      // clean worktree must build that runtime before the server starts.
+      "dependsOn": [
+        "@get-bb/plugin-sdk#build"
+      ],
       "cache": false,
       "persistent": true,
       "passThroughEnv": ["*"]
@@ -250,7 +260,10 @@
       // Templates embed the plugin SDK's generated declarations by file path.
       // Keep the check from racing the SDK build without adding a package edge,
       // which would create a dependency cycle through @bb/sdk.
-      "dependsOn": ["@bb/plugin-sdk#build", "topo"]
+      "dependsOn": [
+        "@get-bb/plugin-sdk#build",
+        "topo"
+      ]
     },
     "@bb/integration-tests#typecheck": {
       "dependsOn": ["topo"],
@@ -270,16 +283,74 @@
       "inputs": ["$TURBO_DEFAULT$", "$TURBO_ROOT$/vitest.shared.ts"]
     },
     "@bb/templates#test": {
-      "dependsOn": ["//#ensure-native-modules", "@bb/plugin-sdk#build", "topo"],
-      "inputs": ["$TURBO_DEFAULT$", "$TURBO_ROOT$/vitest.shared.ts"]
+      "dependsOn": [
+        "//#ensure-native-modules",
+        "@get-bb/plugin-sdk#build",
+        "topo"
+      ],
+      "inputs": [
+        "$TURBO_DEFAULT$",
+        "$TURBO_ROOT$/vitest.shared.ts"
+      ]
+    },
+    // Installs first-party provider plugins, which makes the plugin runtime
+    // build their host artifacts. esbuild resolves the plugin sources'
+    // `@get-bb/plugin-sdk/provider-bridge` import through the package export
+    // map to `packages/plugin-sdk/dist/provider-bridge.js` — the `source`
+    // condition that lets vitest read `src/` does not apply inside that
+    // bundling step — so the SDK dist must exist before the suite runs.
+    "@bb/server#test": {
+      "dependsOn": [
+        "//#ensure-native-modules",
+        "@get-bb/plugin-sdk#build",
+        "topo"
+      ],
+      "inputs": [
+        "$TURBO_DEFAULT$",
+        "$TURBO_ROOT$/vitest.shared.ts"
+      ]
+    },
+    // Builds real plugin host artifacts (the builtin artifacts suite, plus the
+    // fixture that pins the published bridge surface as bundled-not-stubbed),
+    // so it needs the SDK dist for the same reason as @bb/server#test.
+    "@bb/plugin-build#test": {
+      "dependsOn": [
+        "//#ensure-native-modules",
+        "@get-bb/plugin-sdk#build",
+        "topo"
+      ],
+      "inputs": [
+        "$TURBO_DEFAULT$",
+        "$TURBO_ROOT$/vitest.shared.ts"
+      ]
+    },
+    // The live-CLI suite's global setup rebuilds every first-party provider
+    // bridge from source, so it needs the SDK dist too.
+    "@bb/agent-runtime#test:integration": {
+      "dependsOn": [
+        "//#ensure-native-modules",
+        "@get-bb/plugin-sdk#build",
+        "topo"
+      ],
+      "inputs": [
+        "$TURBO_DEFAULT$",
+        "$TURBO_ROOT$/vitest.shared.ts"
+      ]
     },
     "smoke:tarball": {
       "dependsOn": ["build"],
       "cache": false,
       "outputs": []
     },
+    // Boots the real server, which installs the first-party provider plugins
+    // and builds their host artifacts; those bundles resolve
+    // `@get-bb/plugin-sdk/provider-bridge` to the SDK dist.
     "@bb/integration-tests#test": {
-      "dependsOn": ["//#ensure-native-modules", "topo"],
+      "dependsOn": [
+        "//#ensure-native-modules",
+        "@get-bb/plugin-sdk#build",
+        "topo"
+      ],
       "inputs": [
         "$TURBO_DEFAULT$",
         "$TURBO_ROOT$/apps/server/package.json",
@@ -296,7 +367,11 @@
       "inputs": ["$TURBO_DEFAULT$", "$TURBO_ROOT$/vitest.shared.ts"]
     },
     "@bb/integration-tests#test:smoke": {
-      "dependsOn": ["//#ensure-native-modules", "topo"],
+      "dependsOn": [
+        "//#ensure-native-modules",
+        "@get-bb/plugin-sdk#build",
+        "topo"
+      ],
       "inputs": [
         "$TURBO_DEFAULT$",
         "$TURBO_ROOT$/apps/server/package.json",
@@ -316,6 +391,7 @@
       "dependsOn": [
         "//#ensure-native-modules",
         "@bb/agent-runtime#test:integration",
+        "@get-bb/plugin-sdk#build",
         "topo"
       ],
       "inputs": [
@@ -329,7 +405,7 @@
         "$TURBO_ROOT$/vitest.shared.ts"
       ]
     },
-    "@bb/plugin-sdk#build": {
+    "@get-bb/plugin-sdk#build": {
       "inputs": [
         "$TURBO_DEFAULT$",
         "$TURBO_ROOT$/packages/*/package.json",

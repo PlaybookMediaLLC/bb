@@ -555,6 +555,21 @@ describe("electron-builder signing config", () => {
     ).resolves.toBeUndefined();
   });
 
+  // An x64 macOS target forces the release job onto a slow Intel runner and
+  // notarizes twice, which tripled desktop release time when it last shipped.
+  it("packages macOS artifacts for arm64 only", async () => {
+    const configText = await readFile(
+      resolve(desktopPackageRoot, "electron-builder.config.json"),
+      "utf8",
+    );
+    const config = electronBuilderConfigSchema.parse(JSON.parse(configText));
+
+    expect(config.mac.target).toEqual([
+      { arch: ["arm64"], target: "dmg" },
+      { arch: ["arm64"], target: "zip" },
+    ]);
+  });
+
   it("packages a Linux AppImage for x64", async () => {
     const configText = await readFile(
       resolve(desktopPackageRoot, "electron-builder.config.json"),
