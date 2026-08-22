@@ -1,5 +1,6 @@
 {
   "name": "bb",
+  "version": "0.39.0",
   "private": true,
   "license": "MIT",
   "type": "module",

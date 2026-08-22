@@ -47,7 +47,7 @@ jobs:
       # the existing stable desktop publisher explicitly after release-please
       # merges and tags the reviewed release PR.
       - name: Publish stable desktop release
-        if: ${{ steps.release.outputs['packages/bb-app--release_created'] == 'true' }}
+        if: ${{ steps.release.outputs.release_created == 'true' }}
         env:
           GH_TOKEN: ${{ github.token }}
         run: |

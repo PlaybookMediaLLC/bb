@@ -2,18 +2,23 @@
   "$schema": "https://raw.githubusercontent.com/googleapis/release-please/main/schemas/config.json",
   "bootstrap-sha": "5aa888cebc34808eae74f7f5f31eb4dede5dc69d",
   "packages": {
-    "packages/bb-app": {
+    ".": {
       "release-type": "node",
       "versioning": "always-bump-patch",
       "component": "marketing-harness",
       "include-component-in-tag": true,
       "include-v-in-tag": true,
       "tag-separator": "-",
-      "changelog-path": "/CHANGELOG.md",
+      "changelog-path": "CHANGELOG.md",
       "extra-files": [
         {
           "type": "json",
-          "path": "/apps/desktop/package.json",
+          "path": "packages/bb-app/package.json",
+          "jsonpath": "$.version"
+        },
+        {
+          "type": "json",
+          "path": "apps/desktop/package.json",
           "jsonpath": "$.version"
         }
       ],

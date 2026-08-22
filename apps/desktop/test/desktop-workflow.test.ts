@@ -225,26 +225,35 @@ describe("desktop release workflow", () => {
     expect(checksStep.if).toContain("prs_created");
     expect(checksStep.run).toContain("gh workflow run ci.yml");
     expect(checksStep.run).toContain("gh workflow run version-lockstep.yml");
-    expect(publishStep.if).toContain("packages/bb-app--release_created");
+    expect(publishStep.if).toContain("release_created");
     expect(publishStep.run).toContain("gh workflow run build-desktop.yml");
     expect(publishStep.run).toContain("release_channel=stable");
-    expect(config.packages["packages/bb-app"]).toMatchObject({
+    expect(config.packages["."]).toMatchObject({
       component: "marketing-harness",
       versioning: "always-bump-patch",
       "include-component-in-tag": true,
       "include-v-in-tag": true,
       "tag-separator": "-",
-      "changelog-path": "/CHANGELOG.md",
+      "changelog-path": "CHANGELOG.md",
     });
-    expect(config.packages["packages/bb-app"]["extra-files"]).toContainEqual({
-      type: "json",
-      path: "/apps/desktop/package.json",
-      jsonpath: "$.version",
-    });
-    expect(config.packages["packages/bb-app"]["pull-request-footer"]).toContain(
+    expect(config.packages["."]["extra-files"]).toEqual([
+      {
+        type: "json",
+        path: "packages/bb-app/package.json",
+        jsonpath: "$.version",
+      },
+      {
+        type: "json",
+        path: "apps/desktop/package.json",
+        jsonpath: "$.version",
+      },
+    ]);
+    expect(config.packages["."]["pull-request-footer"]).toContain(
       "AGENT GENERATED",
     );
-    expect(manifest["packages/bb-app"]).toBe(bbAppPackage.version);
-    expect(manifest["packages/bb-app"]).toBe(desktopPackage.version);
+    const repositoryPackage = await readRepositoryJson("package.json");
+    expect(manifest["."]).toBe(repositoryPackage.version);
+    expect(manifest["."]).toBe(bbAppPackage.version);
+    expect(manifest["."]).toBe(desktopPackage.version);
   });
 });
