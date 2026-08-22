@@ -531,6 +531,20 @@ For review or fix pipelines, get the environment ID from
   `bb memory update <id> --expected-version <n>` or `bb memory forget <id>
 --expected-version <n> --reason <text>`.
 
+## Marketing Assets
+
+- Marketing Assets is an opt-in official plugin. Install it with
+  `bb plugin install marketing-assets-r2` before using `bb assets ...`.
+- Its optional endpoint setting is only for local MinIO tests and accepts only
+  HTTP(S) loopback URLs. Leave the Cloudflare account ID empty when using it.
+- Run `bb assets status`, then use `bb assets upload <path> --json` and
+  `bb assets list --json`.
+- Use `bb assets url <key> --json` only for temporary access. Treat the signed
+  URL as a bearer secret and do not persist it.
+- Download with `bb assets download <key> --out <path> --json`. The command
+  creates a new file and refuses to overwrite one.
+- Delete only after user approval, then pass `--yes`.
+
 ## Tasks
 
 - Tasks is an opt-in official plugin bundled with the app. Install it with
@@ -776,7 +790,7 @@ them by mixing ink into canvas), the `--primary` accent, the secondary text tier
   (except `side-chat`, which is gated by the **"Side chat plugin"**
   experiment); official plugins install from the bundled store on demand.
 - **BB Official plugins** (store under `/api/v1/plugin-catalog`):
-  - BB's official plugins (GitHub, Docs, Memory, and Tasks) ship
+  - BB's official plugins (GitHub, Docs, Memory, Marketing Assets, and Tasks) ship
     bundled inside the app and install from the local copy — no network. Installed official
     plugins are pinned to the bundled copy and update with BB app releases.
   - The store also lists the **BB Community marketplace** catalog: a manifest

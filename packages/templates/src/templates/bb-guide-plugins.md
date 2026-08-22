@@ -128,6 +128,23 @@ vault to remove that folder. Use `--workspace-host <id>` when a standalone
 CLI's working directory is on a non-primary host. Direct `write`, `mkdir`,
 `move`, and `remove` remain only as deprecated compatibility commands.
 
+The Marketing Assets plugin is an opt-in official plugin bundled with the app:
+`bb plugin install marketing-assets-r2`. It stores private campaign files in
+Cloudflare R2 under the `marketing-assets/` prefix:
+
+  bb assets status
+  bb assets upload <path> [--content-type <type>] [--json]
+  bb assets list [--limit <1-250>] [--cursor <cursor>] [--json]
+  bb assets url <key> [--json]
+  bb assets download <key> --out <path> [--json]
+  bb assets delete <key> --yes [--json]
+
+Configure its account ID, private bucket, access key ID, and secret access key
+in Extensions → Plugins → Marketing Assets, then reload the plugin. Use a
+bucket-scoped Object Read and Write token. Signed URLs are short-lived bearer
+secrets; do not persist them. For local MinIO tests, leave the account ID empty
+and set the endpoint to an HTTP(S) loopback URL.
+
 The Tasks plugin is an opt-in official plugin bundled with the app:
 `bb plugin install tasks`. It adds a task tracker, agent delegation,
 and the `bb tasks` command. Common agent operations are:
@@ -327,12 +344,12 @@ rollback, and remove keep working per plugin.
 
 BB Official plugins
 
-BB's official plugins — GitHub, Docs, Memory, and Tasks — ship bundled inside
+BB's official plugins — GitHub, Docs, Memory, Marketing Assets, and Tasks — ship bundled inside
 the app itself. They appear in Extensions → Plugins → Browse
 and install with one click from the local bundled copy: no network, no
 download, no separate release. Install from the CLI by bare name
 (`bb plugin install github`, `bb plugin install docs`, `bb plugin install
-memory`, or `bb plugin install tasks`). Installed official plugins are pinned
+memory`, `bb plugin install marketing-assets-r2`, or `bb plugin install tasks`). Installed official plugins are pinned
 to the bundled copy and update automatically when the BB app updates.
 
 The BB Community marketplace (reserved name `bb-community`) lists reviewed
@@ -746,7 +763,7 @@ in a checkout). The builtin `inline-vis` plugin renders
 path-shaped, sandboxed worktree HTML iframe preview; `height` is optional.
 Its card header includes an open-in-sidebar action for the source HTML file.
 The `plugins/` directory contains every bundled plugin: the auto-installed
-builtins and the store-only BB Official GitHub, Docs, Memory, and Tasks
+builtins and the store-only BB Official GitHub, Docs, Memory, Marketing Assets, and Tasks
 plugins. The `examples/plugins/` reference plugins cover slack-bot (webhook
 bot), agent-enrichment (agent surfaces), and composer-customization (all
 composer regions). Thread Hover

@@ -97,6 +97,7 @@ describe("official plugin registry invariants", () => {
       github: "Developer tools",
       "inline-vis": "Interface",
       "keep-awake": "Host access",
+      "marketing-assets-r2": "Workflow management",
       memory: "Context & knowledge",
       "pdf-preview": "Interface",
       "provider-acp": "Agent interaction",
