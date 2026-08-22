@@ -1,5 +1,8 @@
 # bb Browser
 
+> RFC proposal: [Browser-Scoped Computer Use](../docs/rfcs/browser-scoped-computer-use.md).
+> This plan is preserved as the original CLI-first implementation proposal.
+
 ## Goal
 
 Add `bb browser ...` CLI commands that drive visible in-app browser automation

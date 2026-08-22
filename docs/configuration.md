@@ -771,7 +771,7 @@ Plugin state lives under the data dir:
                                    commands, injected into agent threads)
 ```
 
-BB's official plugins (GitHub, Docs, Memory, and Tasks) ship bundled
+BB's official plugins (GitHub, Docs, Memory, Marketing Assets, and Tasks) ship bundled
 inside the app and install from the local bundled copy — no network, no remote catalog.
 Discover them with `bb plugin search` or Extensions → Plugins → Browse; users
 cannot add, remove, or configure the bundled official plugin set. Installed official

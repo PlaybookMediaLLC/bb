@@ -175,6 +175,12 @@ export const OFFICIAL_PLUGINS = [
     category: "Context & knowledge",
   },
   {
+    name: "marketing-assets-r2",
+    pluginId: "marketing-assets-r2",
+    defaultEnabled: true,
+    category: "Workflow management",
+  },
+  {
     name: "tasks",
     pluginId: "tasks",
     defaultEnabled: true,
