@@ -5,8 +5,10 @@ import { describe, expect, it } from "vitest";
 
 type WorkflowStep = {
   env?: Record<string, unknown>;
+  if?: string;
   name?: string;
   run?: string;
+  uses?: string;
   with?: Record<string, unknown>;
 };
 
@@ -47,6 +49,20 @@ type NightlyWorkflow = {
   "run-name": string;
 };
 
+type ReleasePleaseWorkflow = {
+  jobs: {
+    "release-please": {
+      steps: WorkflowStep[];
+    };
+  };
+  on: {
+    push: {
+      branches: string[];
+    };
+  };
+  permissions: Record<string, string>;
+};
+
 const repositoryRoot = resolve(process.cwd(), "..", "..");
 
 async function readDesktopWorkflow(): Promise<DesktopWorkflow> {
@@ -65,6 +81,19 @@ async function readNightlyWorkflow(): Promise<NightlyWorkflow> {
       "utf8",
     ),
   ) as NightlyWorkflow;
+}
+
+async function readReleasePleaseWorkflow(): Promise<ReleasePleaseWorkflow> {
+  return parseYaml(
+    await readFile(
+      resolve(repositoryRoot, ".github/workflows/release-please.yml"),
+      "utf8",
+    ),
+  ) as ReleasePleaseWorkflow;
+}
+
+async function readRepositoryJson(path: string) {
+  return JSON.parse(await readFile(resolve(repositoryRoot, path), "utf8"));
 }
 
 function requireStep(steps: WorkflowStep[], name: string): WorkflowStep {
@@ -159,5 +188,63 @@ describe("desktop release workflow", () => {
     );
     expect(workflow.jobs["nightly-desktop-macos"].needs).toBe("publish");
     expect(workflow.jobs["nightly-desktop-linux"].needs).toBe("publish");
+  });
+
+  it("opens a checked release PR after main changes and publishes it through the stable workflow", async () => {
+    const workflow = await readReleasePleaseWorkflow();
+    const releaseStep = requireStep(
+      workflow.jobs["release-please"].steps,
+      "Prepare release PR or release",
+    );
+    const checksStep = requireStep(
+      workflow.jobs["release-please"].steps,
+      "Run checks for release PR",
+    );
+    const publishStep = requireStep(
+      workflow.jobs["release-please"].steps,
+      "Publish stable desktop release",
+    );
+    const config = await readRepositoryJson("release-please-config.json");
+    const manifest = await readRepositoryJson(".release-please-manifest.json");
+    const bbAppPackage = await readRepositoryJson(
+      "packages/bb-app/package.json",
+    );
+    const desktopPackage = await readRepositoryJson(
+      "apps/desktop/package.json",
+    );
+
+    expect(workflow.on.push.branches).toEqual(["main"]);
+    expect(workflow.permissions).toMatchObject({
+      actions: "write",
+      contents: "write",
+      "pull-requests": "write",
+    });
+    expect(releaseStep.uses).toBe(
+      "googleapis/release-please-action@45996ed1f6d02564a971a2fa1b5860e934307cf7",
+    );
+    expect(checksStep.if).toContain("prs_created");
+    expect(checksStep.run).toContain("gh workflow run ci.yml");
+    expect(checksStep.run).toContain("gh workflow run version-lockstep.yml");
+    expect(publishStep.if).toContain("packages/bb-app--release_created");
+    expect(publishStep.run).toContain("gh workflow run build-desktop.yml");
+    expect(publishStep.run).toContain("release_channel=stable");
+    expect(config.packages["packages/bb-app"]).toMatchObject({
+      component: "marketing-harness",
+      versioning: "always-bump-patch",
+      "include-component-in-tag": true,
+      "include-v-in-tag": true,
+      "tag-separator": "-",
+      "changelog-path": "/CHANGELOG.md",
+    });
+    expect(config.packages["packages/bb-app"]["extra-files"]).toContainEqual({
+      type: "json",
+      path: "/apps/desktop/package.json",
+      jsonpath: "$.version",
+    });
+    expect(config.packages["packages/bb-app"]["pull-request-footer"]).toContain(
+      "AGENT GENERATED",
+    );
+    expect(manifest["packages/bb-app"]).toBe(bbAppPackage.version);
+    expect(manifest["packages/bb-app"]).toBe(desktopPackage.version);
   });
 });

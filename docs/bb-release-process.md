@@ -8,6 +8,12 @@ It assumes the manual GitHub Actions publish workflow and npm Trusted
 Publishing are configured. Until then, local `npm publish` is an emergency
 fallback only.
 
+In the PlaybookMediaLLC fork, pushes to `main` open or update one release-please
+PR. Merge that reviewed PR to create the `marketing-harness-v<version>` tag and
+dispatch the stable desktop workflow. The manual preparation and dispatch steps
+below remain the fallback path; do not run them in parallel with an open release
+PR.
+
 A full release has **two** outputs that ship from the same release commit: the
 `bb-app` npm package (`publish-bb-app.yml`) and the desktop app
 (`build-desktop.yml`). They are published by independent workflows — publishing
