@@ -223,6 +223,7 @@ describe("desktop release workflow", () => {
       "googleapis/release-please-action@45996ed1f6d02564a971a2fa1b5860e934307cf7",
     );
     expect(checksStep.if).toContain("prs_created");
+    expect(checksStep.env?.GH_REPO).toContain("github.repository");
     expect(checksStep.run).toContain("gh workflow run ci.yml");
     expect(checksStep.run).toContain("gh workflow run version-lockstep.yml");
     expect(publishStep.if).toContain("release_created");
