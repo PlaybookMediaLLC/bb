@@ -46,3 +46,14 @@ Resolve merge conflicts by class:
    Blacksmith runners in through files that did not conflict.
 4. Run `pnpm --dir apps/desktop run test` before you push the merge. The guard
    tests catch a wrong resolution.
+
+## Release PRs
+
+Every push to `main` runs release-please and opens or updates one patch release
+PR. The PR keeps `bb-app` and the desktop version locked together and prepares
+the root changelog. The workflow dispatches CI explicitly because a PR created
+with `GITHUB_TOKEN` does not trigger another workflow run.
+
+Merging the release PR creates `marketing-harness-v<version>` and dispatches the
+existing stable desktop workflow. Reviewers must complete the web and app
+changelog metadata named in the release PR before merging it.

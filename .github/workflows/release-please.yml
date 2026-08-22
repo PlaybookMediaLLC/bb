@@ -1,0 +1,57 @@
+name: Prepare marketing-harness release
+
+on:
+  push:
+    branches:
+      - main
+  workflow_dispatch:
+
+concurrency:
+  group: release-please-main
+  cancel-in-progress: false
+
+permissions:
+  actions: write
+  contents: write
+  issues: write
+  pull-requests: write
+
+jobs:
+  release-please:
+    name: Open or update release PR
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+
+    steps:
+      - name: Prepare release PR or release
+        id: release
+        uses: googleapis/release-please-action@45996ed1f6d02564a971a2fa1b5860e934307cf7 # v5.0.0
+        with:
+          config-file: release-please-config.json
+          manifest-file: .release-please-manifest.json
+          token: ${{ github.token }}
+
+      # GITHUB_TOKEN-created PRs do not emit another workflow event. Dispatch
+      # the normal checks explicitly against the generated release branch.
+      - name: Run checks for release PR
+        if: ${{ steps.release.outputs.prs_created == 'true' }}
+        env:
+          GH_TOKEN: ${{ github.token }}
+          RELEASE_PR: ${{ steps.release.outputs.pr }}
+        run: |
+          RELEASE_BRANCH="$(node -e 'const pr = JSON.parse(process.env.RELEASE_PR); process.stdout.write(pr.headBranchName)')"
+          gh workflow run ci.yml --ref "$RELEASE_BRANCH"
+          gh workflow run version-lockstep.yml --ref "$RELEASE_BRANCH"
+
+      # A tag created with GITHUB_TOKEN does not trigger tag workflows. Start
+      # the existing stable desktop publisher explicitly after release-please
+      # merges and tags the reviewed release PR.
+      - name: Publish stable desktop release
+        if: ${{ steps.release.outputs['packages/bb-app--release_created'] == 'true' }}
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh workflow run build-desktop.yml \
+            --ref main \
+            -f publish=true \
+            -f release_channel=stable
