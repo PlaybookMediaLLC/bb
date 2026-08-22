@@ -38,10 +38,12 @@ type NightlyWorkflow = {
   };
   jobs: {
     "nightly-desktop-linux": {
-      needs: string;
+      if: string;
+      needs: string[];
     };
     "nightly-desktop-macos": {
-      needs: string;
+      if: string;
+      needs: string[];
     };
   };
   "run-name": string;
@@ -118,8 +120,7 @@ describe("desktop release workflow", () => {
       APPLE_TEAM_ID: "${{ secrets.APPLE_TEAM_ID }}",
       MACOS_CERTIFICATE_NAME: "${{ secrets.MACOS_CERTIFICATE_NAME }}",
       MACOS_CERTIFICATE_P12: "${{ secrets.MACOS_CERTIFICATE_P12 }}",
-      MACOS_CERTIFICATE_PASSWORD:
-        "${{ secrets.MACOS_CERTIFICATE_PASSWORD }}",
+      MACOS_CERTIFICATE_PASSWORD: "${{ secrets.MACOS_CERTIFICATE_PASSWORD }}",
     };
 
     expect(validationStep.env).toEqual(expectedSecrets);
@@ -158,7 +159,14 @@ describe("desktop release workflow", () => {
     expect(workflow.env.RELEASE_DRY_RUN).toBe(
       "${{ github.event_name == 'schedule' && 'true' || inputs.dry_run }}",
     );
-    expect(workflow.jobs["nightly-desktop-macos"].needs).toBe("publish");
-    expect(workflow.jobs["nightly-desktop-linux"].needs).toBe("publish");
+    for (const jobName of [
+      "nightly-desktop-macos",
+      "nightly-desktop-linux",
+    ] as const) {
+      const job = workflow.jobs[jobName];
+      expect(job.needs).toEqual(["publish", "publish-nightly"]);
+      expect(job.if).toContain("!cancelled()");
+      expect(job.if).toContain("github.event_name == 'schedule'");
+    }
   });
 });

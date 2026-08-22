@@ -9,8 +9,11 @@ import {
 } from "node:fs/promises";
 import { isAbsolute, join, resolve } from "node:path";
 import { createPluginArtifactMeta } from "./plugin-artifact-meta.js";
-import { validatePluginBuildManifest } from "./plugin-manifest.js";
-import { type PluginBuildToolchain } from "./toolchain.js";
+import { isRecord, validatePluginBuildManifest } from "./plugin-manifest.js";
+import {
+  NODE_ESM_REQUIRE_BANNER,
+  type PluginBuildToolchain,
+} from "./toolchain.js";
 
 /**
  * `bb plugin build` — compile a plugin's `bb.server` entry into a
@@ -18,7 +21,7 @@ import { type PluginBuildToolchain } from "./toolchain.js";
  *
  * - `dist/server.js` (+ `.map`) — single node-platform ESM file with the
  *   plugin's npm deps inlined, so git:/npm: consumers never need npm or
- *   node_modules. `@bb/plugin-sdk` stays external — plugin authors only ever
+ *   node_modules. `@get-bb/plugin-sdk` stays external — plugin authors only ever
  *   have its `.d.ts` types, so the specifier must survive to load time, where
  *   the server's loader aliases it to the SDK runtime bundle shipped next to
  *   the server (workspace resolution covers source checkouts). better-sqlite3
@@ -28,17 +31,15 @@ import { type PluginBuildToolchain } from "./toolchain.js";
  *   artifact-format, and build-version metadata.
  */
 
-// Same shim scripts/build-utils.mjs applies to our own node bundles: plugin
-// deps may be CJS and reference require/__dirname/__filename, which do not
-// exist in ESM output.
-const NODE_ESM_REQUIRE_BANNER = [
-  'import { createRequire as __createRequire } from "node:module";',
-  'import { dirname as __pathDirname } from "node:path";',
-  'import { fileURLToPath as __fileURLToPath } from "node:url";',
-  "const require = __createRequire(import.meta.url);",
-  "var __filename = __fileURLToPath(import.meta.url);",
-  "var __dirname = __pathDirname(__filename);",
-].join("\n");
+/** The SDK package plugin server sources import. */
+const PLUGIN_SDK_SPECIFIER = "@get-bb/plugin-sdk";
+
+/**
+ * Legacy alias for {@link PLUGIN_SDK_SPECIFIER}, kept so pre-rename plugin
+ * sources still build. The server loader aliases both specifiers to the same
+ * SDK runtime bundle; a later change removes it.
+ */
+const LEGACY_PLUGIN_SDK_SPECIFIER = "@bb/plugin-sdk";
 
 /**
  * Specifiers the backend bundle leaves unresolved. Everything else a plugin's
@@ -46,7 +47,8 @@ const NODE_ESM_REQUIRE_BANNER = [
  * real `dependency` — `packages/templates` scaffolds against this list.
  */
 export const PLUGIN_SERVER_EXTERNALS: readonly string[] = [
-  "@bb/plugin-sdk",
+  PLUGIN_SDK_SPECIFIER,
+  LEGACY_PLUGIN_SDK_SPECIFIER,
   "better-sqlite3",
 ];
 
@@ -55,10 +57,6 @@ interface PluginServerConfig {
   serverEntry: string;
   packageName: string;
   pluginVersion: string;
-}
-
-function isRecord(value: unknown): value is Record<string, unknown> {
-  return typeof value === "object" && value !== null && !Array.isArray(value);
 }
 
 /** Read `<rootDir>/package.json` and resolve its `bb.server` entry, or throw. */
@@ -110,7 +108,7 @@ async function readPluginServerConfig(
   };
 }
 
-export interface PluginServerBuildResult {
+interface PluginServerBuildResult {
   jsPath: string;
   mapPath: string;
   metaPath: string;

@@ -19,8 +19,6 @@ export interface DesktopReleaseConfig {
   updateMetadataFileNames: DesktopUpdateMetadataFileNames;
 }
 
-export const DESKTOP_RELEASE_CHANNEL_ENV_NAME: "BB_DESKTOP_RELEASE_CHANNEL";
-
 export function resolveDesktopReleaseChannel(
   env: NodeJS.ProcessEnv,
 ): DesktopReleaseChannel;

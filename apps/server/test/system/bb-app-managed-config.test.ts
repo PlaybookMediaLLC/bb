@@ -61,12 +61,12 @@ function createCountingLogger(): CountingLogger {
 function createRuntimeConfig(): ServerRuntimeConfig {
   return {
     appUrl: "https://ambient-app.example.test",
-    appSurface: "web",
     appVersion: "0.0.0-test",
     builtinSkillsRootPath: "/tmp/bb-test/builtin-skills",
     customAcpAgents: [],
     customModels: [],
     dataDir: "/tmp/bb-test",
+    marketplaceUrl: "https://marketplace.invalid/marketplace.json",
     featureFlags: defaultFeatureFlags,
     hostDaemonPort: 38887,
     inheritedSkillsRootPaths: [],
@@ -77,7 +77,6 @@ function createRuntimeConfig(): ServerRuntimeConfig {
     openAiApiKey: "ambient-openai-key",
     serverPort: 38886,
     sharedSkillRoots: { user: [], project: [] },
-    threadStorageRootPath: "/tmp/bb-test/thread-storage",
     transcriptionModel: "openai/gpt-4o-transcribe",
   };
 }
@@ -207,6 +206,7 @@ describe("bb-app managed config", () => {
             command: "my-agent",
             args: ["acp"],
             env: { MY_AGENT_HOME: "/tmp/my-agent" },
+            supportsManualCompaction: false,
           },
         ],
       },
@@ -221,6 +221,7 @@ describe("bb-app managed config", () => {
         command: "my-agent",
         args: ["acp"],
         env: { MY_AGENT_HOME: "/tmp/my-agent" },
+        supportsManualCompaction: false,
       },
     ]);
   });
@@ -239,6 +240,7 @@ describe("bb-app managed config", () => {
             command: "my-agent",
             args: [],
             env: {},
+            supportsManualCompaction: false,
           },
         ],
       },
@@ -403,6 +405,7 @@ describe("bb-app managed config", () => {
           command: "valid-agent",
           args: [],
           env: {},
+          supportsManualCompaction: false,
         },
       ]);
       expect(logger.warnings()).toEqual([
