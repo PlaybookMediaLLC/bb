@@ -1,5 +1,18 @@
 # Changelog
 
+## [0.39.1](https://github.com/PlaybookMediaLLC/bb/compare/marketing-harness-v0.39.0...marketing-harness-v0.39.1) (2026-08-22)
+
+
+### Features
+
+* automate release pull requests ([#8](https://github.com/PlaybookMediaLLC/bb/issues/8)) ([db2b6e7](https://github.com/PlaybookMediaLLC/bb/commit/db2b6e7b21b618577932a8d1c62443d8a1645069))
+
+
+### Bug Fixes
+
+* provide repository for release checks ([#11](https://github.com/PlaybookMediaLLC/bb/issues/11)) ([17209d3](https://github.com/PlaybookMediaLLC/bb/commit/17209d3fc977f472ac8ff74c09c216a207d78eef))
+* release from all main changes ([#9](https://github.com/PlaybookMediaLLC/bb/issues/9)) ([b021002](https://github.com/PlaybookMediaLLC/bb/commit/b02100256c831374270090aeaddcc4bf53f0d5dd))
+
 ## 0.39.0
 
 Faster large threads, child threads across projects, and a long list of fixes.
