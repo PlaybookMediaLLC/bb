@@ -25,6 +25,28 @@ const THREAD_INFO_TAB_ID = "thread-info:thread-info:none";
 const GIT_DIFF_TAB_ID = "git-diff:git-diff:none";
 const NEW_TAB_TAB_ID = "new-tab:new-tab:none";
 
+/** Native preview state retained by a plugin file-opener tab for `Original`. */
+export type FileOpenerOwnerRequest =
+  | {
+      kind: "workspace-file-preview";
+      environmentId: string | null;
+      projectId: string | null;
+      tab: WorkspaceFileTabState;
+      threadId: string | null;
+    }
+  | {
+      kind: "host-file-preview";
+      environmentId: string;
+      tab: HostFileTabState;
+      threadId: string;
+    }
+  | {
+      kind: "thread-storage-file-preview";
+      environmentId: string | null;
+      tab: ThreadStorageFileTabState;
+      threadId: string;
+    };
+
 const environmentFilePreviewSourceSchema: z.ZodType<EnvironmentFilePreviewSource> =
   z.discriminatedUnion("kind", [
     z
@@ -53,6 +75,51 @@ const filePreviewLineRangeSchema: z.ZodType<FilePreviewLineRange> = z
   })
   .strict()
   .refine((range) => range.startLineNumber <= range.endLineNumber);
+const fileOpenerOwnerRequestSchema: z.ZodType<FileOpenerOwnerRequest> =
+  z.discriminatedUnion("kind", [
+    z
+      .object({
+        kind: z.literal("workspace-file-preview"),
+        environmentId: z.string().min(1).nullable(),
+        projectId: z.string().min(1).nullable(),
+        tab: z
+          .object({
+            lineRange: filePreviewLineRangeSchema.nullable(),
+            path: z.string().min(1),
+            source: environmentFilePreviewSourceSchema,
+            statusLabel: workspaceFilePreviewStatusLabelSchema,
+          })
+          .strict(),
+        threadId: z.string().min(1).nullable(),
+      })
+      .strict(),
+    z
+      .object({
+        kind: z.literal("host-file-preview"),
+        environmentId: z.string().min(1),
+        tab: z
+          .object({
+            lineRange: filePreviewLineRangeSchema.nullable(),
+            path: z.string().min(1),
+          })
+          .strict(),
+        threadId: z.string().min(1),
+      })
+      .strict(),
+    z
+      .object({
+        kind: z.literal("thread-storage-file-preview"),
+        environmentId: z.string().min(1).nullable(),
+        tab: z
+          .object({
+            lineRange: filePreviewLineRangeSchema.nullable(),
+            path: z.string().min(1),
+          })
+          .strict(),
+        threadId: z.string().min(1),
+      })
+      .strict(),
+  ]);
 const threadInfoFixedPanelTabSchema = z
   .object({
     id: z.string().min(1),
@@ -117,16 +184,36 @@ const newTabFixedPanelTabSchema = z
     kind: z.literal("new-tab"),
   })
   .strict();
+const terminalFixedPanelTargetSchema = z.discriminatedUnion("kind", [
+  z.object({ kind: z.literal("thread"), threadId: z.string().min(1) }).strict(),
+  z
+    .object({
+      kind: z.literal("environment"),
+      environmentId: z.string().min(1),
+    })
+    .strict(),
+  z
+    .object({
+      kind: z.literal("host_path"),
+      hostId: z.string().min(1),
+      cwd: z.string().min(1).nullable(),
+    })
+    .strict(),
+]);
 const terminalFixedPanelTabSchema = z
   .object({
     id: z.string().min(1),
     kind: z.literal("terminal"),
     terminalId: z.string().min(1),
+    // Nav-panel right panels can host terminals from an explicit target. The
+    // field is absent on thread/root-compose tabs, whose surface owns it.
+    target: terminalFixedPanelTargetSchema.optional(),
   })
   .strict();
 const pluginPanelFixedPanelTabSchema = z
   .object({
     actionId: z.string().min(1),
+    fileOpenerOwner: fileOpenerOwnerRequestSchema.optional(),
     id: z.string().min(1),
     kind: z.literal("plugin-panel"),
     paramsJson: z.string().nullable(),
@@ -200,6 +287,8 @@ export interface GitDiffFixedPanelTab {
  */
 export interface PluginPanelFixedPanelTab {
   actionId: string;
+  /** Present only when this plugin panel diverted a native file preview. */
+  fileOpenerOwner?: FileOpenerOwnerRequest;
   id: string;
   kind: "plugin-panel";
   paramsJson: string | null;
@@ -262,7 +351,13 @@ export interface TerminalFixedPanelTab {
   id: string;
   kind: "terminal";
   terminalId: string;
+  target?: TerminalFixedPanelTarget;
 }
+
+export type TerminalFixedPanelTarget =
+  | { kind: "thread"; threadId: string }
+  | { kind: "environment"; environmentId: string }
+  | { kind: "host_path"; hostId: string; cwd: string | null };
 
 export type SecondaryFixedPanelTab =
   | ThreadInfoFixedPanelTab
@@ -377,6 +472,7 @@ interface CreateWorkspaceFilePreviewFixedPanelTabArgs {
 
 interface CreateTerminalFixedPanelTabArgs {
   terminalId: string;
+  target?: TerminalFixedPanelTarget;
 }
 
 interface CreatePluginPanelFixedPanelTabArgs {
@@ -616,8 +712,50 @@ export function createNewTabFixedPanelTab(): NewTabFixedPanelTab {
   };
 }
 
+/**
+ * Runtime invariant shared by every fixed secondary-panel host: an open panel
+ * always has an active tab. Keep a persisted active tab when it still exists,
+ * fall back to the first surviving tab when it does not, and close the panel
+ * when hydration leaves no tabs to show.
+ */
+export function ensureOpenFixedPanelHasActiveTab(
+  state: FixedPanelTabsState,
+): FixedPanelTabsState {
+  if (!state.secondary.isOpen) {
+    return state;
+  }
+
+  const activeTab = state.secondary.tabs.find(
+    (tab) => tab.id === state.secondary.activeTabId,
+  );
+  if (activeTab !== undefined) {
+    return state;
+  }
+
+  const fallbackTab = state.secondary.tabs[0];
+  if (fallbackTab === undefined) {
+    return {
+      ...state,
+      secondary: {
+        ...state.secondary,
+        activeTabId: null,
+        isOpen: false,
+      },
+    };
+  }
+
+  return {
+    ...state,
+    secondary: {
+      ...state.secondary,
+      activeTabId: fallbackTab.id,
+    },
+  };
+}
+
 export function createTerminalFixedPanelTab({
   terminalId,
+  target,
 }: CreateTerminalFixedPanelTabArgs): TerminalFixedPanelTab {
   return {
     id: buildFixedPanelTabId({
@@ -627,6 +765,7 @@ export function createTerminalFixedPanelTab({
     }),
     kind: "terminal",
     terminalId,
+    ...(target !== undefined ? { target } : {}),
   };
 }
 
@@ -767,11 +906,32 @@ function stripTransientFixedPanelTabForStorage(
       };
     case "thread-info":
     case "git-diff":
-    case "plugin-panel":
     case "browser":
     case "new-tab":
     case "terminal":
       return tab;
+    case "plugin-panel":
+      return tab.fileOpenerOwner === undefined
+        ? tab
+        : {
+            ...tab,
+            fileOpenerOwner: stripFileOpenerOwnerRequestForStorage(
+              tab.fileOpenerOwner,
+            ),
+          };
+  }
+}
+
+function stripFileOpenerOwnerRequestForStorage(
+  owner: FileOpenerOwnerRequest,
+): FileOpenerOwnerRequest {
+  switch (owner.kind) {
+    case "workspace-file-preview":
+      return { ...owner, tab: { ...owner.tab, lineRange: null } };
+    case "host-file-preview":
+      return { ...owner, tab: { ...owner.tab, lineRange: null } };
+    case "thread-storage-file-preview":
+      return { ...owner, tab: { ...owner.tab, lineRange: null } };
   }
 }
 
@@ -894,7 +1054,7 @@ function parseFixedPanelTabsStateForStorage({
 
   return {
     shouldPrune: false,
-    state: normalizedState,
+    state: ensureOpenFixedPanelHasActiveTab(normalizedState),
   };
 }
 
@@ -954,6 +1114,7 @@ export function areFixedPanelTabsEquivalent(
         a.pluginId === b.pluginId &&
         a.actionId === b.actionId &&
         a.paramsJson === b.paramsJson &&
+        areFileOpenerOwnerRequestsEqual(a.fileOpenerOwner, b.fileOpenerOwner) &&
         a.title === b.title
       );
     case "workspace-file-preview":
@@ -1000,6 +1161,36 @@ export function areFixedPanelTabsEquivalent(
         a.threadId === b.threadId
       );
     case "terminal":
-      return b.kind === "terminal" && a.terminalId === b.terminalId;
+      return (
+        b.kind === "terminal" &&
+        a.terminalId === b.terminalId &&
+        JSON.stringify(a.target) === JSON.stringify(b.target)
+      );
   }
+}
+
+function areFileOpenerOwnerRequestsEqual(
+  a: FileOpenerOwnerRequest | undefined,
+  b: FileOpenerOwnerRequest | undefined,
+): boolean {
+  if (a === undefined || b === undefined) return a === b;
+  if (
+    a.kind !== b.kind ||
+    a.environmentId !== b.environmentId ||
+    a.threadId !== b.threadId ||
+    a.tab.path !== b.tab.path ||
+    !areFilePreviewLineRangesEqual({
+      a: a.tab.lineRange,
+      b: b.tab.lineRange,
+    })
+  ) {
+    return false;
+  }
+  if (a.kind !== "workspace-file-preview") return true;
+  return (
+    b.kind === "workspace-file-preview" &&
+    a.projectId === b.projectId &&
+    areEnvironmentFilePreviewSourcesEqual(a.tab.source, b.tab.source) &&
+    a.tab.statusLabel === b.tab.statusLabel
+  );
 }

@@ -158,6 +158,92 @@ export interface AppendDaemonEventsResult {
   skippedTurnUnstartedInputIndexes: number[];
 }
 
+interface ItemLifecycleLookupKey {
+  itemId: string;
+  threadId: string;
+}
+
+interface LatestItemLifecycleRow extends ItemLifecycleLookupKey {
+  type:
+    | "item/started"
+    | "item/completed"
+    | "item/backgroundTask/completed";
+}
+
+const TERMINAL_ITEM_EVENT_TYPES = [
+  "item/completed",
+  "item/backgroundTask/completed",
+] as const satisfies readonly ThreadEventType[];
+
+function isTerminalItemEventType(
+  type: ThreadEventType,
+): type is (typeof TERMINAL_ITEM_EVENT_TYPES)[number] {
+  return type === "item/completed" || type === "item/backgroundTask/completed";
+}
+
+function buildItemLifecycleKey(args: ItemLifecycleLookupKey): string {
+  return `${args.threadId}\0${args.itemId}`;
+}
+
+function collectTerminalItemLookupKeys(
+  eventInputs: readonly AppendDaemonEventInput[],
+): ItemLifecycleLookupKey[] {
+  return eventInputs.flatMap((input) =>
+    input.itemId !== null && isTerminalItemEventType(input.type)
+      ? [{ itemId: input.itemId, threadId: input.threadId }]
+      : [],
+  );
+}
+
+function listLatestItemLifecycleRows(
+  db: DbQueryConnection,
+  lookupKeys: readonly ItemLifecycleLookupKey[],
+): LatestItemLifecycleRow[] {
+  return queryInSqliteVariableBatches({
+    dedupeKey: buildItemLifecycleKey,
+    fixedVariableCount: 0,
+    queryBatch: (keys) => {
+      const requestedValues = sql.join(
+        keys.map((key) => sql`(${key.threadId}, ${key.itemId})`),
+        sql`, `,
+      );
+      return db.all<LatestItemLifecycleRow>(sql`
+        WITH requested_item(thread_id, item_id) AS (
+          VALUES ${requestedValues}
+        )
+        SELECT
+          lifecycle.thread_id AS threadId,
+          lifecycle.item_id AS itemId,
+          lifecycle.type AS type
+        FROM requested_item requested
+        JOIN ${events} AS lifecycle
+          INDEXED BY events_item_lifecycle_thread_item_sequence_idx
+          ON lifecycle.thread_id = requested.thread_id
+          AND lifecycle.item_id = requested.item_id
+        WHERE lifecycle.type IN (
+          'item/started',
+          'item/completed',
+          'item/backgroundTask/completed'
+        )
+          AND lifecycle.sequence = (
+            SELECT MAX(candidate.sequence)
+            FROM ${events} AS candidate
+              INDEXED BY events_item_lifecycle_thread_item_sequence_idx
+            WHERE candidate.thread_id = requested.thread_id
+              AND candidate.item_id = requested.item_id
+              AND candidate.type IN (
+                'item/started',
+                'item/completed',
+                'item/backgroundTask/completed'
+              )
+          )
+      `);
+    },
+    values: lookupKeys,
+    variableCountPerValue: 2,
+  });
+}
+
 export interface MissingStoredTurnStartedDetails {
   eventType: ThreadEventType;
   scopeKind: ThreadEventScopeKind;
@@ -583,6 +669,14 @@ export function appendDaemonEventsInTransaction(
     db,
     collectDaemonTurnStartLookupKeys(eventInputs),
   );
+  const settledItemKeys = new Set(
+    listLatestItemLifecycleRows(
+      db,
+      collectTerminalItemLookupKeys(eventInputs),
+    )
+      .filter((row) => isTerminalItemEventType(row.type))
+      .map(buildItemLifecycleKey),
+  );
   const now = Date.now();
   for (const [index, input] of eventInputs.entries()) {
     if (
@@ -593,11 +687,30 @@ export function appendDaemonEventsInTransaction(
       continue;
     }
 
+    const turnId = getThreadEventScopeTurnId(input.scope) ?? null;
+    const itemLifecycleKey =
+      input.itemId === null
+        ? null
+        : buildItemLifecycleKey({
+            itemId: input.itemId,
+            threadId: input.threadId,
+          });
+    if (input.type === "item/started" && itemLifecycleKey !== null) {
+      settledItemKeys.delete(itemLifecycleKey);
+    } else if (
+      isTerminalItemEventType(input.type) &&
+      itemLifecycleKey !== null
+    ) {
+      if (settledItemKeys.has(itemLifecycleKey)) {
+        continue;
+      }
+      settledItemKeys.add(itemLifecycleKey);
+    }
+
     const sequence = nextSequencesByThreadId.get(input.threadId);
     if (sequence === undefined) {
       throw new Error(`Missing event sequence for thread: ${input.threadId}`);
     }
-    const turnId = getThreadEventScopeTurnId(input.scope) ?? null;
     db.run(
       sql`INSERT INTO events
         (id, thread_id, environment_id, scope_kind, turn_id, provider_thread_id, sequence, type, item_id, item_kind, data, created_at)
@@ -1053,6 +1166,10 @@ export interface PruneBackgroundTaskProgressEventsArgs {
 
 export interface ListOpenBackgroundTaskItemRowsForHostArgs {
   hostId: string;
+}
+
+export interface ListOpenBackgroundTaskItemRowsForThreadArgs {
+  threadId: string;
 }
 
 export interface OpenBackgroundTaskItemRow {
@@ -2081,10 +2198,10 @@ export function listActiveBackgroundTaskCountsByThreadIds(
   db: DbQueryConnection,
   args: ListActiveBackgroundTaskCountsByThreadIdsArgs,
 ): ActiveBackgroundTaskCountRow[] {
-  // The query binds each thread ID twice and also binds 11 fixed values.
+  // The query binds each thread ID once and also binds 14 fixed values.
   const rows = queryInSqliteVariableBatches({
     dedupeKey: (threadId) => threadId,
-    fixedVariableCount: 11,
+    fixedVariableCount: 14,
     queryBatch: (threadIds) => {
       const startedType = "item/started" satisfies ThreadEventType;
       const progressType =
@@ -2098,27 +2215,29 @@ export function listActiveBackgroundTaskCountsByThreadIds(
         `= '${backgroundTaskItemKind}'`,
       );
       return db.all<ActiveBackgroundTaskCountRow>(sql`
-    WITH latest_background_task_activity AS (
+    WITH latest_background_task_state AS (
       SELECT
         ${events.threadId} AS thread_id,
         ${events.itemId} AS item_id,
-        MAX(${events.sequence}) AS sequence
+        MAX(
+          CASE
+            WHEN ${inArray(events.type, [startedType, progressType])}
+              THEN ${events.sequence}
+            ELSE NULL
+          END
+        ) AS sequence,
+        MAX(
+          CASE
+            WHEN ${eq(events.type, completedType)} THEN 1
+            ELSE 0
+          END
+        ) AS is_completed
       FROM ${events} INDEXED BY events_background_task_thread_type_item_sequence_idx
       WHERE ${inArray(events.threadId, [...threadIds])}
         AND ${events.itemKind} ${backgroundTaskItemKindPredicate}
-        AND ${inArray(events.type, [startedType, progressType])}
+        AND ${inArray(events.type, [startedType, progressType, completedType])}
         AND ${isNotNull(events.itemId)}
       GROUP BY ${events.threadId}, ${events.itemId}
-    ),
-    completed_background_task_activity AS (
-      SELECT DISTINCT
-        ${events.threadId} AS thread_id,
-        ${events.itemId} AS item_id
-      FROM ${events} INDEXED BY events_background_task_thread_type_item_sequence_idx
-      WHERE ${inArray(events.threadId, [...threadIds])}
-        AND ${events.itemKind} ${backgroundTaskItemKindPredicate}
-        AND ${eq(events.type, completedType)}
-        AND ${isNotNull(events.itemId)}
     )
     SELECT
       active_event.thread_id AS threadId,
@@ -2148,14 +2267,12 @@ export function listActiveBackgroundTaskCountsByThreadIds(
           ELSE 0
         END
       ) AS activeBackgroundCommandCount
-    FROM latest_background_task_activity latest
+    FROM latest_background_task_state latest
     JOIN events active_event
       ON active_event.thread_id = latest.thread_id
       AND active_event.sequence = latest.sequence
-    LEFT JOIN completed_background_task_activity completed
-      ON completed.thread_id = latest.thread_id
-      AND completed.item_id = latest.item_id
-    WHERE completed.item_id IS NULL
+    WHERE latest.is_completed = 0
+      AND latest.sequence IS NOT NULL
       AND json_extract(active_event.data, '$.item.status') = 'pending'
       AND json_extract(active_event.data, '$.item.taskType') IN (
         ${LOCAL_WORKFLOW_TASK_TYPE},
@@ -2172,7 +2289,7 @@ export function listActiveBackgroundTaskCountsByThreadIds(
   `);
     },
     values: args.threadIds,
-    variableCountPerValue: 2,
+    variableCountPerValue: 1,
   });
 
   return rows.sort((left, right) =>
@@ -3423,6 +3540,67 @@ export function listOpenBackgroundTaskItemRowsForHost(
       ),
     )
     .orderBy(events.threadId, events.itemId)
+    .all();
+
+  return rows.flatMap((row) =>
+    row.itemId === null ? [] : [{ ...row, itemId: row.itemId }],
+  );
+}
+
+/**
+ * Latest lifecycle row per open backgroundTask item in one thread. Successful
+ * thread-runtime releases use this to settle work the released provider
+ * process could no longer report itself.
+ */
+export function listOpenBackgroundTaskItemRowsForThread(
+  db: DbQueryConnection,
+  args: ListOpenBackgroundTaskItemRowsForThreadArgs,
+): OpenBackgroundTaskItemRow[] {
+  const startedType = "item/started" satisfies ThreadEventType;
+  const progressType =
+    "item/backgroundTask/progress" satisfies ThreadEventType;
+  const completedType =
+    "item/backgroundTask/completed" satisfies ThreadEventType;
+  const settled = alias(events, "settled_thread_background_task");
+
+  const rows = db
+    .select({
+      data: events.data,
+      environmentId: threads.environmentId,
+      itemId: events.itemId,
+      providerThreadId: events.providerThreadId,
+      threadId: events.threadId,
+    })
+    .from(events)
+    .innerJoin(threads, eq(events.threadId, threads.id))
+    .where(
+      and(
+        eq(events.threadId, args.threadId),
+        eq(events.itemKind, "backgroundTask"),
+        inArray(events.type, [startedType, progressType]),
+        isNotNull(events.itemId),
+        notExists(
+          db
+            .select({ one: sql`1` })
+            .from(settled)
+            .where(
+              and(
+                eq(settled.threadId, events.threadId),
+                eq(settled.itemId, events.itemId),
+                eq(settled.type, completedType),
+              ),
+            ),
+        ),
+        sql`${events.sequence} = (
+          SELECT MAX(latest.sequence)
+          FROM events latest
+          WHERE latest.thread_id = ${events.threadId}
+            AND latest.item_id = ${events.itemId}
+            AND latest.type IN (${startedType}, ${progressType})
+        )`,
+      ),
+    )
+    .orderBy(events.itemId)
     .all();
 
   return rows.flatMap((row) =>

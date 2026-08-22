@@ -6,16 +6,20 @@ import {
   createBrowserFixedPanelTab,
   createEmptyFixedPanelTabsState,
   createHostFilePreviewFixedPanelTab,
+  createNewTabFixedPanelTab,
+  createPluginPanelFixedPanelTab,
   createTerminalFixedPanelTab,
   createThreadInfoFixedPanelTab,
   createThreadStorageFilePreviewFixedPanelTab,
   createWorkspaceFilePreviewFixedPanelTab,
+  ensureOpenFixedPanelHasActiveTab,
   getFixedPanelTabsStateStorageKey,
   isFixedPanelTabsStateStorageKey,
   parseFixedPanelTabsState,
   serializeFixedPanelTabsState,
   FIXED_PANEL_TABS_STATE_STORAGE_VERSION,
   type FixedPanelTabsState,
+  type PluginPanelFixedPanelTab,
 } from "./fixed-panel-tabs-state";
 
 const NOW = 1_700_000_000_000;
@@ -116,6 +120,77 @@ describe("fixed-panel-tabs-state", () => {
     });
 
     expect(parsed).toBe(initialValue);
+  });
+
+  it("closes an open panel when its transient New tab is removed during hydration", () => {
+    const newTab = createNewTabFixedPanelTab();
+    const state: FixedPanelTabsState = {
+      version: FIXED_PANEL_TABS_STATE_STORAGE_VERSION,
+      secondary: {
+        activeTabId: newTab.id,
+        isOpen: true,
+        tabs: [newTab],
+      },
+      lastUsedAt: NOW,
+    };
+
+    const storedValue = serializeFixedPanelTabsState({ state });
+    expect(JSON.parse(storedValue)).toMatchObject({
+      secondary: { activeTabId: null, isOpen: true, tabs: [] },
+    });
+
+    const parsed = parseFixedPanelTabsState({
+      initialValue: EMPTY_FIXED_PANEL_TABS_STATE,
+      now: NOW,
+      storedValue,
+    });
+
+    expect(parsed.secondary).toEqual({
+      activeTabId: null,
+      isOpen: false,
+      tabs: [],
+    });
+  });
+
+  it("selects the first surviving tab when the persisted active tab is gone", () => {
+    const infoTab = createThreadInfoFixedPanelTab();
+    const state: FixedPanelTabsState = {
+      version: FIXED_PANEL_TABS_STATE_STORAGE_VERSION,
+      secondary: {
+        activeTabId: "missing",
+        isOpen: true,
+        tabs: [infoTab],
+      },
+      lastUsedAt: NOW,
+    };
+
+    expect(ensureOpenFixedPanelHasActiveTab(state).secondary).toEqual({
+      activeTabId: infoTab.id,
+      isOpen: true,
+      tabs: [infoTab],
+    });
+  });
+
+  it("keeps the persisted active tab when it still exists", () => {
+    const firstTab = createBrowserFixedPanelTab({
+      environmentId: null,
+      url: "https://first.example.com",
+    });
+    const lastActiveTab = createBrowserFixedPanelTab({
+      environmentId: null,
+      url: "https://last.example.com",
+    });
+    const state: FixedPanelTabsState = {
+      version: FIXED_PANEL_TABS_STATE_STORAGE_VERSION,
+      secondary: {
+        activeTabId: lastActiveTab.id,
+        isOpen: true,
+        tabs: [firstTab, lastActiveTab],
+      },
+      lastUsedAt: NOW,
+    };
+
+    expect(ensureOpenFixedPanelHasActiveTab(state)).toBe(state);
   });
 
   it("recognizes old versioned storage keys for pruning", () => {
@@ -319,6 +394,60 @@ describe("thread-owned file preview fixed panel tabs", () => {
         threadId: null,
       },
     ]);
+  });
+});
+
+describe("plugin file opener owner state", () => {
+  it("persists native preview context while dropping transient line selection", () => {
+    const tab = {
+      ...createPluginPanelFixedPanelTab({
+        actionId: "file-opener:markdown",
+        paramsJson: JSON.stringify({ path: "docs/readme.md" }),
+        pluginId: "docs",
+        title: "readme.md",
+      }),
+      fileOpenerOwner: {
+        kind: "workspace-file-preview" as const,
+        environmentId: "env_docs",
+        projectId: null,
+        tab: {
+          lineRange: { startLineNumber: 8, endLineNumber: 12 },
+          path: "docs/readme.md",
+          source: { kind: "working-tree" as const },
+          statusLabel: null,
+        },
+        threadId: "thr_docs",
+      },
+    } satisfies PluginPanelFixedPanelTab;
+    const state = createEmptyFixedPanelTabsState({
+      secondary: {
+        activeTabId: tab.id,
+        isOpen: true,
+        tabs: [tab],
+      },
+      lastUsedAt: NOW,
+    });
+
+    const parsed = parseFixedPanelTabsState({
+      initialValue: EMPTY_FIXED_PANEL_TABS_STATE,
+      now: NOW,
+      storedValue: serializeFixedPanelTabsState({ state }),
+    });
+
+    expect(parsed.secondary.tabs[0]).toMatchObject({
+      actionId: "file-opener:markdown",
+      fileOpenerOwner: {
+        environmentId: "env_docs",
+        projectId: null,
+        tab: {
+          lineRange: null,
+          path: "docs/readme.md",
+          source: { kind: "working-tree" },
+          statusLabel: null,
+        },
+        threadId: "thr_docs",
+      },
+    });
   });
 });
 

@@ -1,5 +1,5 @@
 /**
- * Version of the BB plugin SDK surface (`@bb/plugin-sdk`). Single source of
+ * Version of the BB plugin SDK surface (`@get-bb/plugin-sdk`). Single source of
  * truth shared by the CLI and the server: `bb plugin build` stamps it into a
  * plugin's `dist/app.meta.json` sidecar, and the host compares majors before
  * loading a bundle (design §7 — a stale bundle is skipped legibly, never a
@@ -16,7 +16,7 @@
 // PLUGIN_SDK_MAJOR is 0, so the major-only artifact gate cannot distinguish
 // 0.x releases and is intentionally vacuous for them until a future 1.0.
 // Rebuildable artifacts still rebuild on the exact sdkVersion-differs trigger.
-export const PLUGIN_SDK_VERSION = "0.4.3";
+export const PLUGIN_SDK_VERSION = "0.4.8";
 
 /** Major of {@link PLUGIN_SDK_VERSION} — the plugin API compatibility number. */
 export const PLUGIN_SDK_MAJOR = Number(PLUGIN_SDK_VERSION.split(".", 1)[0]);
