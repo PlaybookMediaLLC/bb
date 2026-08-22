@@ -493,18 +493,8 @@ jobs:
 
   nightly-desktop-macos:
     name: Build marketing-harness Nightly desktop (macOS)
-    # `!cancelled()` is required because publish-nightly is skipped on the
-    # scheduled and manual nightly paths, and a skipped need would otherwise
-    # skip this job too.
-    if: >-
-      ${{ !cancelled()
-      && needs.publish.result == 'success'
-      && (github.event_name == 'schedule'
-      || (inputs.npm_tag == 'nightly' && inputs.dry_run == false)
-      || needs.publish-nightly.result == 'success') }}
-    needs:
-      - publish
-      - publish-nightly
+    if: ${{ github.event_name == 'schedule' || (inputs.npm_tag == 'nightly' && inputs.dry_run == false) }}
+    needs: publish
     runs-on: macos-15-intel
     timeout-minutes: 45
     outputs:
@@ -538,10 +528,7 @@ jobs:
       - name: Apply the nightly version
         id: nightly_version
         env:
-          # publish-nightly holds the version on a release run; publish holds it
-          # on the scheduled and manual nightly paths, where publish-nightly is
-          # skipped and reports an empty version.
-          NIGHTLY_VERSION: ${{ needs.publish-nightly.outputs.version || needs.publish.outputs.version }}
+          NIGHTLY_VERSION: ${{ needs.publish.outputs.version }}
         run: |
           set -euo pipefail
 
@@ -630,20 +617,12 @@ jobs:
 
   nightly-desktop-linux:
     name: Build marketing-harness Nightly desktop (Linux)
-    # See the macOS job for why this condition uses `!cancelled()`.
-    if: >-
-      ${{ !cancelled()
-      && needs.publish.result == 'success'
-      && (github.event_name == 'schedule'
-      || (inputs.npm_tag == 'nightly' && inputs.dry_run == false)
-      || needs.publish-nightly.result == 'success') }}
-    needs:
-      - publish
-      - publish-nightly
+    if: ${{ github.event_name == 'schedule' || (inputs.npm_tag == 'nightly' && inputs.dry_run == false) }}
+    needs: publish
     # Pinned rather than ubuntu-latest so the glibc the AppImage links against
     # changes only when we choose it: the build machine's glibc sets the
     # minimum distro version users need.
-    runs-on: blacksmith-4vcpu-ubuntu-2204
+    runs-on: ubuntu-22.04
     timeout-minutes: 45
     outputs:
       version: ${{ steps.nightly_version.outputs.version }}
@@ -672,8 +651,7 @@ jobs:
       - name: Apply the nightly version
         id: nightly_version
         env:
-          # See the macOS job for why the version comes from either npm job.
-          NIGHTLY_VERSION: ${{ needs.publish-nightly.outputs.version || needs.publish.outputs.version }}
+          NIGHTLY_VERSION: ${{ needs.publish.outputs.version }}
         run: |
           set -euo pipefail
 
@@ -724,9 +702,8 @@ jobs:
 
   nightly-mobile-ios:
     name: Build bb Nightly iOS (EAS)
-    # Same gate as the desktop jobs: only after the npm publish succeeded on
-    # the scheduled or manual nightly path. The reusable workflow starts an
-    # EAS production build that auto-submits to TestFlight.
+    # The reusable workflow starts an EAS production build that auto-submits
+    # to TestFlight after a scheduled, manual, or post-release nightly publish.
     if: >-
       ${{ !cancelled()
       && needs.publish.result == 'success'
@@ -767,7 +744,7 @@ jobs:
     needs:
       - nightly-desktop-macos
       - nightly-desktop-linux
-    runs-on: blacksmith-4vcpu-ubuntu-2404
+    runs-on: ubuntu-latest
     timeout-minutes: 20
     permissions:
       contents: write

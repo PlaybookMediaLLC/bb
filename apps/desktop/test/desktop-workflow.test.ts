@@ -38,12 +38,10 @@ type NightlyWorkflow = {
   };
   jobs: {
     "nightly-desktop-linux": {
-      if: string;
-      needs: string[];
+      needs: string;
     };
     "nightly-desktop-macos": {
-      if: string;
-      needs: string[];
+      needs: string;
     };
   };
   "run-name": string;
@@ -159,14 +157,7 @@ describe("desktop release workflow", () => {
     expect(workflow.env.RELEASE_DRY_RUN).toBe(
       "${{ github.event_name == 'schedule' && 'true' || inputs.dry_run }}",
     );
-    for (const jobName of [
-      "nightly-desktop-macos",
-      "nightly-desktop-linux",
-    ] as const) {
-      const job = workflow.jobs[jobName];
-      expect(job.needs).toEqual(["publish", "publish-nightly"]);
-      expect(job.if).toContain("!cancelled()");
-      expect(job.if).toContain("github.event_name == 'schedule'");
-    }
+    expect(workflow.jobs["nightly-desktop-macos"].needs).toBe("publish");
+    expect(workflow.jobs["nightly-desktop-linux"].needs).toBe("publish");
   });
 });
