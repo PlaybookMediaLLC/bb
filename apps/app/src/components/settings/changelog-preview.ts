@@ -27,6 +27,11 @@ interface ChangelogReleaseMeta {
   headline: string;
 }
 
+function changelogVersion(heading: string): string {
+  const linkedVersion = /^\[([^\]]+)\]\(/.exec(heading);
+  return linkedVersion?.[1] ?? heading;
+}
+
 /** Presentation metadata from the canonical changelog page. */
 export const CHANGELOG_RELEASE_META: Record<string, ChangelogReleaseMeta> = {
   "0.39.0": {
@@ -97,7 +102,11 @@ export function parseChangelogEntries(source: string): ChangelogEntry[] {
     if (line.startsWith("## ") && !line.startsWith("### ")) {
       flushParagraph();
       section = null;
-      entry = { version: line.slice(3).trim(), lede: [], sections: [] };
+      entry = {
+        version: changelogVersion(line.slice(3).trim()),
+        lede: [],
+        sections: [],
+      };
       entries.push(entry);
       continue;
     }

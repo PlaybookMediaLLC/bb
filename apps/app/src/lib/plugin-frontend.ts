@@ -319,6 +319,7 @@ async function fetchFrontendCandidates(): Promise<PluginFrontendCandidate[]> {
       logoUrl?: unknown;
       logoDarkUrl?: unknown;
       iconUrl?: unknown;
+      icons?: unknown;
       app?: { bundle?: unknown };
     } | null;
     if (typeof typed?.id !== "string") continue;
@@ -329,12 +330,21 @@ async function fetchFrontendCandidates(): Promise<PluginFrontendCandidate[]> {
       typeof typed.iconUrl === "string" ? typed.iconUrl : null;
     const icon = typeof typed.icon === "string" ? typed.icon : null;
     const displayName = typeof typed.name === "string" ? typed.name : null;
+    // Declared icons: an older server sends no `icons`, which reads as a
+    // plugin that declares none.
+    const icons = new Map<string, string>();
+    if (typeof typed.icons === "object" && typed.icons !== null) {
+      for (const [name, url] of Object.entries(typed.icons)) {
+        if (typeof url === "string") icons.set(name, url);
+      }
+    }
     logoUrls.set(typed.id, {
       displayName,
       icon,
       compactIconUrl,
       logoUrl,
       logoDarkUrl,
+      icons,
     });
     if (typed.status !== "running") {
       continue;

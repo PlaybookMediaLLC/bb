@@ -1,4 +1,4 @@
-import { describe, expect, it, vi } from "vitest";
+import { beforeEach, describe, expect, it, vi } from "vitest";
 import type { AppCommandId } from "@bb/domain";
 import type {
   BbDesktopApi,
@@ -13,6 +13,7 @@ import type {
 import {
   BB_DESKTOP_CHECK_FOR_UPDATES_CHANNEL,
   BB_DESKTOP_GET_INFO_CHANNEL,
+  BB_DESKTOP_INFO_CHANGED_CHANNEL,
   BB_DESKTOP_INSTALL_UPDATE_CHANNEL,
   BB_DESKTOP_SET_THEME_CHANNEL,
 } from "../src/desktop-update-ipc.js";
@@ -43,6 +44,7 @@ import {
   BB_DESKTOP_CLOSE_WINDOW_RESPONSE_CHANNEL,
   BB_DESKTOP_GET_WINDOW_STATE_CHANNEL,
   BB_DESKTOP_OPEN_NEW_TAB_CHANNEL,
+  BB_DESKTOP_OPEN_SERVER_DAEMON_LOGS_CHANNEL,
   BB_DESKTOP_WINDOW_STATE_CHANGED_CHANNEL,
 } from "../src/desktop-window-command-ipc.js";
 const electronMock = vi.hoisted(() => {
@@ -164,8 +166,15 @@ function emitIpcPayload(args: EmitIpcPayloadArgs): void {
 }
 
 describe("desktop preload browser API", () => {
+  let api: BbDesktopApi;
+
+  // Vitest does not cancel a timed-out test body. Keep module loading in a
+  // hook so a slow transform cannot release stale commands into the next test.
+  beforeEach(async () => {
+    api = await loadPreload();
+  }, 30_000);
+
   it("exposes only the typed browser commands and forwards them over fixed channels", async () => {
-    const api = await loadPreload();
     const attachRequest = {
       tabId: "browser:a",
       url: "http://localhost:5173/",
@@ -303,8 +312,7 @@ describe("desktop preload browser API", () => {
     );
   }, 10_000);
 
-  it("converts zoomed renderer bounds to native window coordinates", async () => {
-    const api = await loadPreload();
+  it("converts zoomed renderer bounds to native window coordinates", () => {
     electronMock.setZoomFactor(1.25);
 
     api.browser.attach({
@@ -338,8 +346,7 @@ describe("desktop preload browser API", () => {
     ]);
   });
 
-  it("validates browser event payloads before notifying renderer listeners", async () => {
-    const api = await loadPreload();
+  it("validates browser event payloads before notifying renderer listeners", () => {
     const states: BbDesktopBrowserState[] = [];
     const openTabs: BbDesktopBrowserOpenTabRequest[] = [];
     const scopedOpenTabs: BbDesktopBrowserScopedOpenTabRequest[] = [];
@@ -503,9 +510,32 @@ describe("desktop preload browser API", () => {
     });
   });
 
-  it("answers unhandled close-window requests so main closes the window", async () => {
-    await loadPreload();
+  it("routes the log viewer request to main and mirrors its availability", async () => {
+    await api.openServerDaemonLogs?.();
+    expect(electronMock.invokeCalls).toContain(
+      BB_DESKTOP_OPEN_SERVER_DAEMON_LOGS_CHANNEL,
+    );
 
+    // Availability follows the runtime, so main re-pushes it on every swap and
+    // the renderer must read the pushed value, not its startup snapshot.
+    expect(api.serverDaemonLogsAvailable).toBeUndefined();
+    emitIpcPayload({
+      channel: BB_DESKTOP_INFO_CHANGED_CHANNEL,
+      payload: {
+        lastCheckedAt: null,
+        latestVersion: null,
+        pendingVersion: null,
+        platform: "macos",
+        serverDaemonLogsAvailable: true,
+        updateAvailable: false,
+        updateDownloaded: false,
+        version: "0.0.0-test",
+      },
+    });
+    expect(api.serverDaemonLogsAvailable).toBe(true);
+  });
+
+  it("answers unhandled close-window requests so main closes the window", () => {
     emitIpcPayload({
       channel: BB_DESKTOP_CLOSE_WINDOW_REQUEST_CHANNEL,
       payload: null,

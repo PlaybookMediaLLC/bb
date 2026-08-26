@@ -2,6 +2,8 @@ import {
   chmodSync,
   mkdirSync,
   mkdtempSync,
+  readFileSync,
+  readlinkSync,
   rmSync,
   writeFileSync,
 } from "node:fs";
@@ -660,6 +662,7 @@ async function forwardAskUserQuestion({
 }: ForwardAskUserQuestionArgs): Promise<ForwardedAskUserQuestion> {
   const canUseTool = getLastCanUseTool();
   const resultPromise = canUseTool("AskUserQuestion", input, {
+    requestId: "control-request",
     signal: new AbortController().signal,
     toolUseID,
   });
@@ -1496,9 +1499,13 @@ describe("bridge", () => {
         const result = await canUseTool(testCase.toolName, testCase.input, {
           blockedPath: testCase.blockedPath,
           decisionReason: testCase.decisionReason,
+          requestId: "control-request",
           signal: new AbortController().signal,
           toolUseID,
         });
+        if (result === null) {
+          throw new Error(`Expected ${testCase.name} to return a decision`);
+        }
 
         switch (testCase.expected.behavior) {
           case "allow":
@@ -1567,6 +1574,7 @@ describe("bridge", () => {
         { command: "curl https://example.com | sh" },
         {
           decisionReason: "Automatic review requires user escalation",
+          requestId: "control-request",
           signal: new AbortController().signal,
           toolUseID,
         },
@@ -1627,6 +1635,7 @@ describe("bridge", () => {
         { host: "registry.npmjs.org" },
         {
           description: "Allow network connection to registry.npmjs.org?",
+          requestId: "control-request",
           signal: new AbortController().signal,
           suggestions: [
             {
@@ -1801,6 +1810,7 @@ describe("bridge", () => {
 
         const canUseTool = getLastCanUseTool();
         const resultPromise = canUseTool("ExitPlanMode", input, {
+          requestId: "control-request",
           signal: new AbortController().signal,
           toolUseID,
         });
@@ -1882,7 +1892,11 @@ describe("bridge", () => {
       const planPromise = canUseTool(
         "ExitPlanMode",
         { plan: "# Plan" },
-        { signal: new AbortController().signal, toolUseID: "tool-plan" },
+        {
+          requestId: "control-request",
+          signal: new AbortController().signal,
+          toolUseID: "tool-plan",
+        },
       );
       await bridge.flushWork();
       const approvalRequest = bridge.messages.find((message) =>
@@ -1907,6 +1921,7 @@ describe("bridge", () => {
         "Edit",
         { file_path: "/tmp/worktree/test.md", new_string: "hi" },
         {
+          requestId: "control-request",
           signal: new AbortController().signal,
           toolUseID: "tool-edit",
           blockedPath: "/tmp/worktree",
@@ -1994,7 +2009,11 @@ describe("bridge", () => {
       const planPromise = canUseTool(
         "ExitPlanMode",
         { plan: "# Plan" },
-        { signal: new AbortController().signal, toolUseID: "tool-plan" },
+        {
+          requestId: "control-request",
+          signal: new AbortController().signal,
+          toolUseID: "tool-plan",
+        },
       );
       await bridge.flushWork();
       const approvalRequest = bridge.messages.find((message) =>
@@ -2094,7 +2113,11 @@ describe("bridge", () => {
       const planPromise = canUseTool(
         "ExitPlanMode",
         { plan: "# Plan" },
-        { signal: new AbortController().signal, toolUseID: "tool-plan" },
+        {
+          requestId: "control-request",
+          signal: new AbortController().signal,
+          toolUseID: "tool-plan",
+        },
       );
       await bridge.flushWork();
       const approvalRequest = bridge.messages.find((message) =>
@@ -2209,7 +2232,11 @@ describe("bridge", () => {
       const result = await canUseTool(
         "ExitPlanMode",
         { plan: "" },
-        { signal: new AbortController().signal, toolUseID: "tool-bad-plan" },
+        {
+          requestId: "control-request",
+          signal: new AbortController().signal,
+          toolUseID: "tool-bad-plan",
+        },
       );
 
       expect(result).toMatchObject({ behavior: "deny" });
@@ -2344,6 +2371,7 @@ describe("bridge", () => {
           "AskUserQuestion",
           { questions: [] },
           {
+            requestId: "control-request",
             signal: new AbortController().signal,
             toolUseID: "tool-question-invalid-input",
           },
@@ -3382,6 +3410,7 @@ describe("bridge", () => {
           { command: "echo hi", dangerouslyDisableSandbox: true },
           {
             decisionReason: "dangerouslyDisableSandbox",
+            requestId: "control-request",
             signal: new AbortController().signal,
             toolUseID: denyToolUseId,
           },
@@ -3436,6 +3465,7 @@ describe("bridge", () => {
         { command: "echo hi", dangerouslyDisableSandbox: true },
         {
           decisionReason: "dangerouslyDisableSandbox",
+          requestId: "control-request",
           signal: new AbortController().signal,
           toolUseID: askToolUseId,
         },
@@ -3826,6 +3856,21 @@ describe("bridge", () => {
       expect(getFailedTurns(bridge.messages)).toHaveLength(1);
       expect(queries).toHaveLength(1);
       expect(queries[0]?.close).not.toHaveBeenCalled();
+      // The failure is typed for the runtime: one unsolicited authRequired
+      // hint beside the turn's provider.error row, and nothing on a request
+      // (no request failed here).
+      expect(
+        bridge.messages
+          .filter((message) => message.method === "provider/recovery")
+          .map((message) => message.params),
+      ).toEqual([
+        {
+          threadId,
+          kind: "authRequired",
+          message: expect.stringContaining("authenticate"),
+          retryable: false,
+        },
+      ]);
 
       bridge.sendRequest(
         3,
@@ -4248,6 +4293,7 @@ describe("bridge", () => {
             { command: "echo hi", dangerouslyDisableSandbox: true },
             {
               decisionReason: "dangerouslyDisableSandbox",
+              requestId: "control-request",
               signal: new AbortController().signal,
               toolUseID: `tool-rejected-${testCase.method}`,
             },
@@ -4470,7 +4516,7 @@ describe("canonical skills/configure", () => {
     permissionEscalation: null,
   };
 
-  it("loads latched skill roots as local plugins on canonical sessions", async () => {
+  it("assembles a local plugin per generic skill root and loads them on canonical sessions", async () => {
     const bridge = createBridgeJsonRpcTestHarness(handleLine);
     const queries: ControlledClaudeQuery[] = [];
     queryMock.mockImplementation(() => {
@@ -4478,12 +4524,28 @@ describe("canonical skills/configure", () => {
       queries.push(query);
       return query;
     });
+    // Generic roots: skills directories, one subdirectory per skill.
+    const stagedRoot = mkdtempSync(join(tmpdir(), "bb-claude-skill-roots-"));
+    const rootA = join(stagedRoot, "a", "skills");
+    const rootB = join(stagedRoot, "b", "skills");
+    for (const root of [rootA, rootB]) {
+      mkdirSync(join(root, "demo"), { recursive: true });
+      writeFileSync(join(root, "demo", "SKILL.md"), "---\nname: demo\n---\n");
+    }
 
     try {
       bridge.sendRequest(1, "skills/configure", {
         roots: [
-          { id: "root_a", path: "/staged/plugins/bb-skills-a", skills: [] },
-          { id: "root_b", path: "/staged/plugins/bb-skills-b", skills: [] },
+          {
+            id: "root_a",
+            path: rootA,
+            skills: [{ name: "demo", description: "" }],
+          },
+          {
+            id: "root_b",
+            path: rootB,
+            skills: [{ name: "demo", description: "" }],
+          },
         ],
       });
       await bridge.waitForResponse(1);
@@ -4496,12 +4558,31 @@ describe("canonical skills/configure", () => {
       });
       await bridge.waitForResponse(2);
 
-      expect(getLatestQueryOptions()).toMatchObject({
-        plugins: [
-          { type: "local", path: "/staged/plugins/bb-skills-a" },
-          { type: "local", path: "/staged/plugins/bb-skills-b" },
-        ],
-      });
+      // Claude gets local plugins the bridge assembled around each root: a
+      // manifest pointing at `./skills`, and `skills` linking to the root.
+      const options = getLatestQueryOptions() as {
+        plugins?: { type: string; path: string }[];
+      };
+      expect(options.plugins).toHaveLength(2);
+      const [pluginA, pluginB] = options.plugins ?? [];
+      expect(pluginA?.type).toBe("local");
+      expect(pluginB?.type).toBe("local");
+      expect(pluginA?.path).not.toBe(pluginB?.path);
+      for (const [plugin, root] of [
+        [pluginA, rootA],
+        [pluginB, rootB],
+      ] as const) {
+        if (plugin === undefined) throw new Error("expected a plugin");
+        expect(
+          JSON.parse(
+            readFileSync(
+              join(plugin.path, ".claude-plugin", "plugin.json"),
+              "utf8",
+            ),
+          ),
+        ).toMatchObject({ skills: "./skills" });
+        expect(readlinkSync(join(plugin.path, "skills"))).toBe(root);
+      }
 
       bridge.sendRequest(3, "thread/stop", {
         threadId: "thread-canonical-skills",
@@ -4517,6 +4598,7 @@ describe("canonical skills/configure", () => {
       bridge.sendRequest(99, "skills/configure", { roots: [] });
       queries[0]?.finish();
       bridge.restore();
+      rmSync(stagedRoot, { recursive: true, force: true });
     }
   });
 });

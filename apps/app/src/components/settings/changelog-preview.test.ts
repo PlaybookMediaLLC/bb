@@ -29,6 +29,18 @@ Turn on **Edit messages** in Settings → Experiments.
 `;
 
 describe("parseChangelogEntries", () => {
+  it("extracts versions from release-please linked headings", () => {
+    const [entry] = parseChangelogEntries(`
+## [0.39.1](https://example.test/compare/v0.39.0...v0.39.1) (2026-08-22)
+
+### Bug Fixes
+
+- Kept the fork release notes readable.
+`);
+
+    expect(entry?.version).toBe("0.39.1");
+  });
+
   it("keeps a release's sections out of its version list", () => {
     const entries = parseChangelogEntries(SAMPLE);
 

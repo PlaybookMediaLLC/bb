@@ -20,6 +20,7 @@ import {
 } from "@bb/db";
 import { PLUGIN_SDK_MAJOR, PLUGIN_SDK_VERSION } from "@bb/domain";
 import type { Logger } from "@bb/logger";
+import { createAiServiceRegistry } from "../../../src/services/ai/ai-service-registry.js";
 import {
   createPluginService,
   dispatchPluginSourceWatchChange,
@@ -66,6 +67,9 @@ async function writePackagedBuiltinSource(workDir: string): Promise<{
   for (const name of BUILTIN_PLUGIN_NAMES) {
     const sourceRoot = join(sourceModuleDir, "builtin-plugins", name);
     const usesPluginOwnedIcon = name === "automations";
+    // Declared icons (`bb.branding.experimental_icons`) are manifest assets
+    // too: a provider logo named through them must reach the packaged root.
+    const usesDeclaredIcons = name === "provider-acp";
     await mkdir(join(sourceRoot, "dist"), { recursive: true });
     await mkdir(join(sourceRoot, "skills", name), { recursive: true });
     await mkdir(join(sourceRoot, "src"), { recursive: true });
@@ -79,9 +83,14 @@ async function writePackagedBuiltinSource(workDir: string): Promise<{
           bb: {
             name,
             description: `${name} builtin plugin fixture.`,
-            branding: usesPluginOwnedIcon
-              ? { icon: "./assets/icon.svg" }
-              : { icon: "Zap" },
+            branding: {
+              ...(usesPluginOwnedIcon
+                ? { icon: "./assets/icon.svg" }
+                : { icon: "Zap" }),
+              ...(usesDeclaredIcons
+                ? { experimental_icons: { cursor: "./icons/cursor.svg" } }
+                : {}),
+            },
             server: "./src/server.ts",
             app: "./app.tsx",
             skills: ["skills"],
@@ -102,6 +111,10 @@ async function writePackagedBuiltinSource(workDir: string): Promise<{
     if (usesPluginOwnedIcon) {
       await mkdir(join(sourceRoot, "assets"), { recursive: true });
       await writeFile(join(sourceRoot, "assets", "icon.svg"), "<svg/>\n");
+    }
+    if (usesDeclaredIcons) {
+      await mkdir(join(sourceRoot, "icons"), { recursive: true });
+      await writeFile(join(sourceRoot, "icons", "cursor.svg"), "<svg/>\n");
     }
     await writeFile(
       join(sourceRoot, "dist", "server.js"),
@@ -148,6 +161,7 @@ function createService(args: {
   watchBuiltinPluginSources?: boolean;
 }): PluginService {
   return createPluginService({
+    aiServices: createAiServiceRegistry(),
     telemetry: createNoopTelemetryService(),
     db: args.db,
     hub: {
@@ -221,6 +235,7 @@ describe("builtin plugin reconciliation", () => {
       ["plugin-api-tester", "Beaker"],
       ["inline-vis", "AppWindow"],
       ["keep-awake", "Coffee"],
+      ["monaco-editor", "Code"],
       ["pdf-preview", "FileText"],
       ["provider-acp", "./icons/acp.svg"],
       ["provider-claude-code", "./icons/claude-code.svg"],
@@ -452,6 +467,14 @@ describe("builtin plugin reconciliation", () => {
     );
 
     expect(pluginApiTester?.defaultEnabled).toBe(false);
+  });
+
+  it("ships the File Editor (monaco-editor) disabled on a fresh database", () => {
+    const monacoEditor = BUILTIN_PLUGINS.find(
+      (builtin) => builtin.name === "monaco-editor",
+    );
+
+    expect(monacoEditor?.defaultEnabled).toBe(false);
   });
 
   it("ships Workflows disabled on a fresh database", async () => {
@@ -994,6 +1017,11 @@ describe("builtin plugin packaging", () => {
     await expect(stat(join(copiedRoot, "src"))).rejects.toThrow();
     await expect(stat(join(copiedRoot, "app.tsx"))).rejects.toThrow();
     await expect(stat(join(copiedRoot, "node_modules"))).rejects.toThrow();
+
+    // A declared icon ships with the manifest that names it.
+    await expect(
+      readFile(join(targetRoot, "provider-acp", "icons", "cursor.svg"), "utf8"),
+    ).resolves.toBe("<svg/>\n");
 
     const connectRoot = join(targetRoot, "connect");
     await expect(stat(join(connectRoot, "package.json"))).resolves.toBeTruthy();

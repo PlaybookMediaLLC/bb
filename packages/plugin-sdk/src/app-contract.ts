@@ -134,7 +134,9 @@ export interface PluginThreadListProps {
    *
    * @experimental Audit before relying on this as a stable contract.
    */
-  experimental_Original: ComponentType;
+  Original: ComponentType;
+  /** @deprecated Renamed to `Original` in SDK 0.4.16; removed in bb 0.42. */
+  experimental_Original?: ComponentType;
 }
 
 /**
@@ -188,7 +190,9 @@ export interface PluginFileOpenerProps {
    *
    * @experimental Audit before relying on this as a stable contract.
    */
-  experimental_Original: ComponentType;
+  Original: ComponentType;
+  /** @deprecated Renamed to `Original` in SDK 0.4.16; removed in bb 0.42. */
+  experimental_Original?: ComponentType;
 }
 
 // ---------------------------------------------------------------------------
@@ -292,7 +296,9 @@ export interface PluginSourceCodeRendererProps {
    *
    * @experimental Audit before relying on this as a stable contract.
    */
-  experimental_Original: ComponentType;
+  Original: ComponentType;
+  /** @deprecated Renamed to `Original` in SDK 0.4.16; removed in bb 0.42. */
+  experimental_Original?: ComponentType;
 }
 
 /**
@@ -320,7 +326,9 @@ export interface PluginDiffRendererProps {
    *
    * @experimental Audit before relying on this as a stable contract.
    */
-  experimental_Original: ComponentType;
+  Original: ComponentType;
+  /** @deprecated Renamed to `Original` in SDK 0.4.16; removed in bb 0.42. */
+  experimental_Original?: ComponentType;
 }
 
 /**
@@ -410,21 +418,20 @@ export type ExperimentalPluginFixedTabReference<
     });
 
 /** A fixed tab declared by a plugin nav panel. */
-export type ExperimentalPluginFixedTabRegistration<
-  Target extends JsonValue = never,
-> = ExperimentalPluginFixedTabReference<Target> & {
-  title: string;
-  /** Icon hint (BB icon name); unknown names fall back to a generic icon. */
-  icon: string;
-  component: ComponentType<PluginNavPanelProps>;
-  /** `flush` lets the component own padding and scrolling. */
-  layout?: "padded" | "flush";
-};
+export type PluginFixedTabRegistration<Target extends JsonValue = never> =
+  ExperimentalPluginFixedTabReference<Target> & {
+    title: string;
+    /** Icon hint (BB icon name); unknown names fall back to a generic icon. */
+    icon: string;
+    component: ComponentType<PluginNavPanelProps>;
+    /** `flush` lets the component own padding and scrolling. */
+    layout?: "padded" | "flush";
+  };
 
 /** A fixed tab with either no target or an owner-validated JSON target. */
-export type ExperimentalPluginFixedTabDeclaration =
-  | ExperimentalPluginFixedTabRegistration
-  | ExperimentalPluginFixedTabRegistration<JsonValue>;
+export type PluginFixedTabDeclaration =
+  | PluginFixedTabRegistration
+  | PluginFixedTabRegistration<JsonValue>;
 
 export interface PluginNavPanelRegistration {
   /** Unique within the plugin; letters, digits, `-`, `_`. */
@@ -445,7 +452,7 @@ export interface PluginNavPanelRegistration {
    *
    * Experimental: see docs/api_to_audit.md.
    */
-  experimental_fixedTabs?: readonly ExperimentalPluginFixedTabDeclaration[];
+  fixedTabs?: readonly PluginFixedTabDeclaration[];
   /**
    * Optional presentational component rendered at the trailing edge of this
    * panel's sidebar row. It receives no props so it can own a narrow live
@@ -573,7 +580,17 @@ export interface PluginNewThreadPanelActionRegistration {
 }
 
 export interface PluginPendingInteractionRegistration {
-  /** Matches `rendererId` passed to `bb.ui.requestInput`. */
+  /**
+   * The renderer's plugin-local name. Two addresses resolve to it: the
+   * `rendererId` a backend passes to `bb.ui.requestInput`, and the `<name>`
+   * half of a provider bridge's `interaction/request` kind
+   * `"<pluginId>/<name>"` (docs/provider-plugin-api.md §4), which the client
+   * splits on the slash to find this registration under its plugin.
+   * `bb.ui.requestInput` validates `rendererId` against `/^[a-zA-Z0-9_-]+$/`;
+   * an extension kind must match `/^[a-z0-9-]+\/[a-z0-9-]+$/`
+   * (`EXTENSION_KIND_PATTERN` in @bb/domain), so an id addressable both ways
+   * uses lowercase letters, digits, and "-" only.
+   */
   id: string;
   component: ComponentType<PluginPendingInteractionProps>;
 }
@@ -777,6 +794,56 @@ export interface PluginProvidersState {
 }
 
 /**
+ * One TextMate token rule from the active code theme, in the shape VS Code
+ * theme files author it.
+ */
+export interface PluginCodeThemeTokenRule {
+  /** Scope(s) the rule paints; absent means the theme's base rule. */
+  scope?: string | readonly string[];
+  settings: {
+    /** `#rrggbb` or `#rrggbbaa`. */
+    foreground?: string;
+    background?: string;
+    /** Space-separated TextMate font styles, e.g. `"bold italic"`. */
+    fontStyle?: string;
+  };
+}
+
+/**
+ * The active code theme as a VS Code theme file: the same document BB's own
+ * highlighter renders from, so a plugin that embeds a third-party editor can
+ * translate it into that editor's theme format rather than guessing colors
+ * from CSS variables.
+ */
+export interface PluginCodeThemeData {
+  /** Registered theme name — a bundled Shiki name or a BB-registered id. */
+  name: string;
+  type: "light" | "dark";
+  /** Default editor foreground, as `#rrggbb[aa]`. */
+  fg: string;
+  /** Default editor background, as `#rrggbb[aa]`. */
+  bg: string;
+  /** VS Code workbench colors (`editor.background`, `editorCursor.foreground`, …). */
+  colors: Readonly<Record<string, string>>;
+  tokenColors: readonly PluginCodeThemeTokenRule[];
+}
+
+/**
+ * The code theme BB is currently rendering with (see
+ * {@link PluginSdkApp.experimental_useCodeTheme}). `mode` and `name` change
+ * the moment the user switches palette or light/dark; `theme` follows once
+ * the theme file resolves, and keeps the previous document until then so a
+ * consumer never has to paint an unthemed frame. Compare `theme.name` with
+ * `name` to tell a settled state from one still resolving.
+ */
+export interface PluginCodeThemeState {
+  mode: "light" | "dark";
+  name: string;
+  /** null only before the first theme file resolves. */
+  theme: PluginCodeThemeData | null;
+}
+
+/**
  * Act on threads from a plugin surface. Every method routes to the host's own
  * flow, so optimistic updates, toasts, dialogs, pane closing, and route repair
  * behave exactly as they do in the built-in sidebar. Unknown thread ids are
@@ -880,7 +947,7 @@ export interface PluginSidebarThreadSplit {
  * enabled. If multiple plugins register one, the first in deterministic slot
  * order is active by default; removing it reveals the next. The user can pin
  * BB's list or a specific provider under Settings → Appearance. A plugin can
- * also use its own setting and render `experimental_Original` conditionally.
+ * also use its own setting and render `Original` conditionally.
  * An absent or crashing replacement falls back to BB's list rather than
  * leaving the user with no sidebar.
  *
@@ -905,7 +972,7 @@ export interface PluginThreadListRegistration {
  * order. The user can pin BB's preview or a specific opener per extension
  * under Settings → Files. The file tab's "Open with" menu can override that
  * choice for one open. A plugin can also use its own setting and render
- * `experimental_Original` conditionally. Applies to working-tree, host, and
+ * `Original` conditionally. Applies to working-tree, host, and
  * thread-storage files — never to git-ref snapshots (diff views always use
  * BB's preview).
  */
@@ -926,7 +993,7 @@ export interface PluginFileOpenerRegistration {
  * **exclusive**: one renderer at a time. Registering activates it while the
  * plugin is enabled; if several are registered the first in deterministic slot
  * order wins. A missing, disabled, or crashing replacement falls back to BB's
- * renderer, and a replacement can render `experimental_Original` to delegate
+ * renderer, and a replacement can render `Original` to delegate
  * per call (behind its own setting, by language, by size — whatever it needs).
  */
 export interface PluginSourceCodeRendererRegistration {
@@ -943,7 +1010,7 @@ export interface PluginSourceCodeRendererRegistration {
  * Replace BB's diff renderer everywhere it renders supplied diff content — the
  * timeline file diffs, the environment diff panel's text bodies, and every
  * plugin that calls `experimental_Diff`. Exclusive, with the same activation,
- * fallback, and `experimental_Original` delegation rules as
+ * fallback, and `Original` delegation rules as
  * {@link PluginSourceCodeRendererRegistration}.
  */
 export interface PluginDiffRendererRegistration {
@@ -1104,6 +1171,92 @@ export interface PluginProviderIconRegistration {
   icon: ComponentType<{ className?: string }>;
 }
 
+/**
+ * The declarative presentation persisted with a timeline item (docs/
+ * provider-plugin-api.md §3): what every client renders when no plugin code
+ * is present. A renderer receives it so it can reuse the bridge's label,
+ * glyph and tint instead of re-deriving them from the payload.
+ */
+export interface PluginTimelineRowPresentation {
+  label: { pending: string; completed: string };
+  icon: { glyph: string };
+  title?: string;
+  /** Short Markdown, length-capped at ingest. */
+  detail?: string;
+  suppress?: boolean;
+  tint?: { light: string; dark: string };
+}
+
+export type PluginTimelineRowStatus =
+  | "pending"
+  | "completed"
+  | "error"
+  | "interrupted";
+
+/** The projected row a `experimental_timelineRenderer` component receives. */
+export interface PluginTimelineRendererRow {
+  id: string;
+  threadId: string;
+  turnId: string | null;
+  /**
+   * The item kind the renderer registered for: this plugin's extension kind
+   * (`"<pluginId>/<name>"`) or `"tool"` for a generic tool item.
+   */
+  kind: string;
+  /** The tool name for a `"tool"` row; null for an extension row. */
+  toolName: string | null;
+  status: PluginTimelineRowStatus;
+  startedAt: number;
+  completedAt: number | null;
+}
+
+export interface PluginTimelineRendererProps {
+  row: PluginTimelineRendererRow;
+  /**
+   * The item's data: an extension item's payload (validated against the
+   * plugin's declared schema at ingest), or for a `"tool"` row the call's
+   * `{ arguments, output }`.
+   */
+  payload: JsonValue;
+  /**
+   * The bridge's presentation for the row. Null only for a generic tool row
+   * persisted before bridges attached presentation (grammar v2); an
+   * extension row always has one.
+   */
+  presentation: PluginTimelineRowPresentation | null;
+  /** The thread the row belongs to. */
+  thread: { id: string; providerId: string | null };
+  /**
+   * The host's declarative base for this row's body (the presentation's
+   * `detail`, or the tool call's arguments and output). Render it to keep
+   * the default body beside the plugin's own content.
+   */
+  Original: ComponentType<Record<never, never>>;
+}
+
+/**
+ * Render the expanded body of the timeline rows this plugin owns: its own
+ * extension item kinds (`"<pluginId>/<name>"`, where `<pluginId>` is this
+ * plugin), and `"tool"` for the generic tool items of the providers this
+ * plugin registered. Core kinds (message, command, fileChange, fileRead,
+ * search, delegation, planSteps, …) always use the core renderers and are
+ * customized through the bridge's presentation alone.
+ *
+ * The row's header — the bridge's label, glyph, tint and headline — stays
+ * host-rendered so the timeline reads uniformly; the component owns the
+ * body. When no renderer is registered for a kind (the plugin is not loaded,
+ * uninstalled, or never shipped an app bundle) the declarative base renders
+ * instead, so a row never goes blank. Crashes are contained per row.
+ */
+export interface PluginTimelineRendererRegistration {
+  /**
+   * `"<pluginId>/<name>"` for one of this plugin's extension kinds, or
+   * `"tool"` for the generic tool items of this plugin's providers.
+   */
+  kind: string;
+  component: ComponentType<PluginTimelineRendererProps>;
+}
+
 // ---------------------------------------------------------------------------
 // definePluginApp
 // ---------------------------------------------------------------------------
@@ -1174,6 +1327,15 @@ export interface PluginAppSlots {
    * docs/api_to_audit.md.
    */
   experimental_providerIcon(registration: PluginProviderIconRegistration): void;
+  /**
+   * Render the body of this plugin's own timeline rows: its extension kinds
+   * and its providers' generic tool items (see
+   * {@link PluginTimelineRendererRegistration}). Experimental: see
+   * docs/api_to_audit.md.
+   */
+  experimental_timelineRenderer(
+    registration: PluginTimelineRendererRegistration,
+  ): void;
 }
 
 export interface PluginAppComposer {
@@ -1749,7 +1911,7 @@ export interface MarkdownProps {
  * supplied `rel` tokens and receive safe defaults unless `opener` is explicit.
  * Experimental: see docs/api_to_audit.md.
  */
-export interface ExperimentalUrlLinkProps extends Omit<
+export interface UrlLinkProps extends Omit<
   ComponentPropsWithoutRef<"a">,
   "href"
 > {
@@ -1851,7 +2013,7 @@ export interface BbNavigate {
    * false for schemes the host does not own. Experimental: see
    * docs/api_to_audit.md.
    */
-  experimental_openUrl(url: string): boolean;
+  openUrl(url: string): boolean;
   /** Open a live file in this surface's shared BB preview panel. */
   experimental_openFilePreview(options: ExperimentalFileOpenOptions): boolean;
   /** Open a live file in this client's preferred external file target. */
@@ -1953,6 +2115,13 @@ export interface PluginSdkApp {
    */
   experimental_useProviders(): PluginProvidersState;
   /**
+   * The active code theme as a VS Code theme file (see
+   * {@link PluginCodeThemeState}), for a plugin that renders code with an
+   * engine of its own and needs BB's palette to reach it. Experimental: see
+   * docs/api_to_audit.md.
+   */
+  experimental_useCodeTheme(): PluginCodeThemeState;
+  /**
    * The host-owned chat component (see {@link ThreadChatProps}). Together
    * with `Markdown`, the only components the SDK ships — everything else
    * stays vendored per §5.5.
@@ -1967,7 +2136,7 @@ export interface PluginSdkApp {
    * A real anchor whose ordinary HTTP(S) activation uses BB's URL preference.
    * Experimental: see docs/api_to_audit.md.
    */
-  experimental_UrlLink: ComponentType<ExperimentalUrlLinkProps>;
+  UrlLink: ComponentType<UrlLinkProps>;
   /** Host-rendered live-file link backed by the shared navigation controller. */
   experimental_FileLink: ComponentType<ExperimentalFileLinkProps>;
   /**

@@ -19,6 +19,7 @@ import {
   type ComposerView,
   type PluginAppDefinition,
   type PluginAppSetup,
+  type PluginCodeThemeState,
   type PluginContentScriptDisposer,
   type PluginContentScriptRegistration,
   type PluginComposerApi,
@@ -35,6 +36,7 @@ import {
   type PluginNewThreadPanelActionRegistration,
   type PluginPendingInteractionRegistration,
   type PluginProviderIconRegistration,
+  type PluginTimelineRendererRegistration,
   type PluginRealtimeConnectionState,
   type PluginRpcClient,
   type PluginSdkApp,
@@ -55,7 +57,7 @@ import {
   type PluginRpcResult,
   type StandardSchemaV1InferInput,
   type MarkdownProps,
-  type ExperimentalUrlLinkProps,
+  type UrlLinkProps,
   type ExperimentalFileLinkProps,
   type ExperimentalFileOpenOptions,
   type ExperimentalAppPanel,
@@ -124,7 +126,7 @@ export type NavigateCall =
       method: "openThreadPanel";
       options: Parameters<BbNavigate["openThreadPanel"]>[0];
     }
-  | { method: "experimental_openUrl"; url: string }
+  | { method: "openUrl"; url: string }
   | {
       method: "experimental_openFilePreview";
       options: ExperimentalFileOpenOptions;
@@ -187,6 +189,7 @@ interface SlotEnv {
   sidebarActionCalls: SidebarActionCall[];
   sidebarPullRequests: ReadonlyMap<string, PluginSidebarPullRequest>;
   providers: PluginProvidersState;
+  codeTheme: PluginCodeThemeState;
 }
 
 interface TestFixedTabTargetStore {
@@ -339,8 +342,8 @@ function TestUrlLink({
   rel,
   target,
   ...anchorProps
-}: ExperimentalUrlLinkProps) {
-  const navigate = useSlotEnv("experimental_UrlLink").navigate;
+}: UrlLinkProps) {
+  const navigate = useSlotEnv("UrlLink").navigate;
   const normalizedTarget = target?.toLowerCase();
   const opensNewBrowsingContext =
     normalizedTarget !== undefined &&
@@ -379,7 +382,7 @@ function TestUrlLink({
         ) {
           return;
         }
-        if (navigate.experimental_openUrl(href)) event.preventDefault();
+        if (navigate.openUrl(href)) event.preventDefault();
       }}
     />
   );
@@ -792,7 +795,7 @@ const testPluginSdkApp = {
   ThreadChat: TestThreadChat,
   Markdown: TestMarkdown,
   experimental_FileLink: TestFileLink,
-  experimental_UrlLink: TestUrlLink,
+  UrlLink: TestUrlLink,
   experimental_NewThreadComposer: TestNewThreadComposer,
   experimental_ProviderModelPicker: TestProviderModelPicker,
   experimental_PermissionModePicker: TestPermissionModePicker,
@@ -803,6 +806,9 @@ const testPluginSdkApp = {
   },
   experimental_useProviders(): PluginProvidersState {
     return useSlotEnv("experimental_useProviders").providers;
+  },
+  experimental_useCodeTheme(): PluginCodeThemeState {
+    return useSlotEnv("experimental_useCodeTheme").codeTheme;
   },
   experimental_useSidebarThreadActions(): PluginSidebarThreadActions {
     return useSlotEnv("experimental_useSidebarThreadActions").sidebarActions;
@@ -896,6 +902,7 @@ export interface CapturedPluginApp {
   messageDirectives: PluginMessageDirectiveRegistration[];
   messageActions: PluginMessageActionRegistration[];
   providerIcons: PluginProviderIconRegistration[];
+  timelineRenderers: PluginTimelineRendererRegistration[];
   contentScripts: PluginContentScriptRegistration[];
 }
 
@@ -1110,6 +1117,11 @@ export interface RenderSlotOptions<
    */
   providers?: Partial<PluginProvidersState>;
   /**
+   * The code theme `experimental_useCodeTheme()` reports. Omitted → a light
+   * mode with no resolved document, the state a plugin sees on first paint.
+   */
+  codeTheme?: Partial<PluginCodeThemeState>;
+  /**
    * Pull requests `experimental_useSidebarThreadPullRequest()` reports, keyed
    * by thread id. Omitted → every thread reports none.
    */
@@ -1118,7 +1130,7 @@ export interface RenderSlotOptions<
   openThreadPanel?: (
     options: Parameters<BbNavigate["openThreadPanel"]>[0],
   ) => boolean;
-  /** Host acceptance for URL intents from the hook or `experimental_UrlLink`. */
+  /** Host acceptance for URL intents from the hook or `UrlLink`. */
   openUrl?: (url: string) => boolean;
   /** Host acceptance for preview intents from the hook or file link. */
   openFilePreview?: (options: ExperimentalFileOpenOptions) => boolean;
@@ -1360,6 +1372,11 @@ export function renderSlot<
     status: options.providers?.status ?? "ready",
     providers: options.providers?.providers ?? [],
   };
+  const codeTheme: PluginCodeThemeState = {
+    mode: options.codeTheme?.mode ?? "light",
+    name: options.codeTheme?.name ?? "pierre-light",
+    theme: options.codeTheme?.theme ?? null,
+  };
   const sidebarActions: PluginSidebarThreadActions = {
     open(threadId, openOptions) {
       sidebarActionCalls.push({
@@ -1417,8 +1434,8 @@ export function renderSlot<
       });
       return options.openThreadPanel?.(panelOptions) ?? false;
     },
-    experimental_openUrl(url) {
-      navigateCalls.push({ method: "experimental_openUrl", url });
+    openUrl(url) {
+      navigateCalls.push({ method: "openUrl", url });
       return options.openUrl?.(url) ?? false;
     },
     experimental_openFilePreview(fileOptions) {
@@ -1553,6 +1570,7 @@ export function renderSlot<
     sidebarActionCalls,
     sidebarPullRequests,
     providers,
+    codeTheme,
   };
 
   const releaseComposerOwnership = (): void => {
