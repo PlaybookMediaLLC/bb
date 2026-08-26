@@ -1,5 +1,28 @@
 # Changelog
 
+## [0.39.2](https://github.com/PlaybookMediaLLC/bb/compare/marketing-harness-v0.39.1...marketing-harness-v0.39.2) (2026-08-26)
+
+
+### Bug Fixes
+
+* **acp:** normalize omp command results ([#2374](https://github.com/PlaybookMediaLLC/bb/issues/2374)) ([98a929b](https://github.com/PlaybookMediaLLC/bb/commit/98a929b01d7ab39ce15f5356e96ffdb4b06fa0d3))
+* **acp:** normalize OpenCode command results ([#2376](https://github.com/PlaybookMediaLLC/bb/issues/2376)) ([fc43700](https://github.com/PlaybookMediaLLC/bb/commit/fc43700259c1f7cd5c3c87f8aa2e6f4f974b59c8))
+* **app:** parse release-please changelog versions ([71f793e](https://github.com/PlaybookMediaLLC/bb/commit/71f793e7808fe3d08cc2eed2f71750db3d90c042))
+* **bb-app:** keep installed package repackable ([#2373](https://github.com/PlaybookMediaLLC/bb/issues/2373)) ([b3d38e2](https://github.com/PlaybookMediaLLC/bb/commit/b3d38e23a35f71759793f5f66c0277f3068c9e75))
+* **bb-app:** reuse installed tarball in package smoke ([#2410](https://github.com/PlaybookMediaLLC/bb/issues/2410)) ([5d787d9](https://github.com/PlaybookMediaLLC/bb/commit/5d787d92cae51d5f037142cc62b0bd157db3e8fd))
+* **cli:** preserve plugin commands in split bundles ([#2377](https://github.com/PlaybookMediaLLC/bb/issues/2377)) ([c2837e0](https://github.com/PlaybookMediaLLC/bb/commit/c2837e0d4876e13b570159656925fab0123e5dcc))
+* **host-daemon:** retry provider probes after invalidation ([#2381](https://github.com/PlaybookMediaLLC/bb/issues/2381)) ([787eb14](https://github.com/PlaybookMediaLLC/bb/commit/787eb14d9082a078f5f160f00814ac64b9cdbf83))
+* retry read-only host RPC timeouts ([#2369](https://github.com/PlaybookMediaLLC/bb/issues/2369)) ([69596f1](https://github.com/PlaybookMediaLLC/bb/commit/69596f19e897ae0c6af3a2fe059950ecfe5c28dd))
+* **server:** never persist empty-input prompt history rows ([#2295](https://github.com/PlaybookMediaLLC/bb/issues/2295)) ([42658f9](https://github.com/PlaybookMediaLLC/bb/commit/42658f98738e7be53b19a63ceaf223de5f53ba23))
+* **side-chat:** bind reply anchor to accepted turn ([#2428](https://github.com/PlaybookMediaLLC/bb/issues/2428)) ([e33574e](https://github.com/PlaybookMediaLLC/bb/commit/e33574e28ef1cc74d5c04e5d4a558e574f46b361))
+* **side-chat:** deliver reply anchor on first turn ([#2403](https://github.com/PlaybookMediaLLC/bb/issues/2403)) ([c65d2ec](https://github.com/PlaybookMediaLLC/bb/commit/c65d2ec8bf4be50ef8518fc026b85260cae73921))
+
+
+### Performance Improvements
+
+* load bb command groups on demand and split the CLI bundle (C1) ([#2349](https://github.com/PlaybookMediaLLC/bb/issues/2349)) ([30952cd](https://github.com/PlaybookMediaLLC/bb/commit/30952cdfab6b0f2708842a69e9346ece6bb88ab0))
+* low-risk sweep fixes (F5, F3, F2, S3, D1, F4) ([#2346](https://github.com/PlaybookMediaLLC/bb/issues/2346)) ([19eedbb](https://github.com/PlaybookMediaLLC/bb/commit/19eedbb7fb4cc8b9bdb0f8fcbfc92a9b90d8bd0b))
+
 ## [0.39.1](https://github.com/PlaybookMediaLLC/bb/compare/marketing-harness-v0.39.0...marketing-harness-v0.39.1) (2026-08-22)
 
 
