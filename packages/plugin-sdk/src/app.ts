@@ -49,7 +49,7 @@ export const definePluginApp = runtime.definePluginApp;
 export const ThreadChat = runtime.ThreadChat;
 export const Markdown = runtime.Markdown;
 export const experimental_FileLink = runtime.experimental_FileLink;
-export const experimental_UrlLink = runtime.experimental_UrlLink;
+export const UrlLink = runtime.UrlLink;
 export const experimental_NewThreadComposer =
   runtime.experimental_NewThreadComposer;
 export const experimental_ProviderModelPicker =
@@ -82,3 +82,6 @@ export const experimental_useSidebarThreadSplit =
   runtime.experimental_useSidebarThreadSplit;
 // The provider directory (experimental — see docs/api_to_audit.md).
 export const experimental_useProviders = runtime.experimental_useProviders;
+// The live code theme, for plugins that render code with their own engine
+// (experimental — see docs/api_to_audit.md).
+export const experimental_useCodeTheme = runtime.experimental_useCodeTheme;

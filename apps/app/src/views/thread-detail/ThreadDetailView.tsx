@@ -26,6 +26,7 @@ import {
   useThreadTimelineController,
 } from "@/components/thread/timeline";
 import { serializePluginPanelParams } from "@/lib/plugin-json-value";
+import { ThreadProviderContext } from "@/components/thread/thread-provider-context";
 import {
   defaultAppSettings,
   resolveEnvironmentMergeBaseBranch,
@@ -974,6 +975,16 @@ function ThreadDetailViewInternal(props: ThreadRoutePathArgs) {
           enabled: thread !== undefined,
           providerId: thread?.providerId,
         },
+  );
+  const threadProviderPluginId = threadProviderInfo?.pluginId ?? null;
+  // Declared here, above the loading / not-found early returns below, so the
+  // hook order is the same on every render of this component.
+  const threadProviderContextValue = useMemo(
+    () => ({
+      providerId: thread?.providerId ?? null,
+      pluginId: threadProviderPluginId,
+    }),
+    [thread?.providerId, threadProviderPluginId],
   );
   const isForkAvailable = isThreadForkable(
     thread ?? null,
@@ -3054,11 +3065,13 @@ function ThreadDetailViewInternal(props: ThreadRoutePathArgs) {
     <>
       <ThreadArchiveCommandHandler thread={thread} />
       <ThreadRenameCommandHandler thread={thread} />
-      <PluginThreadPanelNavigationProvider
-        openThreadPanel={handleOpenTimelinePluginPanel}
-      >
-        {threadDetailContent}
-      </PluginThreadPanelNavigationProvider>
+      <ThreadProviderContext.Provider value={threadProviderContextValue}>
+        <PluginThreadPanelNavigationProvider
+          openThreadPanel={handleOpenTimelinePluginPanel}
+        >
+          {threadDetailContent}
+        </PluginThreadPanelNavigationProvider>
+      </ThreadProviderContext.Provider>
     </>
   );
 }

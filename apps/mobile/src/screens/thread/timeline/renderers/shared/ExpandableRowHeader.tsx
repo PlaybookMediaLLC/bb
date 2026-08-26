@@ -1,6 +1,14 @@
 import type { TimelineTitle } from "@bb/thread-view";
-import type { ReactNode } from "react";
+import { useLayoutEffect, useRef, type ReactNode } from "react";
 import { Pressable, View } from "react-native";
+import Animated, {
+  Easing,
+  useAnimatedStyle,
+  useSharedValue,
+  withTiming,
+} from "react-native-reanimated";
+import { haptic } from "@/lib/haptics";
+import { ServerSvgIcon } from "@/screens/plugins/ServerSvgIcon";
 import { useTheme } from "@/theme";
 import { Icon, type IconName } from "@/ui";
 import {
@@ -13,6 +21,8 @@ import { PAST_ROW_DIM_OPACITY } from "./row-dim";
 /** Web `size-3.5` leading glyph. */
 export const ROW_LEADING_ICON_SIZE = 14;
 const CHEVRON_SIZE = 14;
+/** The disclosure chevron turns from pointing right to pointing down. */
+const CHEVRON_TURN_MS = 180;
 
 interface TimelineRowShellProps {
   depth: number;
@@ -46,11 +56,70 @@ export function TimelineRowShell({
   );
 }
 
+/**
+ * One `chevron.right` glyph that rotates a quarter turn while expanded,
+ * instead of swapping two glyphs. The turn animates only when the same row
+ * toggles: FlashList recycles the cell onto other rows without remounting,
+ * so a change of `rowKey` snaps the angle to the new row's state instead.
+ */
+export function DisclosureChevron({
+  expanded,
+  rowKey,
+  size = CHEVRON_SIZE,
+  color,
+}: {
+  expanded: boolean;
+  /** Identity of the row the chevron belongs to (the list item key). */
+  rowKey: string;
+  size?: number;
+  color: string;
+}) {
+  const turn = useSharedValue(expanded ? 1 : 0);
+  const applied = useRef({ rowKey, expanded });
+  useLayoutEffect(() => {
+    const previous = applied.current;
+    applied.current = { rowKey, expanded };
+    const target = expanded ? 1 : 0;
+    if (previous.rowKey !== rowKey) {
+      turn.set(target);
+      return;
+    }
+    if (previous.expanded === expanded) return;
+    turn.set(
+      withTiming(target, {
+        duration: CHEVRON_TURN_MS,
+        easing: Easing.out(Easing.quad),
+      }),
+    );
+  }, [expanded, rowKey, turn]);
+  const rotation = useAnimatedStyle(() => ({
+    transform: [{ rotate: `${turn.get() * 90}deg` }],
+  }));
+  return (
+    <Animated.View style={rotation}>
+      <Icon name="ChevronRight" size={size} weight="semibold" color={color} />
+    </Animated.View>
+  );
+}
+
 interface ExpandableRowHeaderProps {
+  /**
+   * Identity of the row (the list item key): the disclosure chevron snaps
+   * rather than animates when a recycled cell moves to another row.
+   */
+  rowKey: string;
   title: TimelineTitle;
   /** Replaces the generic title renderer for a specialized header. */
   titleContent?: ReactNode;
   leadingIcon?: IconName;
+  /**
+   * A plugin-declared icon resolved from the installed-plugin list, drawn
+   * as a tinted remote SVG; `leadingIcon` stays the glyph shown while it
+   * loads and when the fetch fails.
+   */
+  leadingIconUrl?: string;
+  /** Accent for the leading glyph (a bridge's tint); defaults to muted. */
+  leadingIconColor?: string;
   expandable: boolean;
   expanded: boolean;
   onToggle: () => void;
@@ -73,12 +142,16 @@ interface ExpandableRowHeaderProps {
  * One-line row header (web `ExpandableTimelineRow` summary / `TimelineStaticRow`):
  * optional leading glyph, the title (segments + decorations), and — for
  * expandable rows — a disclosure chevron at the trailing edge, the touch-
- * friendly place for it. Tapping anywhere on the line toggles.
+ * friendly place for it. Tapping anywhere on the line toggles (with the
+ * selection haptic).
  */
 export function ExpandableRowHeader({
+  rowKey,
   title,
   titleContent,
   leadingIcon,
+  leadingIconUrl,
+  leadingIconColor,
   expandable,
   expanded,
   onToggle,
@@ -90,8 +163,14 @@ export function ExpandableRowHeader({
   testID,
 }: ExpandableRowHeaderProps) {
   const { tokens } = useTheme();
-  const handlePress = expandable ? onToggle : onPress;
+  const handlePress = expandable
+    ? () => {
+        haptic("selection");
+        onToggle();
+      }
+    : onPress;
   const pressable = handlePress !== undefined;
+  const iconColor = leadingIconColor ?? tokens.mutedForeground;
   return (
     <Pressable
       // A custom title (e.g. the tappable source-thread chip) keeps its own
@@ -110,11 +189,18 @@ export function ExpandableRowHeader({
         className="min-w-0 flex-1 flex-row items-center gap-1.5"
         style={dimmed ? { opacity: PAST_ROW_DIM_OPACITY } : undefined}
       >
-        {leadingIcon ? (
+        {leadingIcon && leadingIconUrl !== undefined ? (
+          <ServerSvgIcon
+            path={leadingIconUrl}
+            fallbackIcon={leadingIcon}
+            size={ROW_LEADING_ICON_SIZE}
+            color={iconColor}
+          />
+        ) : leadingIcon ? (
           <Icon
             name={leadingIcon}
             size={ROW_LEADING_ICON_SIZE}
-            color={tokens.mutedForeground}
+            color={iconColor}
           />
         ) : null}
         <View className="min-w-0 flex-1">
@@ -122,9 +208,9 @@ export function ExpandableRowHeader({
         </View>
       </View>
       {expandable ? (
-        <Icon
-          name={expanded ? "ChevronDown" : "ChevronRight"}
-          size={CHEVRON_SIZE}
+        <DisclosureChevron
+          expanded={expanded}
+          rowKey={rowKey}
           color={tokens.subtleForeground}
         />
       ) : (

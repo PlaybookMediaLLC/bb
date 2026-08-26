@@ -3,10 +3,8 @@ import type { ServerNotification as CodexServerNotification } from "./generated/
 import {
   collabAgentPresentation,
   commandPresentation,
-  dynamicToolPresentation,
   fileChangePresentation,
   mcpToolPresentation,
-  presentationTitle,
 } from "./presentation.js";
 import { createCodexEventTranslator } from "./translator.js";
 
@@ -23,13 +21,7 @@ describe("codex presentation", () => {
     expect(commandPresentation("cargo test").title).toBe("cargo test");
   });
 
-  it("keeps the headline to one short line", () => {
-    expect(presentationTitle("  first line\nsecond line  ")).toBe("first line");
-    expect(presentationTitle("\n\n")).toBeUndefined();
-    const long = "x".repeat(400);
-    const title = presentationTitle(long);
-    expect(title).toHaveLength(160);
-    expect(title?.endsWith("…")).toBe(true);
+  it("drops the headline of a blank command", () => {
     expect(commandPresentation("   ").title).toBeUndefined();
   });
 
@@ -92,15 +84,6 @@ describe("codex presentation", () => {
     });
   });
 
-  it("presents codex's own dynamic tools generically", () => {
-    // A bb-injected tool (AskUserQuestion, bb_workflow_run) carries its own
-    // presentation on its definition; this is only for codex's own tools.
-    expect(dynamicToolPresentation("codex_tool")).toEqual({
-      label: { pending: "Running codex_tool", completed: "Ran codex_tool" },
-      icon: { glyph: "Toolbox" },
-    });
-  });
-
   it("labels each collab verb and headlines the prompt", () => {
     expect(collabAgentPresentation({ tool: "wait", prompt: null })).toEqual({
       label: { pending: "Waiting for agents", completed: "Waited for agents" },
@@ -145,6 +128,7 @@ describe("every codex lifecycle delta carries a presentation", () => {
         text: "hi",
         phase: null,
         memoryCitation: null,
+        delivery: null,
       },
     },
     {

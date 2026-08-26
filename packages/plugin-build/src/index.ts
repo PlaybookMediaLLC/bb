@@ -17,6 +17,7 @@
 export {
   buildPluginApp,
   RUNTIME_SLOT_BY_SPECIFIER,
+  SHIMMED_TYPE_PACKAGES,
 } from "./build-plugin-app.js";
 export {
   buildPluginServer,
@@ -29,4 +30,8 @@ export {
   resolvePluginBuildToolchain,
   type PluginBuildToolchain,
 } from "./toolchain.js";
-export { assertValidPluginCompactIconSvg } from "./svg-asset.js";
+export {
+  assertValidPluginCompactIconSvg,
+  assertValidPluginIconSvg,
+  assertValidPluginLogoSvg,
+} from "./svg-asset.js";

@@ -35,7 +35,8 @@ export function usePluginFrontendBoot(): void {
   const resolved = systemConfig.data !== undefined;
   useEffect(() => {
     if (!resolved) return;
-    if (getPluginPanelRoutePluginId(window.location.pathname) !== null) {
+    const routePluginId = getPluginPanelRoutePluginId(window.location.pathname);
+    if (routePluginId !== null) {
       void bootPluginFrontends();
       return;
     }
