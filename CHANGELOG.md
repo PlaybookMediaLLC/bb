@@ -1,5 +1,34 @@
 # Changelog
 
+## [0.39.3](https://github.com/PlaybookMediaLLC/bb/compare/marketing-harness-v0.39.2...marketing-harness-v0.39.3) (2026-09-28)
+
+
+### Features
+
+* add manually dispatched drafts ([#3575](https://github.com/PlaybookMediaLLC/bb/issues/3575)) ([25baf41](https://github.com/PlaybookMediaLLC/bb/commit/25baf41c878d8ad8faea067c21a02e5611e194e4))
+* **desktop:** add Cmd+F find in window ([#4143](https://github.com/PlaybookMediaLLC/bb/issues/4143)) ([94d77da](https://github.com/PlaybookMediaLLC/bb/commit/94d77da09568d7f0f7cdb23b84686e743acfb0ad))
+* **git-diff:** persist diff view mode and line wrap across reloads ([#3271](https://github.com/PlaybookMediaLLC/bb/issues/3271)) ([1caad15](https://github.com/PlaybookMediaLLC/bb/commit/1caad15c96c2f67fb85451fb451beb0407518b5b))
+* **plugins:** support browser annotation context ([#3623](https://github.com/PlaybookMediaLLC/bb/issues/3623)) ([2cfd5b8](https://github.com/PlaybookMediaLLC/bb/commit/2cfd5b82b911dc1a91226be5ce24a25eff0e6004))
+
+
+### Bug Fixes
+
+* **app:** confirm cascading thread archives ([#3717](https://github.com/PlaybookMediaLLC/bb/issues/3717)) ([6a3dd45](https://github.com/PlaybookMediaLLC/bb/commit/6a3dd456c21cef7bbb02fd40620f560a3a1470cf))
+* **app:** constrain the More models submenu height ([#4003](https://github.com/PlaybookMediaLLC/bb/issues/4003)) ([fdab410](https://github.com/PlaybookMediaLLC/bb/commit/fdab410e7956232e7d12f742c8426b3e97741f1c))
+* **app:** preserve Mermaid previews during streaming updates ([#3778](https://github.com/PlaybookMediaLLC/bb/issues/3778)) ([4969d3a](https://github.com/PlaybookMediaLLC/bb/commit/4969d3a3926cde57cbc3dae63741fb07b2edcb07))
+* **app:** reflect explicit projectless selection in picker trigger ([#3794](https://github.com/PlaybookMediaLLC/bb/issues/3794)) ([1c69f56](https://github.com/PlaybookMediaLLC/bb/commit/1c69f568eb00f6cb1fbbbc1202accbba2b02ce41))
+* **issues:** format ruled-out helper text ([#4138](https://github.com/PlaybookMediaLLC/bb/issues/4138)) ([2e75839](https://github.com/PlaybookMediaLLC/bb/commit/2e75839c26f65fcfea7922743e8085bad065770b))
+* keep launcher logs free of terminal escape sequences ([#3733](https://github.com/PlaybookMediaLLC/bb/issues/3733)) ([657ecc7](https://github.com/PlaybookMediaLLC/bb/commit/657ecc719a80654d77b2cc99f92972328cf57d69))
+* **mobile:** suppress foreground notification toasts ([#4001](https://github.com/PlaybookMediaLLC/bb/issues/4001)) ([9f73d23](https://github.com/PlaybookMediaLLC/bb/commit/9f73d237f84f4f1b434437d4ecfa78eb254185de))
+* **pi:** preserve conversations when switching directories ([#4346](https://github.com/PlaybookMediaLLC/bb/issues/4346)) ([c89ac32](https://github.com/PlaybookMediaLLC/bb/commit/c89ac32eaa9e812f00e40399fa4ce5da315457f0))
+* **plugins:** bundle marketing-assets-r2 runtime ([b88c96d](https://github.com/PlaybookMediaLLC/bb/commit/b88c96d3f325dc977cf00263b857bf71b261b2c9))
+* **provider-acp:** accept grouped select options in ACP config options ([#4153](https://github.com/PlaybookMediaLLC/bb/issues/4153)) ([e128105](https://github.com/PlaybookMediaLLC/bb/commit/e128105e223a12e8c1878992a5c5dfcc6bf788d2))
+* **provider-pi:** add select keyboard shortcuts ([#3719](https://github.com/PlaybookMediaLLC/bb/issues/3719)) ([8c7684c](https://github.com/PlaybookMediaLLC/bb/commit/8c7684ca61d80457db71a798f8289043873b5c67))
+* **provider-pi:** render batched edit diffs ([#4347](https://github.com/PlaybookMediaLLC/bb/issues/4347)) ([3cbba52](https://github.com/PlaybookMediaLLC/bb/commit/3cbba5230bab216cb19718781cbbcf9ebac5267d))
+* **provider-pi:** start a fresh session when clearing context ([#3677](https://github.com/PlaybookMediaLLC/bb/issues/3677)) ([96fddad](https://github.com/PlaybookMediaLLC/bb/commit/96fddad2629246b6053346d693579e50983b84ea))
+* **threads:** title threads that open with a skill invocation ([#3887](https://github.com/PlaybookMediaLLC/bb/issues/3887)) ([36d8aaa](https://github.com/PlaybookMediaLLC/bb/commit/36d8aaaec1c451356bb61358182ce6958ffc0478))
+* **turbo:** pass pnpm store config to tasks ([#4127](https://github.com/PlaybookMediaLLC/bb/issues/4127)) ([a13140a](https://github.com/PlaybookMediaLLC/bb/commit/a13140ac188a021ae83bea6ce5aa34216dd82ae2))
+
 ## [0.39.2](https://github.com/PlaybookMediaLLC/bb/compare/marketing-harness-v0.39.1...marketing-harness-v0.39.2) (2026-08-26)
 
 
