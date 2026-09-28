@@ -1,13 +1,19 @@
 import { useCallback, useEffect, useRef, useState } from "react";
 import { appToast } from "@/components/ui/app-toast";
 import {
-  buildAudioInputConstraints,
+  requestAudioInputStream,
   useAudioInputDevicePreferenceValue,
 } from "@/lib/audio-input-device-preference";
 import {
   isDocumentVisible,
   subscribeToDocumentVisibility,
 } from "@/lib/document-visibility";
+import {
+  readVoiceSupportEnvironment,
+  resolveVoiceSupport,
+  voiceUnsupportedMessage,
+  type VoiceUnsupportedReason,
+} from "./voice-input-support";
 
 type VoiceInputState = "idle" | "recording" | "transcribing" | "error";
 
@@ -106,6 +112,17 @@ function createRecordingFile(audioBlob: Blob, mimeType: string): File {
   });
 }
 
+function downloadRecording(file: File): void {
+  const url = URL.createObjectURL(file);
+  const anchor = document.createElement("a");
+  anchor.href = url;
+  anchor.download = file.name;
+  document.body.append(anchor);
+  anchor.click();
+  anchor.remove();
+  setTimeout(() => URL.revokeObjectURL(url), 60_000);
+}
+
 export function useVoiceInput(options: UseVoiceInputOptions) {
   const preferredAudioInputDeviceId = useAudioInputDevicePreferenceValue();
   const mediaRecorderRef = useRef<MediaRecorder | null>(null);
@@ -114,6 +131,7 @@ export function useVoiceInput(options: UseVoiceInputOptions) {
   const startedAtMsRef = useRef<number | null>(null);
   const promptContextRef = useRef<string | undefined>(undefined);
   const shouldTranscribeRef = useRef(true);
+  const acceptedRecordingPendingRef = useRef(false);
   const transcriptionAbortRef = useRef<AbortController | null>(null);
   const wakeLockSentinelRef = useRef<WakeLockSentinel | null>(null);
   const wakeLockRequestRef = useRef<Promise<void> | null>(null);
@@ -121,6 +139,8 @@ export function useVoiceInput(options: UseVoiceInputOptions) {
 
   const [state, setState] = useState<VoiceInputState>("idle");
   const [isSupported, setIsSupported] = useState(false);
+  const [unsupportedReason, setUnsupportedReason] =
+    useState<VoiceUnsupportedReason | null>("unsupported-browser");
   const [stream, setStream] = useState<MediaStream | null>(null);
 
   const showError = useCallback((message: string) => {
@@ -197,38 +217,29 @@ export function useVoiceInput(options: UseVoiceInputOptions) {
   }, []);
 
   useEffect(() => {
-    if (typeof window === "undefined") {
-      setIsSupported(false);
-      return;
-    }
-    const hasMediaDevices =
-      typeof navigator !== "undefined" &&
-      Boolean(navigator.mediaDevices?.getUserMedia);
-    const hasMediaRecorder = typeof window.MediaRecorder !== "undefined";
-    setIsSupported(hasMediaDevices && hasMediaRecorder);
+    const support = resolveVoiceSupport(readVoiceSupportEnvironment());
+    setIsSupported(support.isSupported);
+    setUnsupportedReason(support.reason);
   }, []);
 
   useEffect(() => {
     return () => {
       const recorder = mediaRecorderRef.current;
+      const acceptedRecordingPending = acceptedRecordingPendingRef.current;
       if (recorder && recorder.state === "recording") {
+        shouldTranscribeRef.current = false;
         try {
           recorder.stop();
-        } catch {
-          // noop
-        }
+        } catch {}
       }
       mediaRecorderRef.current = null;
-      chunksRef.current = [];
-      startedAtMsRef.current = null;
-      promptContextRef.current = undefined;
-      shouldTranscribeRef.current = true;
-      releaseRecordingWakeLock();
-      if (transcriptionAbortRef.current) {
-        transcriptionAbortRef.current.abort();
-        transcriptionAbortRef.current = null;
+      if (!acceptedRecordingPending) {
+        chunksRef.current = [];
+        startedAtMsRef.current = null;
+        promptContextRef.current = undefined;
       }
-      stopMediaStream();
+      releaseRecordingWakeLock();
+      if (!acceptedRecordingPending) stopMediaStream();
     };
   }, [releaseRecordingWakeLock, stopMediaStream]);
 
@@ -242,7 +253,7 @@ export function useVoiceInput(options: UseVoiceInputOptions) {
 
   const start = useCallback(async () => {
     if (!isSupported) {
-      showError("Voice input is not supported in this browser");
+      showError(voiceUnsupportedMessage(unsupportedReason));
       return;
     }
     if (state === "recording" || state === "transcribing") {
@@ -250,8 +261,9 @@ export function useVoiceInput(options: UseVoiceInputOptions) {
     }
 
     try {
-      const stream = await navigator.mediaDevices.getUserMedia(
-        buildAudioInputConstraints(preferredAudioInputDeviceId),
+      const stream = await requestAudioInputStream(
+        navigator.mediaDevices,
+        preferredAudioInputDeviceId,
       );
       streamRef.current = stream;
       setStream(stream);
@@ -259,6 +271,7 @@ export function useVoiceInput(options: UseVoiceInputOptions) {
       startedAtMsRef.current = Date.now();
       promptContextRef.current = options.getPromptContext?.();
       shouldTranscribeRef.current = true;
+      acceptedRecordingPendingRef.current = false;
       shouldHoldWakeLockRef.current = true;
       requestRecordingWakeLock();
 
@@ -283,6 +296,7 @@ export function useVoiceInput(options: UseVoiceInputOptions) {
       };
 
       recorder.onstop = async () => {
+        acceptedRecordingPendingRef.current = false;
         releaseRecordingWakeLock();
         stopMediaStream();
 
@@ -329,6 +343,7 @@ export function useVoiceInput(options: UseVoiceInputOptions) {
             promptContext,
             signal: abortController.signal,
           });
+          if (abortController.signal.aborted) return;
           const normalized = normalizeTranscript(transcript);
           if (normalized.length === 0) {
             throw new Error("Voice transcription returned an empty result.");
@@ -340,7 +355,15 @@ export function useVoiceInput(options: UseVoiceInputOptions) {
             setState("idle");
             return;
           }
-          showError(resolveRecordingErrorMessage(error));
+          setState("error");
+          appToast.error("Voice input failed", {
+            description: resolveRecordingErrorMessage(error),
+            duration: Infinity,
+            action: {
+              label: "Download recording",
+              onClick: () => downloadRecording(audioFile),
+            },
+          });
         } finally {
           if (transcriptionAbortRef.current === abortController) {
             transcriptionAbortRef.current = null;
@@ -356,6 +379,7 @@ export function useVoiceInput(options: UseVoiceInputOptions) {
       startedAtMsRef.current = null;
       promptContextRef.current = undefined;
       shouldTranscribeRef.current = true;
+      acceptedRecordingPendingRef.current = false;
       transcriptionAbortRef.current = null;
       releaseRecordingWakeLock();
       showError(
@@ -368,6 +392,7 @@ export function useVoiceInput(options: UseVoiceInputOptions) {
   }, [
     isSupported,
     options,
+    unsupportedReason,
     preferredAudioInputDeviceId,
     releaseRecordingWakeLock,
     requestRecordingWakeLock,
@@ -386,9 +411,11 @@ export function useVoiceInput(options: UseVoiceInputOptions) {
       return;
     }
     shouldTranscribeRef.current = true;
+    acceptedRecordingPendingRef.current = true;
     try {
       recorder.stop();
     } catch (error) {
+      acceptedRecordingPendingRef.current = false;
       showError(resolveRecordingErrorMessage(error));
     }
   }, [showError, state]);
@@ -398,6 +425,7 @@ export function useVoiceInput(options: UseVoiceInputOptions) {
       const recorder = mediaRecorderRef.current;
       if (recorder && recorder.state === "recording") {
         shouldTranscribeRef.current = false;
+        acceptedRecordingPendingRef.current = false;
         try {
           recorder.stop();
         } catch (error) {
@@ -420,6 +448,7 @@ export function useVoiceInput(options: UseVoiceInputOptions) {
   return {
     state,
     isSupported,
+    unsupportedReason,
     stream,
     isRecording: state === "recording",
     isProcessing: state === "transcribing",

@@ -4,7 +4,7 @@ import {
   type AppDefaultKeybindings,
   type AppKeybindings,
 } from "@bb/domain";
-import { getAppCommandMetadata } from "./app-command-metadata";
+import { APP_COMMAND_GROUPS } from "./app-command-metadata";
 import {
   appShortcutFromInput,
   canAssignAppShortcut,
@@ -45,8 +45,10 @@ const defaults: AppKeybindings = [
 describe("keyboard shortcut settings", () => {
   it("has settings metadata for every command", () => {
     expect(
-      APP_COMMAND_IDS.map((command) => getAppCommandMetadata(command).command),
-    ).toEqual(APP_COMMAND_IDS);
+      APP_COMMAND_GROUPS.flatMap((group) =>
+        group.commands.map((metadata) => metadata.command),
+      ).sort(),
+    ).toEqual([...APP_COMMAND_IDS].sort());
   });
 
   it("records primary modifiers and unshifted punctuation", () => {
@@ -72,9 +74,6 @@ describe("keyboard shortcut settings", () => {
     });
   });
 
-  // Recording must agree with matching: macOS reports Option+M as "µ", so the
-  // recorder has to store the physical key or the captured chord would never
-  // fire again.
   it("records an alt chord by its physical key", () => {
     expect(
       appShortcutFromInput(

@@ -1,4 +1,4 @@
-import type { QueryClient } from "@tanstack/react-query";
+import type { QueryClient, QueryKey } from "@tanstack/react-query";
 import type { ThreadListEntry, ThreadWithRuntime } from "@bb/domain";
 import type {
   ProjectResponse,
@@ -22,12 +22,17 @@ import {
 } from "./mutation-cache-effects";
 import {
   applyToCachedThreadListsAndSidebarNavigation,
+  applyToCachedSidebarNavigationThreads,
+  listSidebarNavigationThreads,
+  getCachedSidebarNavigationThreads,
   restoreCachedSidebarNavigation,
   snapshotCachedSidebarNavigation,
   type CachedSidebarNavigationSnapshot,
 } from "./query-cache";
 import {
+  applyToCachedThreadLists,
   getCachedThreadLists,
+  iterateThreadListCacheEntries,
   restoreCachedThreadLists,
   type CachedThreadListSnapshot,
 } from "./thread-list-cache-data";
@@ -66,8 +71,21 @@ interface BeginThreadReadStateTransactionArgs extends ThreadIdCacheArgs {
 }
 
 interface BeginThreadMetadataTransactionArgs extends ThreadIdCacheArgs {
+  parentThreadId?: string | null;
   sectionId?: string | null;
   title?: string | null;
+}
+
+interface ThreadMetadataUpdate {
+  threadId: string;
+  parentThreadId?: string | null;
+  sectionId?: string | null;
+  title?: string | null;
+}
+
+interface BeginThreadMetadataBatchTransactionArgs {
+  queryClient: QueryClient;
+  updates: readonly ThreadMetadataUpdate[];
 }
 
 interface ReorderPinnedThreadTransactionRequest extends ReorderPinnedThreadRequest {
@@ -103,6 +121,16 @@ interface ArchiveThreadAndChildrenTransactionArgs {
   threadId: string;
 }
 
+interface ArchiveEnvironmentThreadsTransactionArgs {
+  environmentId: string;
+  queryClient: QueryClient;
+}
+
+interface ArchiveMatchingThreadsTransactionArgs {
+  matchesThread: (thread: ThreadListEntry) => boolean;
+  queryClient: QueryClient;
+}
+
 interface RollbackArchiveThreadsTransactionArgs {
   queryClient: QueryClient;
   transaction: ArchiveThreadsTransaction | undefined;
@@ -113,8 +141,6 @@ interface SettleArchiveThreadsTransactionArgs {
   response: ThreadArchiveAllResponse | undefined;
   transaction: ArchiveThreadsTransaction | undefined;
 }
-
-interface DeleteThreadTransactionArgs extends ThreadIdCacheArgs {}
 
 interface RollbackDeleteThreadTransactionArgs extends ThreadIdCacheArgs {
   transaction: DeleteThreadTransaction | undefined;
@@ -127,6 +153,12 @@ interface SettleDeleteThreadTransactionArgs extends ThreadIdCacheArgs {
 export interface ThreadListMutationTransaction {
   previousSidebarNavigation: CachedSidebarNavigationSnapshot;
   previousThread: ThreadWithRuntime | undefined;
+  previousThreadLists: CachedThreadListSnapshot;
+}
+
+interface ThreadMetadataBatchTransaction {
+  previousSidebarNavigation: CachedSidebarNavigationSnapshot;
+  previousThreads: ReadonlyMap<string, ThreadWithRuntime | undefined>;
   previousThreadLists: CachedThreadListSnapshot;
 }
 
@@ -364,12 +396,23 @@ export function beginUnpinAndMoveThreadTransaction({
   });
 }
 
-export function beginThreadReadStateTransaction({
+export async function beginThreadReadStateTransaction({
   lastReadAt,
   queryClient,
   threadId,
-}: BeginThreadReadStateTransactionArgs): Promise<ThreadListMutationTransaction> {
-  return runOptimisticThreadFieldTransaction({
+}: BeginThreadReadStateTransactionArgs): Promise<ThreadReadStateTransaction> {
+  const interruptedQueryKeys = [
+    threadQueryKey(threadId),
+    threadsQueryKey(),
+    sidebarNavigationQueryKey(),
+  ].flatMap((queryKey) =>
+    queryClient
+      .getQueryCache()
+      .findAll({ queryKey })
+      .filter((query) => query.state.fetchStatus !== "idle")
+      .map((query) => query.queryKey),
+  );
+  const transaction = await runOptimisticThreadFieldTransaction({
     applyToLists: (queryClient, threadId) =>
       applyToCachedThreadListsAndSidebarNavigation(queryClient, (list) =>
         list.map((thread) =>
@@ -388,18 +431,145 @@ export function beginThreadReadStateTransaction({
     queryClient,
     threadId,
   });
+  return { ...transaction, lastReadAt, interruptedQueryKeys };
+}
+
+export interface ThreadReadStateTransaction extends ThreadListMutationTransaction {
+  lastReadAt: number | null;
+  interruptedQueryKeys: QueryKey[];
+}
+
+export function settleThreadReadStateTransaction({
+  queryClient,
+  transaction,
+}: {
+  queryClient: QueryClient;
+  transaction: ThreadReadStateTransaction | undefined;
+}): void {
+  for (const queryKey of transaction?.interruptedQueryKeys ?? []) {
+    void queryClient.invalidateQueries(
+      { exact: true, queryKey },
+      { cancelRefetch: false },
+    );
+  }
+}
+
+export function rollbackThreadReadStateTransaction({
+  queryClient,
+  threadId,
+  transaction,
+}: ThreadIdCacheArgs & {
+  transaction: ThreadReadStateTransaction | undefined;
+}): void {
+  if (!transaction) return;
+  const { lastReadAt } = transaction;
+  function restore<
+    T extends Pick<
+      ThreadWithRuntime,
+      "id" | "lastReadAt" | "latestAttentionAt"
+    >,
+  >(
+    current: T,
+    previous:
+      | Pick<ThreadWithRuntime, "lastReadAt" | "latestAttentionAt">
+      | undefined,
+  ): T {
+    return current.id === threadId &&
+      previous &&
+      current.lastReadAt === getOptimisticLastReadAt(previous, lastReadAt)
+      ? { ...current, lastReadAt: previous.lastReadAt }
+      : current;
+  }
+  queryClient.setQueryData<ThreadWithRuntime>(
+    threadQueryKey(threadId),
+    (current) => current && restore(current, transaction.previousThread),
+  );
+  for (const snapshot of transaction.previousThreadLists) {
+    const previous = [...iterateThreadListCacheEntries(snapshot.data)].find(
+      (thread) => thread.id === threadId,
+    );
+    applyToCachedThreadLists(queryClient, {
+      queryKey: snapshot.queryKey,
+      mapper: (list) => list.map((thread) => restore(thread, previous)),
+    });
+  }
+  const previous = transaction.previousSidebarNavigation
+    ? listSidebarNavigationThreads(transaction.previousSidebarNavigation).find(
+        (thread) => thread.id === threadId,
+      )
+    : undefined;
+  applyToCachedSidebarNavigationThreads({
+    queryClient,
+    mapper: (list) => list.map((thread) => restore(thread, previous)),
+  });
+}
+
+function findThreadMetadataInCache(
+  queryClient: QueryClient,
+  threadId: string,
+): Pick<ThreadWithRuntime, "parentThreadId" | "sectionId"> | undefined {
+  const thread = queryClient.getQueryData<ThreadWithRuntime>(
+    threadQueryKey(threadId),
+  );
+  if (thread) return thread;
+  const sidebarThread = getCachedSidebarNavigationThreads(queryClient).find(
+    (entry) => entry.id === threadId,
+  );
+  if (sidebarThread) return sidebarThread;
+  for (const { data } of getCachedThreadLists(queryClient, {
+    queryKey: threadsQueryKey(),
+  })) {
+    for (const entry of iterateThreadListCacheEntries(data)) {
+      if (entry.id === threadId) return entry;
+    }
+  }
+  return undefined;
+}
+
+function resolveThreadMetadataPatch({
+  parentThreadId,
+  sectionId,
+  queryClient,
+  threadId,
+  title,
+}: ThreadMetadataUpdate & {
+  queryClient: QueryClient;
+}): Partial<ThreadWithRuntime> {
+  if (parentThreadId === null && sectionId === undefined) {
+    const thread = findThreadMetadataInCache(queryClient, threadId);
+    if (thread?.parentThreadId) {
+      const parent = findThreadMetadataInCache(
+        queryClient,
+        thread.parentThreadId,
+      );
+      if (parent) {
+        sectionId = parent.sectionId;
+      } else {
+        parentThreadId = undefined;
+      }
+    }
+  }
+  return {
+    ...(title !== undefined ? { title } : {}),
+    ...(sectionId !== undefined ? { sectionId } : {}),
+    ...(parentThreadId !== undefined ? { parentThreadId } : {}),
+  };
 }
 
 export function beginThreadMetadataTransaction({
+  parentThreadId,
   sectionId,
   queryClient,
   threadId,
   title,
 }: BeginThreadMetadataTransactionArgs): Promise<ThreadListMutationTransaction> {
-  const patch = {
-    ...(title !== undefined ? { title } : {}),
-    ...(sectionId !== undefined ? { sectionId } : {}),
-  };
+  const patch = resolveThreadMetadataPatch({
+    parentThreadId,
+    queryClient,
+    sectionId,
+    threadId,
+    title,
+  });
   return runOptimisticThreadFieldTransaction({
     applyToLists: (queryClient, threadId) =>
       applyToCachedThreadListsAndSidebarNavigation(queryClient, (list) =>
@@ -411,6 +581,109 @@ export function beginThreadMetadataTransaction({
     queryClient,
     threadId,
   });
+}
+
+export async function beginThreadMetadataBatchTransaction({
+  queryClient,
+  updates,
+}: BeginThreadMetadataBatchTransactionArgs): Promise<ThreadMetadataBatchTransaction> {
+  const threadIds = [...new Set(updates.map((update) => update.threadId))];
+  await Promise.all([
+    ...threadIds.map((threadId) =>
+      queryClient.cancelQueries({ queryKey: threadQueryKey(threadId) }),
+    ),
+    queryClient.cancelQueries({ queryKey: threadsQueryKey() }),
+    queryClient.cancelQueries({ queryKey: sidebarNavigationQueryKey() }),
+  ]);
+
+  const previousThreads = new Map(
+    threadIds.map((threadId) => [
+      threadId,
+      queryClient.getQueryData<ThreadWithRuntime>(threadQueryKey(threadId)),
+    ]),
+  );
+  const previousThreadLists = getCachedThreadLists(queryClient, {
+    queryKey: threadsQueryKey(),
+  });
+  const previousSidebarNavigation =
+    snapshotCachedSidebarNavigation(queryClient);
+  const patches = new Map<string, Partial<ThreadWithRuntime>>();
+  for (const update of updates) {
+    patches.set(update.threadId, {
+      ...patches.get(update.threadId),
+      ...resolveThreadMetadataPatch({ ...update, queryClient }),
+    });
+  }
+
+  for (const [threadId, patch] of patches) {
+    queryClient.setQueryData<ThreadWithRuntime>(
+      threadQueryKey(threadId),
+      (thread) => (thread ? { ...thread, ...patch } : thread),
+    );
+  }
+  applyToCachedThreadListsAndSidebarNavigation(queryClient, (list) =>
+    list.map((thread) => {
+      const patch = patches.get(thread.id);
+      return patch ? { ...thread, ...patch } : thread;
+    }),
+  );
+
+  return {
+    previousSidebarNavigation,
+    previousThreads,
+    previousThreadLists,
+  };
+}
+
+export function rollbackThreadMetadataBatchTransaction({
+  queryClient,
+  transaction,
+}: {
+  queryClient: QueryClient;
+  transaction: ThreadMetadataBatchTransaction | undefined;
+}): void {
+  if (!transaction) return;
+  for (const [threadId, thread] of transaction.previousThreads) {
+    queryClient.setQueryData(threadQueryKey(threadId), thread);
+  }
+  restoreCachedThreadLists(queryClient, transaction.previousThreadLists);
+  restoreCachedSidebarNavigation(
+    queryClient,
+    transaction.previousSidebarNavigation,
+  );
+}
+
+export function applyThreadMetadataBatchResult({
+  queryClient,
+  threads,
+}: {
+  queryClient: QueryClient;
+  threads: readonly ThreadWithRuntime[];
+}): void {
+  const threadsById = new Map(threads.map((thread) => [thread.id, thread]));
+  for (const thread of threads) {
+    queryClient.setQueryData(threadQueryKey(thread.id), thread);
+  }
+  applyToCachedThreadListsAndSidebarNavigation(queryClient, (list) =>
+    list.map((thread) => {
+      const result = threadsById.get(thread.id);
+      return result ? { ...thread, ...result } : thread;
+    }),
+  );
+  invalidateThreadListQueries({ queryClient });
+}
+
+export function invalidateThreadMetadataBatch({
+  queryClient,
+  threadIds,
+}: {
+  queryClient: QueryClient;
+  threadIds: readonly string[];
+}): void {
+  for (const threadId of threadIds) {
+    void queryClient.invalidateQueries({ queryKey: threadQueryKey(threadId) });
+  }
+  invalidateThreadListQueries({ queryClient });
 }
 
 export function rollbackThreadListMutationTransaction({
@@ -493,22 +766,34 @@ export function beginUnarchiveThreadTransaction({
   threadId,
 }: ThreadIdCacheArgs): Promise<ThreadListMutationTransaction> {
   return runOptimisticThreadFieldTransaction({
-    applyToLists: removeThreadFromLists,
+    applyToLists: (queryClient, threadId) => {
+      const thread = getCachedThreadLists(queryClient, {
+        queryKey: threadsQueryKey(),
+      })
+        .flatMap(({ data }) => [...iterateThreadListCacheEntries(data)])
+        .find((candidate) => candidate.id === threadId);
+      removeThreadFromLists(queryClient, threadId);
+      if (!thread) return;
+      applyToCachedSidebarNavigationThreads({
+        queryClient,
+        mapper: (list, projectId) =>
+          projectId === thread.projectId
+            ? [...list, { ...thread, archivedAt: null }]
+            : list,
+      });
+    },
     patch: { archivedAt: null },
     queryClient,
     threadId,
   });
 }
 
-export async function beginArchiveThreadAndChildrenTransaction({
+async function beginArchiveMatchingThreadsTransaction({
+  matchesThread,
   queryClient,
-  threadId,
-}: ArchiveThreadAndChildrenTransactionArgs): Promise<ArchiveThreadsTransaction> {
-  await queryClient.cancelQueries({ queryKey: threadsQueryKey() });
-  await queryClient.cancelQueries({ queryKey: sidebarNavigationQueryKey() });
+}: ArchiveMatchingThreadsTransactionArgs): Promise<ArchiveThreadsTransaction> {
   const archivedThreadIds = getCachedLiveThreadIdsMatching({
-    matchesThread: (thread) =>
-      thread.id === threadId || thread.parentThreadId === threadId,
+    matchesThread,
     queryClient,
   });
   await Promise.all(
@@ -532,8 +817,7 @@ export async function beginArchiveThreadAndChildrenTransaction({
     threadIds: archivedThreadIds,
   });
   removeLiveThreadsFromCachedLists({
-    matchesThread: (thread) =>
-      thread.id === threadId || thread.parentThreadId === threadId,
+    matchesThread,
     queryClient,
   });
 
@@ -543,6 +827,30 @@ export async function beginArchiveThreadAndChildrenTransaction({
     previousThreadLists,
     previousThreads,
   };
+}
+
+export async function beginArchiveThreadAndChildrenTransaction({
+  queryClient,
+  threadId,
+}: ArchiveThreadAndChildrenTransactionArgs): Promise<ArchiveThreadsTransaction> {
+  await queryClient.cancelQueries({ queryKey: threadsQueryKey() });
+  await queryClient.cancelQueries({ queryKey: sidebarNavigationQueryKey() });
+  return beginArchiveMatchingThreadsTransaction({
+    matchesThread: (thread) =>
+      thread.id === threadId || thread.parentThreadId === threadId,
+    queryClient,
+  });
+}
+
+export async function beginArchiveEnvironmentThreadsTransaction({
+  environmentId,
+  queryClient,
+}: ArchiveEnvironmentThreadsTransactionArgs): Promise<ArchiveThreadsTransaction> {
+  await queryClient.cancelQueries({ queryKey: threadsQueryKey() });
+  return beginArchiveMatchingThreadsTransaction({
+    matchesThread: (thread) => thread.environmentId === environmentId,
+    queryClient,
+  });
 }
 
 export function rollbackArchiveThreadsTransaction({
@@ -581,7 +889,7 @@ export function settleArchiveThreadsTransaction({
 export async function beginDeleteThreadTransaction({
   queryClient,
   threadId,
-}: DeleteThreadTransactionArgs): Promise<DeleteThreadTransaction> {
+}: ThreadIdCacheArgs): Promise<DeleteThreadTransaction> {
   await queryClient.cancelQueries({ queryKey: threadQueryKey(threadId) });
   await queryClient.cancelQueries({ queryKey: threadsQueryKey() });
   await queryClient.cancelQueries({ queryKey: sidebarNavigationQueryKey() });

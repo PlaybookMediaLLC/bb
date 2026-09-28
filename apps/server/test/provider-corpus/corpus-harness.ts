@@ -1,12 +1,3 @@
-/**
- * Shared harness for the provider-corpus gates: load one corpus thread into an
- * in-memory database, project it the way `GET /threads/:id/timeline` does, and
- * normalize the result for snapshot comparison.
- *
- * Nothing here is production code. The route options are copied from
- * `apps/server/src/routes/threads/data.ts` so that a row produced here is the
- * row a client would receive.
- */
 import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
@@ -38,6 +29,8 @@ import type { ThreadTimelinePageRequest } from "../../src/services/threads/timel
 import { resolveProviderPlanCommand } from "../../src/services/providers/provider-plan-command.js";
 import type { ProviderRegistryService } from "../../src/services/providers/provider-registry.js";
 import { previewTimelineResponseOutputs } from "../../src/services/threads/timeline-output-preview.js";
+import { clearStoredEventDecodeCache } from "../../src/services/threads/stored-event-decode-cache.js";
+import { clearTimelineSelectionMemo } from "../../src/services/threads/timeline-selection-memo.js";
 import {
   DEFAULT_MAX_INLINE_OUTPUT_CHARS,
   truncateTimelineResponseOutputs,
@@ -45,20 +38,8 @@ import {
 
 export const SNAPSHOT_MODE_ENV = "BB_PROVIDER_CORPUS_SNAPSHOT";
 
-/**
- * Where the row baseline lives. `snapshots/rows` under the corpus is the
- * canonical baseline minted on main and shared by every workstream; a
- * workstream that wants to write a snapshot of its own rows points this at
- * a shadow directory instead of overwriting the shared one.
- */
 export const SNAPSHOT_ROWS_DIR_ENV = "BB_PROVIDER_CORPUS_SNAPSHOT_DIR";
 
-/**
- * An additional allowlist file, merged after the shared
- * `snapshots/allowlist.json`. A PR that intentionally changes rows carries
- * its entries in the repository (see `allowlists/`) so the change is
- * documented with the code and never lands in the shared file.
- */
 export const ALLOWLIST_FILE_ENV = "BB_PROVIDER_CORPUS_ALLOWLIST";
 
 export function resolveSnapshotRowsDir(
@@ -88,30 +69,20 @@ export function resolveSnapshotMode(
   );
 }
 
-// ---------------------------------------------------------------------------
-// Database loading
-// ---------------------------------------------------------------------------
-
 export interface LoadedCorpusThread {
   db: DbConnection;
   thread: Thread;
   close(): void;
 }
 
-/**
- * Inserts the corpus thread and its events with their original ids, sequences,
- * and timestamps. The thread hangs off a synthetic host/project because the
- * extractor kept only the `threads` row; it has no environment, so the
- * projection sees `workspaceRoot: null` and leaves file paths absolute.
- */
 export function loadCorpusThreadIntoDb(
   corpusThread: CorpusThread,
+  connection?: DbConnection,
 ): LoadedCorpusThread {
-  const db = createConnection(":memory:");
-  migrate(db);
+  const db = connection ?? createConnection(":memory:");
+  if (connection === undefined) migrate(db);
   const host = upsertHost(db, noopNotifier, {
     name: "provider-corpus-host",
-    type: "persistent",
   });
   const { project } = createProject(db, noopNotifier, {
     name: "provider-corpus",
@@ -132,7 +103,6 @@ export function loadCorpusThreadIntoDb(
           titleFallback: null,
           sectionId: null,
           status: row.status,
-          // The parent is not part of the corpus, and the FK would reject it.
           parentThreadId: null,
           sourceThreadId: null,
           originKind: row.originKind,
@@ -170,10 +140,6 @@ export function loadCorpusThreadIntoDb(
   };
 }
 
-// ---------------------------------------------------------------------------
-// Route-equivalent projection
-// ---------------------------------------------------------------------------
-
 export type TimelineVariant = "default" | "nested";
 
 export const TIMELINE_VARIANTS: readonly TimelineVariant[] = [
@@ -188,37 +154,32 @@ export interface BuiltTimelinePage {
 
 export interface BuildRouteTimelinePageArgs {
   db: DbConnection;
+  eventBudget?: number;
+  includeDiagnosticOperations?: boolean;
+  maxSeq?: number;
   page: ThreadTimelinePageRequest;
-  /**
-   * The first-party providers as their plugins register them
-   * (`createTestProviderRegistry`), so the display name and plan command come
-   * from the same declarations and resolvers the route uses.
-   */
   registry: ProviderRegistryService;
   thread: Thread;
   variant: TimelineVariant;
 }
 
-/** One page, built and post-processed exactly as the timeline route does. */
 export function buildRouteTimelinePage(
   args: BuildRouteTimelinePageArgs,
 ): BuiltTimelinePage {
   const includeNestedRows = args.variant === "nested";
-  const maxSeq = getLatestThreadSequence(args.db, {
-    threadId: args.thread.id,
-  });
   const { profile, response } = buildThreadTimelineWithProfile(
     args.db,
     args.thread,
     {
-      eventBudget: defaultFeatureFlags.timelineWindowEventBudget,
-      // The dev server and the "show unhandled provider events" setting both
-      // turn this on. The snapshot keeps those rows so a later layer that
-      // converts an unhandled event into a typed row shows up as a diff.
-      includeProviderUnhandledOperations: true,
+      completedTurnDisplay: "collapse",
+      eventBudget:
+        args.eventBudget ?? defaultFeatureFlags.timelineWindowEventBudget,
+      includeDiagnosticOperations: args.includeDiagnosticOperations ?? true,
       includeNestedRows,
       maxInlineOutputChars: DEFAULT_MAX_INLINE_OUTPUT_CHARS,
-      maxSeq,
+      maxSeq:
+        args.maxSeq ??
+        getLatestThreadSequence(args.db, { threadId: args.thread.id }),
       page: args.page,
       providerDisplayName: args.registry.get(args.thread.providerId)?.info
         .displayName,
@@ -241,6 +202,22 @@ export function buildRouteTimelinePage(
   };
 }
 
+export function clearCrossBuildTimelineCaches(db: DbConnection): void {
+  clearStoredEventDecodeCache(db);
+  clearTimelineSelectionMemo(db);
+}
+
+export function selectionWasReused(
+  profile: ThreadTimelineBuildProfile,
+): boolean {
+  const stages = new Set(profile.stageTimings.map((timing) => timing.stage));
+  return (
+    stages.has("selection-memo-lookup") &&
+    !stages.has("group-context-query") &&
+    !stages.has("ordering-context-query")
+  );
+}
+
 export function latestTimelinePage(): ThreadTimelinePageRequest {
   return {
     kind: "latest",
@@ -248,10 +225,6 @@ export function latestTimelinePage(): ThreadTimelinePageRequest {
   };
 }
 
-/**
- * Walks every page from the latest window back to the oldest, following the
- * route's own `olderCursor`, and returns them newest first.
- */
 export function buildAllRouteTimelinePages(
   args: Omit<BuildRouteTimelinePageArgs, "page">,
 ): BuiltTimelinePage[] {
@@ -280,10 +253,6 @@ export function buildAllRouteTimelinePages(
   }
 }
 
-// ---------------------------------------------------------------------------
-// Normalization
-// ---------------------------------------------------------------------------
-
 export type JsonValue =
   | null
   | boolean
@@ -292,11 +261,6 @@ export type JsonValue =
   | JsonValue[]
   | { [key: string]: JsonValue };
 
-/**
- * Rebuilds a JSON-serializable value with object keys sorted, so two builds
- * serialize byte-for-byte when they are structurally equal. `undefined`
- * properties drop the way `JSON.stringify` drops them.
- */
 export function normalizeJson(value: unknown): JsonValue {
   if (value === null || value === undefined) {
     return null;
@@ -325,12 +289,7 @@ export function normalizeJson(value: unknown): JsonValue {
   throw new Error(`Cannot normalize a ${typeof value} for a snapshot`);
 }
 
-// ---------------------------------------------------------------------------
-// Structural diff
-// ---------------------------------------------------------------------------
-
 export interface JsonDiff {
-  /** JSON pointer (RFC 6901) to the differing value. */
   pointer: string;
   expected: JsonValue | undefined;
   actual: JsonValue | undefined;
@@ -351,11 +310,6 @@ function isJsonObject(
   );
 }
 
-/**
- * Leaf-level differences between two normalized values. Arrays compare by
- * index; a length change reports the extra entries individually so an
- * allowlist entry can still name them by path.
- */
 export function diffJson(
   expected: JsonValue | undefined,
   actual: JsonValue | undefined,
@@ -387,11 +341,6 @@ export function diffJson(
   return out;
 }
 
-/**
- * Unified diff of two pretty-printed JSON documents via the system `diff`,
- * capped to `maxLines`. Only the first few differing threads are printed, so
- * shelling out is cheaper than carrying a diff library for a local-only tool.
- */
 export function unifiedJsonDiff(
   expected: JsonValue,
   actual: JsonValue,
@@ -430,10 +379,6 @@ export function unifiedJsonDiff(
   }
 }
 
-// ---------------------------------------------------------------------------
-// Allowlist
-// ---------------------------------------------------------------------------
-
 const allowlistScopeSchema = z.union([
   z.object({ threadId: z.string().min(1) }),
   z.object({ provider: z.string().min(1) }),
@@ -442,7 +387,6 @@ const allowlistScopeSchema = z.union([
 
 const allowlistEntrySchema = z
   .object({
-    /** JSON pointer, or a glob over pointer segments (`*` one, `**` many). */
     path: z.string().min(1),
     pr: z.string().regex(/^#\d+$/),
     reason: z.string().min(1),
@@ -546,11 +490,6 @@ function readAllowlistFile(allowlistPath: string): AllowlistEntry[] {
   );
 }
 
-/**
- * The shared `snapshots/allowlist.json` (absent → none) followed by the
- * file `BB_PROVIDER_CORPUS_ALLOWLIST` names, which must exist when set: a
- * typo must not silently turn an intended diff into a failure.
- */
 export function readAllowlist(
   snapshotsDir: string,
   env: NodeJS.ProcessEnv = process.env,
@@ -563,15 +502,13 @@ export function readAllowlist(
   const extraPath = env[ALLOWLIST_FILE_ENV];
   if (extraPath !== undefined && extraPath !== "") {
     entries.push(
-      ...readAllowlistFile(resolveRepoRelativeFile(ALLOWLIST_FILE_ENV, extraPath)),
+      ...readAllowlistFile(
+        resolveRepoRelativeFile(ALLOWLIST_FILE_ENV, extraPath),
+      ),
     );
   }
   return entries;
 }
-
-// ---------------------------------------------------------------------------
-// Statistics
-// ---------------------------------------------------------------------------
 
 export function percentile(
   values: readonly number[],

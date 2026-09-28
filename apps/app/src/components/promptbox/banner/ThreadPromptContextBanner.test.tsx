@@ -92,27 +92,61 @@ describe("ThreadPromptContextBanner", () => {
     expect(markup).not.toContain("<button");
   });
 
-  it("renders the environment-gone read-only status without a provision action", () => {
-    const markup = renderToStaticMarkup(
+  it.each([
+    ["removed", "Machine removed"],
+    ["removing", "Machine removal in progress"],
+    ["cleanup-failed", "Machine cleanup failed"],
+    ["destroyed", "Environment unavailable"],
+  ] as const)(
+    "collapses the %s explanation behind its status toggle by default",
+    (status, label) => {
+      const toggled: string[] = [];
+      render(
+        <ThreadPromptContextBanner
+          gitSection={null}
+          gitSectionPending={false}
+          archivedSection={null}
+          environmentGoneSection={{ status }}
+          parentThreadSection={null}
+          childThreadsSection={null}
+          pullRequestSection={null}
+          expandedSection={null}
+          onToggleSection={(section) => toggled.push(section)}
+        />,
+      );
+      const toggle = screen.getByRole("button", { name: label });
+      expect(toggle.getAttribute("aria-expanded")).toBe("false");
+      expect(screen.queryByText(/history|machine settings/)).toBeNull();
+      expect(screen.queryByText("Provision")).toBeNull();
+      toggle.click();
+      expect(toggled).toEqual(["status"]);
+    },
+  );
+
+  it("shows the machine removal explanation once the status is expanded", () => {
+    render(
       <ThreadPromptContextBanner
         gitSection={null}
         gitSectionPending={false}
         archivedSection={null}
-        environmentGoneSection={{ status: "destroyed" }}
+        environmentGoneSection={{ status: "cleanup-failed" }}
         parentThreadSection={null}
         childThreadsSection={null}
         pullRequestSection={null}
-        expandedSection={null}
+        expandedSection="status"
         onToggleSection={noop}
       />,
     );
-
-    expect(markup).toContain("Environment archived");
-    expect(markup).toContain("This environment has been archived.");
-    expect(markup).not.toContain("to keep working");
-    expect(markup).toContain('role="status"');
-    expect(markup).not.toContain("<button");
-    expect(markup).not.toContain("Provision");
+    expect(
+      screen
+        .getByRole("button", { name: "Machine cleanup failed" })
+        .getAttribute("aria-expanded"),
+    ).toBe("true");
+    expect(
+      screen.getByText(
+        "This thread is unavailable while machine cleanup is pending. Retry cleanup in machine settings.",
+      ),
+    ).toBeDefined();
   });
 
   it.each([
@@ -126,7 +160,7 @@ describe("ThreadPromptContextBanner", () => {
       label: "environment archived",
       archivedSection: null,
       environmentGoneSection: { status: "destroyed" as const },
-      expectedLabel: "Environment archived",
+      expectedLabel: "Environment unavailable",
     },
   ])(
     "keeps the $label read-only status visible in compact mode",
@@ -158,33 +192,69 @@ describe("ThreadPromptContextBanner", () => {
     },
   );
 
-  it("prioritizes the archived-environment status over unarchiving", () => {
+  it("offers unarchiving first when an archived thread also lost its environment", () => {
     const markup = renderToStaticMarkup(
-      <MemoryRouter>
-        <ThreadPromptContextBanner
-          gitSection={null}
-          gitSectionPending={false}
-          archivedSection={{
-            archivedAt: 1_731_456_000_000,
-            onUnarchive: noop,
-          }}
-          environmentGoneSection={{ status: "destroyed" }}
-          parentThreadSection={{
-            parentThreadTitle: "Parent thread",
-            href: "/threads/thr_parent",
-            relationship: "parent",
-          }}
-          childThreadsSection={null}
-          pullRequestSection={null}
-          expandedSection={null}
-          onToggleSection={noop}
-        />
-      </MemoryRouter>,
+      <ThreadPromptContextBanner
+        gitSection={null}
+        gitSectionPending={false}
+        archivedSection={{
+          archivedAt: 1_731_456_000_000,
+          onUnarchive: noop,
+        }}
+        environmentGoneSection={{ status: "destroyed" }}
+        parentThreadSection={null}
+        childThreadsSection={null}
+        pullRequestSection={null}
+        expandedSection={null}
+        onToggleSection={noop}
+      />,
     );
 
-    expect(markup).toContain("Environment archived");
+    expect(markup).toContain("Environment unavailable");
     expect(markup).not.toContain("Thread is archived");
-    expect(markup).not.toContain(">Unarchive<");
+    expect(markup).toContain(">Unarchive<");
+  });
+
+  it("offers restoring the workspace once the thread is live again", () => {
+    const markup = renderToStaticMarkup(
+      <ThreadPromptContextBanner
+        gitSection={null}
+        gitSectionPending={false}
+        archivedSection={null}
+        environmentGoneSection={{ status: "destroyed", onRestore: noop }}
+        parentThreadSection={null}
+        childThreadsSection={null}
+        pullRequestSection={null}
+        expandedSection={null}
+        onToggleSection={noop}
+      />,
+    );
+
+    expect(markup).toContain("Environment unavailable");
+    expect(markup).toContain(">Restore workspace<");
+  });
+
+  it("shows the restore action as pending while it runs", () => {
+    const markup = renderToStaticMarkup(
+      <ThreadPromptContextBanner
+        gitSection={null}
+        gitSectionPending={false}
+        archivedSection={null}
+        environmentGoneSection={{
+          status: "destroyed",
+          onRestore: noop,
+          restorePending: true,
+        }}
+        parentThreadSection={null}
+        childThreadsSection={null}
+        pullRequestSection={null}
+        expandedSection={null}
+        onToggleSection={noop}
+      />,
+    );
+
+    expect(markup).toContain(">Restoring...<");
+    expect(markup).toContain("disabled");
   });
 
   it("labels a standalone pull request without non-actionable attention text", () => {
@@ -643,8 +713,6 @@ describe("ThreadPromptContextBanner git section body", () => {
   }
 
   it("does not mount the changed-files list until the section first expands", () => {
-    // The list can hold thousands of rows. A collapsed body still costs
-    // layout for every node inside it, so it must stay out of the DOM.
     const { rerender } = render(renderBanner(null));
     expect(screen.queryByRole("list", { hidden: true })).toBeNull();
 
@@ -654,7 +722,6 @@ describe("ThreadPromptContextBanner git section body", () => {
       screen.getByRole("button", { name: `Open ${changedFile.path}` }),
     ).toBeTruthy();
 
-    // Retain the realized body after collapse so re-opening is instant.
     rerender(renderBanner(null));
     expect(screen.getByRole("list", { hidden: true })).toBeTruthy();
   });

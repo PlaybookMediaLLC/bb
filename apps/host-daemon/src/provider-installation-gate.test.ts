@@ -26,6 +26,13 @@ const BRIDGE_LAUNCH: HostDaemonBridgeLaunch = {
   },
 };
 
+async function settleRevalidation(
+  revalidation: Promise<ProviderInstallationStatus>,
+): Promise<void> {
+  await revalidation.catch(() => undefined);
+  await new Promise<void>((resolve) => setTimeout(resolve, 0));
+}
+
 function status(
   overrides: Partial<ProviderInstallationStatus> = {},
 ): ProviderInstallationStatus {
@@ -76,10 +83,6 @@ describe("createProviderInstallationGate", () => {
 
   it("never remembers a not-installed status from a bridge with a minimum version", async () => {
     const gate = createProviderInstallationGate({ ttlMs: 1_000, now: () => 0 });
-    // Bridges compute versionUnsupported as `installed && ...`, so a missing
-    // CLI arrives as versionUnsupported: false. Codex and pi enforce a
-    // minimum version, so an out-of-band install into a directory already on
-    // PATH can turn this answer into a rejection; it must not be stored.
     const notInstalled = status({
       installed: false,
       executablePath: null,
@@ -108,10 +111,6 @@ describe("createProviderInstallationGate", () => {
 
   it("remembers a not-installed status from a bridge with no minimum version", async () => {
     const gate = createProviderInstallationGate({ ttlMs: 1_000, now: () => 0 });
-    // Claude Code and ACP report minimumSupportedVersion: null and hard-code
-    // versionUnsupported: false, so re-probing can never change the verdict;
-    // their launchers resolve the executable on their own, so "not installed"
-    // is a working steady state that must be served from memory.
     const notInstalled = status({
       executableName: "claude",
       executablePath: null,
@@ -177,13 +176,17 @@ describe("createProviderInstallationGate", () => {
     expect(probe).toHaveBeenCalledTimes(2);
   });
 
-  it("probes again once the remembered status expires", async () => {
+  it("revalidates in the background once the remembered status expires", async () => {
     let currentTime = 0;
     const gate = createProviderInstallationGate({
       ttlMs: 100,
       now: () => currentTime,
     });
-    const probe = vi.fn(async () => status());
+    const revalidation = createDeferredPromise<ProviderInstallationStatus>();
+    const probe = vi
+      .fn<() => Promise<ProviderInstallationStatus>>()
+      .mockResolvedValueOnce(status())
+      .mockReturnValueOnce(revalidation.promise);
 
     await gate.run("codex", probe);
     currentTime = 99;
@@ -191,8 +194,68 @@ describe("createProviderInstallationGate", () => {
     expect(probe).toHaveBeenCalledOnce();
 
     currentTime = 100;
-    await gate.run("codex", probe);
+    await expect(gate.run("codex", probe)).resolves.toEqual(status());
     expect(probe).toHaveBeenCalledTimes(2);
+
+    revalidation.resolve(status({ currentVersion: "0.150.0" }));
+    await settleRevalidation(revalidation.promise);
+    currentTime = 150;
+    await expect(gate.run("codex", probe)).resolves.toEqual(
+      status({ currentVersion: "0.150.0" }),
+    );
+    expect(probe).toHaveBeenCalledTimes(2);
+  });
+
+  it("forgets the remembered status when revalidation reports an unsupported version", async () => {
+    let currentTime = 0;
+    const gate = createProviderInstallationGate({
+      ttlMs: 100,
+      now: () => currentTime,
+    });
+    const unsupported = status({
+      currentVersion: "0.135.0",
+      versionUnsupported: true,
+    });
+    const revalidation = createDeferredPromise<ProviderInstallationStatus>();
+    const probe = vi
+      .fn<() => Promise<ProviderInstallationStatus>>()
+      .mockResolvedValueOnce(status())
+      .mockReturnValueOnce(revalidation.promise)
+      .mockResolvedValue(unsupported);
+
+    await gate.run("codex", probe);
+    currentTime = 100;
+    await expect(gate.run("codex", probe)).resolves.toEqual(status());
+
+    revalidation.resolve(unsupported);
+    await settleRevalidation(revalidation.promise);
+    await expect(gate.run("codex", probe)).resolves.toEqual(unsupported);
+    expect(probe).toHaveBeenCalledTimes(3);
+  });
+
+  it("forgets the remembered status when revalidation fails", async () => {
+    let currentTime = 0;
+    const gate = createProviderInstallationGate({
+      ttlMs: 100,
+      now: () => currentTime,
+    });
+    const revalidation = createDeferredPromise<ProviderInstallationStatus>();
+    const probe = vi
+      .fn<() => Promise<ProviderInstallationStatus>>()
+      .mockResolvedValueOnce(status())
+      .mockReturnValueOnce(revalidation.promise)
+      .mockResolvedValue(status({ currentVersion: "0.150.0" }));
+
+    await gate.run("codex", probe);
+    currentTime = 100;
+    await expect(gate.run("codex", probe)).resolves.toEqual(status());
+
+    revalidation.reject(new Error("bridge unavailable"));
+    await settleRevalidation(revalidation.promise);
+    await expect(gate.run("codex", probe)).resolves.toEqual(
+      status({ currentVersion: "0.150.0" }),
+    );
+    expect(probe).toHaveBeenCalledTimes(3);
   });
 
   it("forgets settled entries on clear", async () => {
@@ -216,8 +279,6 @@ describe("createProviderInstallationGate", () => {
 
     const stale = gate.run("codex", probe);
     gate.clear();
-    // The in-flight answer reflects the pre-clear install, so a caller that
-    // arrives after the clear must start its own probe rather than join it.
     const fresh = gate.run("codex", probe);
     staleProbe.resolve(status({ currentVersion: "0.140.0" }));
     await expect(stale).resolves.toEqual(status());
@@ -282,8 +343,6 @@ describe("providerInstallationGateKey", () => {
   });
 
   it("ignores launch facts that do not change which binary answers", () => {
-    // envPassthrough, pluginId, and byteLength are not part of the runtime's
-    // process identity either; keying on them would only split the memo.
     expect(
       providerInstallationGateKey({
         providerId: "codex",

@@ -12,20 +12,20 @@ import {
   PresetDialog,
   savePresetDraft,
 } from "../views/manage/preset-dialog.js";
-import { Icon } from "@bb/shared-ui/icon";
-import { DelayedLoading } from "@bb/shared-ui/delayed-loading";
-import { Skeleton } from "@bb/shared-ui/skeleton";
+import { Icon } from "@/components/ui/icon";
+import { DelayedLoading } from "@/components/ui/delayed-loading";
+import { Skeleton } from "@/components/ui/skeleton";
 import {
   Tooltip,
   TooltipContent,
   TooltipProvider,
   TooltipTrigger,
-} from "@bb/shared-ui/tooltip";
-import { cn } from "@bb/shared-ui/lib/utils";
+} from "@/components/ui/tooltip";
+import { cn } from "@/lib/utils";
 
 interface SidebarRowProps {
   active?: boolean;
-  onClick?: () => void;
+  onClick: () => void;
   children: ReactNode;
   title?: string;
 }
@@ -38,11 +38,11 @@ function SidebarRow({ active, onClick, children, title }: SidebarRowProps) {
       title={title}
       className={cn(
         "flex h-7 w-full items-center gap-2 rounded-md px-2 text-left text-sm focus-visible:outline-none focus-visible:ring-1 focus-visible:ring-ring max-md:pointer-coarse:h-9",
-        onClick ? "cursor-pointer" : "cursor-default",
+        "cursor-pointer",
         active
           ? "bg-sidebar-accent font-medium text-foreground"
           : "text-muted-foreground",
-        onClick && !active && "hover:bg-state-hover hover:text-foreground",
+        !active && "hover:bg-state-hover hover:text-foreground",
       )}
     >
       {children}
@@ -93,8 +93,6 @@ function SectionHeader({
 }
 
 function ProjectDot({ color }: { color: string }) {
-  // Project colors are user data, not theme tokens, so an inline style is the
-  // only way to render them.
   return (
     <span
       aria-hidden
@@ -184,8 +182,6 @@ export function TasksSidebar({
     new Set(),
   );
   const rpc = useTasksRpc();
-  // Keyed remount resets the dialog draft per open/target. Saving publishes
-  // projects:changed, which refreshes the shell's presets query.
   const [presetDialog, setPresetDialog] = useState<{
     key: number;
     editing: Preset | null;
@@ -199,7 +195,6 @@ export function TasksSidebar({
     [summaries],
   );
   const activeProjectId = route.kind === "project" ? route.projectId : null;
-  // No explicit view: the shell restores the view last used for that project.
   const openProject = (projectId: string) =>
     onNavigate({ kind: "project", projectId, view: null });
   const toggleFolder = (folderId: string) =>
@@ -212,9 +207,6 @@ export function TasksSidebar({
 
   const rootFolders = (folders ?? []).filter((f) => f.parentFolderId === null);
   const childFolders = (folders ?? []).filter((f) => f.parentFolderId !== null);
-  // A project whose folder is not in hand (the folder list failed to load, or
-  // the lists briefly disagree) is listed ungrouped rather than dropped; it is
-  // still the user's project and must stay navigable.
   const knownFolderIds = new Set((folders ?? []).map((f) => f.id));
   const ungrouped = (projects ?? []).filter(
     (p) => p.folderId === null || !knownFolderIds.has(p.folderId),
@@ -244,7 +236,6 @@ export function TasksSidebar({
                 onClick={() => openProject(project.id)}
               />
             ))}
-            {/* Folders nest one level; children only render under roots. */}
             {!indent
               ? children.map((child) => renderFolder(child, true))
               : null}
@@ -297,8 +288,6 @@ export function TasksSidebar({
               </>
             ) : null}
             {rootFolders.map((folder) => renderFolder(folder, false))}
-            {/* With zero projects the main pane's empty-state CTA is the
-                single New-project affordance. */}
             {(projects ?? []).length > 0 ? (
               <div className="mt-1.5">
                 <SidebarRow onClick={onNewProject} title="New project">
@@ -319,7 +308,7 @@ export function TasksSidebar({
                         setPresetDialog({ key: Date.now(), editing: preset })
                       }
                     >
-                      <Icon name="Brain" className="size-3.5 shrink-0" />
+                      <Icon name="Bot" className="size-3.5 shrink-0" />
                       <span className="min-w-0 flex-1 truncate">
                         {preset.name}
                       </span>

@@ -16,6 +16,8 @@ import {
 } from "./FilePreview";
 import { SOURCE_CODE_MAX_LINES } from "@/components/code/source-code-budget";
 import { SecondaryPanelFilePreview } from "./ThreadStorageFilePreview";
+import { HttpError } from "@/lib/api";
+import { BbHttpError } from "@bb/sdk/browser";
 import {
   PierreWorkerPoolGateContext,
   type PierreWorkerPoolGate,
@@ -130,9 +132,6 @@ vi.mock("@pierre/diffs/react", async () => {
               y: 700 + index * 18,
               toJSON: () => ({}),
             });
-            // Model the native behavior that caused the regression: asking a
-            // long line to scroll into view can also move Pierre's horizontal
-            // code scroller.
             line.scrollIntoView = () => {
               code.scrollLeft = 0;
             };
@@ -162,11 +161,6 @@ vi.mock("@pierre/diffs/react", async () => {
   };
 });
 
-/**
- * The code view reads the workspace pool from the worker-pool gate (see
- * ThreadDetailWorkerPoolProvider); tests that exercise pool-driven behavior
- * render inside a ready gate that publishes the mock pool.
- */
 function renderWithWorkerPool(ui: ReactElement) {
   const gate: PierreWorkerPoolGate = {
     ready: true,
@@ -182,11 +176,6 @@ function renderWithWorkerPool(ui: ReactElement) {
   );
 }
 
-/**
- * jsdom has no layout, so the CSV table's row virtualizer would see a 0px
- * scroll box and mount nothing. Give every scroll box a 400px viewport and
- * every table row its real single-line height.
- */
 const CSV_TEST_ROW_HEIGHT_PX = 29;
 function mockCsvTableLayout() {
   vi.spyOn(HTMLElement.prototype, "offsetHeight", "get").mockImplementation(
@@ -366,8 +355,6 @@ describe("FilePreview", () => {
     );
 
     const pierreFile = await screen.findByTestId("pierre-file");
-    // The code view scrolls its own virtualized viewport (which sits at the
-    // origin in jsdom), not the surrounding panel scroller.
     const codeViewport = scrollViewport.querySelector<HTMLElement>(
       "[data-bb-source-code-viewport]",
     );
@@ -419,8 +406,6 @@ describe("FilePreview", () => {
       );
     });
 
-    // Pierre repaints the highlighted AST in place; a React remount would
-    // throw away its DOM (and the user's scroll position) for nothing.
     await waitFor(() => {
       expect(
         Number(screen.getByTestId("pierre-file").dataset.renderCount),
@@ -459,7 +444,6 @@ describe("FilePreview", () => {
     expect(pierreMock.state.lastFile?.contents.split("\n")).toHaveLength(
       SOURCE_CODE_MAX_LINES,
     );
-    // The capped prefix must not share the full file's highlight cache slot.
     expect(pierreMock.state.lastFile?.cacheKey).toBe(
       "file-preview:generated:head",
     );
@@ -495,7 +479,6 @@ describe("FilePreview", () => {
       />,
     );
 
-    // 512 KB budget: two 200k-char lines fit, the third would exceed it.
     expect(pierreMock.state.lastFile?.contents).toBe(
       [longLine, longLine].join("\n"),
     );
@@ -561,10 +544,46 @@ describe("FilePreview", () => {
     openSpy.mockRestore();
   });
 
+  it("enlarges the HTML file actions for narrow coarse pointers", () => {
+    render(
+      <FilePreview
+        path="docs/progress-vis.html"
+        onOpenInEditor={vi.fn()}
+        state={{
+          kind: "html",
+          file: { name: "progress-vis.html", contents: "<p>chart</p>" },
+          iframe: {
+            sandbox: "allow-scripts",
+            title: "docs/progress-vis.html",
+            url: "/api/v1/threads/thr_1/worktree/files/docs/progress-vis.html",
+          },
+          lineRange: null,
+        }}
+      />,
+    );
+
+    const actionButtons = [
+      screen.getByRole("button", { name: "Copy HTML source" }),
+      screen.getByRole("button", { name: /Open in editor/ }),
+    ];
+
+    for (const actionButton of actionButtons) {
+      expect(actionButton.classList.contains("max-md:pointer-coarse:h-9")).toBe(
+        true,
+      );
+      expect(actionButton.classList.contains("max-md:pointer-coarse:w-9")).toBe(
+        true,
+      );
+      expect(
+        actionButton.classList.contains(
+          "max-md:pointer-coarse:[&_[data-icon-root]]:size-5",
+        ),
+      ).toBe(true);
+    }
+  });
+
   it("hands the desktop shell an absolute preview url", () => {
     const openExternalUrl = vi.fn();
-    // The desktop main process drops a relative path, so the button has to
-    // resolve the app-relative preview route before handing it over.
     (window as unknown as { bbDesktop: unknown }).bbDesktop = {
       openExternalUrl,
     };
@@ -739,13 +758,11 @@ describe("FilePreview", () => {
 
     const preview = buildCsvPreviewData(lines.join("\n"));
 
-    // rows includes the header, so the cap keeps 500 data rows.
     expect(preview.rows.length).toBe(501);
     expect(preview.rows.at(-1)?.[0]).toBe("c1r500");
     expect(preview.columnCount).toBe(100);
     expect(preview.truncatedRows).toBe(true);
     expect(preview.truncatedColumns).toBe(true);
-    // The footnote counts data rows, not parsed rows.
     expect(getCsvTruncationNote(preview, preview.rows.length - 1)).toBe(
       "Showing the first 500 rows and 100 columns.",
     );
@@ -765,6 +782,7 @@ describe("FilePreview", () => {
   });
 
   it("mounts only the CSV rows near the viewport, not the whole 500x100 window", () => {
+    vi.useFakeTimers();
     mockCsvTableLayout();
     const columnCount = 120;
     const header = Array.from({ length: columnCount }, (_, i) => `col_${i}`);
@@ -787,19 +805,17 @@ describe("FilePreview", () => {
 
     const table = screen.getByRole("table", { name: "big.csv CSV preview" });
     expect(screen.getByText("r0c0")).not.toBeNull();
-    // 400px / 29px is ~14 visible rows; with overscan the mounted set stays
-    // far below the 500-row parse cap (50,000 cells when fully mounted).
     expect(table.querySelectorAll("td").length).toBeLessThan(6_000);
     const mountedRows = table.querySelectorAll("tbody tr[data-index]");
     expect(mountedRows.length).toBeGreaterThanOrEqual(14);
     expect(mountedRows.length).toBeLessThan(60);
     expect(screen.queryByText("r499c0")).toBeNull();
 
-    // Scrolling to the bottom mounts the last rows and unmounts the first.
     const scrollBox = table.parentElement;
     if (!(scrollBox instanceof HTMLElement)) throw new Error("no scroll box");
     scrollBox.scrollTop = 499 * CSV_TEST_ROW_HEIGHT_PX;
     fireEvent.scroll(scrollBox);
+    act(() => vi.runOnlyPendingTimers());
     expect(screen.getByText("r499c0")).not.toBeNull();
     expect(screen.queryByText("r0c0")).toBeNull();
     expect(table.querySelectorAll("tbody tr[data-index]").length).toBeLessThan(
@@ -832,6 +848,124 @@ describe("FilePreview", () => {
     ).not.toBeNull();
     expect(screen.getByRole("cell", { name: "Ada" })).not.toBeNull();
     expect(screen.getByRole("cell", { name: "10" })).not.toBeNull();
+  });
+
+  it("states the reason a file preview failed", () => {
+    render(
+      <SecondaryPanelFilePreview
+        activePath="docs/huge.bin"
+        error={
+          new HttpError({
+            status: 413,
+            message: "File is too large to preview",
+            code: "file_too_large",
+            body: {
+              code: "file_too_large",
+              message: "File is too large to preview",
+            },
+          })
+        }
+        filePreview={undefined}
+        isLoading={false}
+      />,
+    );
+
+    expect(screen.getByRole("alert").textContent).toBe(
+      "File is too large to preview",
+    );
+  });
+
+  it("states the reason an SDK-sourced file preview failed", () => {
+    render(
+      <SecondaryPanelFilePreview
+        activePath="docs/notes.md"
+        error={
+          new BbHttpError({
+            status: 502,
+            code: "host_unavailable",
+            message: "Host is not connected",
+            body: {
+              code: "host_unavailable",
+              message: "Host is not connected",
+            },
+          })
+        }
+        filePreview={undefined}
+        isLoading={false}
+      />,
+    );
+
+    expect(screen.getByRole("alert").textContent).toBe("Host is not connected");
+  });
+
+  it("keeps the dedicated not-found message for a 404 preview fetch", () => {
+    render(
+      <SecondaryPanelFilePreview
+        activePath="does-not-exist.md"
+        error={new HttpError({ status: 404, message: "Not found" })}
+        filePreview={undefined}
+        isLoading={false}
+      />,
+    );
+
+    expect(screen.getByRole("alert").textContent).toBe("File not found.");
+  });
+
+  it("keeps the dedicated not-found message for a 404 from the SDK", () => {
+    render(
+      <SecondaryPanelFilePreview
+        activePath="does-not-exist.md"
+        error={
+          new BbHttpError({
+            status: 404,
+            code: "ENOENT",
+            message: "Path does not exist: /workspace/does-not-exist.md",
+            body: {
+              code: "ENOENT",
+              message: "Path does not exist: /workspace/does-not-exist.md",
+            },
+          })
+        }
+        filePreview={undefined}
+        isLoading={false}
+      />,
+    );
+
+    expect(screen.getByRole("alert").textContent).toBe("File not found.");
+  });
+
+  it("falls back to the generic failure message when the error carries none", () => {
+    render(
+      <SecondaryPanelFilePreview
+        activePath="does-not-exist.md"
+        error={new Error("   ")}
+        filePreview={undefined}
+        isLoading={false}
+      />,
+    );
+
+    expect(screen.getByRole("alert").textContent).toBe("Failed to load file");
+  });
+
+  it("does not announce an unsupported preview type as an alert", () => {
+    render(
+      <SecondaryPanelFilePreview
+        activePath="docs/report.pdf"
+        filePreview={{
+          kind: "unsupported",
+          mimeType: "application/pdf",
+          name: "report.pdf",
+          path: "docs/report.pdf",
+          url: "/api/v1/preview/report",
+        }}
+        isLoading={false}
+      />,
+    );
+
+    expect(screen.queryByRole("alert")).toBeNull();
+    expect(
+      screen.getByText("Preview not available for application/pdf."),
+    ).not.toBeNull();
   });
 
   it("does not show the file preview actions menu for non-text previews", () => {

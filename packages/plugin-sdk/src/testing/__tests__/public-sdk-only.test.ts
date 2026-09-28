@@ -4,15 +4,6 @@ import { join } from "node:path";
 import { afterEach, describe, expect, it } from "vitest";
 import { experimental_scanPublicSdkOnly as scanPublicSdkOnly } from "../index.js";
 
-/**
- * The guard the echo example and the first-party ACP plugin run over
- * themselves. What can go wrong is a scanner that reads nothing, lets a
- * private package through, lets a relative path climb out of the package
- * into one, misses a specifier it cannot read, or refuses a published SDK
- * subpath — so the cases below plant one file per outcome in a throwaway
- * package.
- */
-
 let packageRoot: string;
 
 function plant(files: Record<string, string>, manifest: object = {}): void {
@@ -35,7 +26,7 @@ describe("experimental_scanPublicSdkOnly", () => {
   it("walks the package, skipping node_modules and dist, and accepts the published SDK surface", () => {
     plant({
       "server.ts": `import { z } from "zod";\nimport type { BbPluginApi } from "@get-bb/plugin-sdk";\nimport { join } from "node:path";\nimport { helper } from "./src/helper.js";\n`,
-      "src/helper.ts": `import "@get-bb/plugin-sdk/provider-bridge";\nimport "@get-bb/plugin-sdk/provider-bridge/acp";\nimport "@get-bb/plugin-sdk/host";\nimport "@get-bb/plugin-sdk/ai-services";\nexport const helper = 1;\n`,
+      "src/helper.ts": `import "@get-bb/plugin-sdk/provider-bridge";\nimport "@get-bb/plugin-sdk/provider-bridge/acp";\nimport "@get-bb/plugin-sdk/host";\nexport const helper = 1;\n`,
       "app.tsx": `import "@get-bb/plugin-sdk/app";\n`,
       "server.test.ts": `import { it } from "vitest";\nimport "@get-bb/plugin-sdk/testing";\nimport "@get-bb/plugin-sdk/provider-bridge/testing";\n`,
       "node_modules/dep/index.js": `require("@bb/domain");\n`,
@@ -81,9 +72,6 @@ describe("experimental_scanPublicSdkOnly", () => {
   });
 
   it("reports a relative import that resolves outside the package root and admits one inside it", () => {
-    // Inside bb's monorepo `../../../../packages/domain/src/index.js` is a
-    // private package reached without its name: an IDE auto-import plants
-    // exactly this shape.
     plant({
       "src/bridge.ts": `import { threadEventSchema } from "../../outside.js";\nimport { helper } from "./inside.js";\nimport { shared } from "../sibling.js";\nimport { config } from "../../vitest.shared.js";\n`,
       "src/inside.ts": "export const helper = 1;\n",
@@ -101,8 +89,6 @@ describe("experimental_scanPublicSdkOnly", () => {
         reason: "outside-package",
       },
     ]);
-    // An escape the plugin names in `allow` (a shared test config above
-    // the package, say) is deliberate and admitted.
     expect(
       scanPublicSdkOnly(packageRoot, {
         allow: [/^(?:\.\.\/)+vitest\.shared\.js$/u],

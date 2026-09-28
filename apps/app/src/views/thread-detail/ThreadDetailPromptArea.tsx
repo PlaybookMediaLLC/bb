@@ -1,5 +1,8 @@
+import type { MachineRemovalStatus } from "@/lib/machine-removal-display";
+import { ThreadMachineStatus } from "@/components/promptbox/banner/ThreadMachineStatus";
 import {
   useCallback,
+  useEffect,
   useLayoutEffect,
   useMemo,
   useRef,
@@ -7,7 +10,7 @@ import {
   type RefObject,
 } from "react";
 import { createPortal } from "react-dom";
-import { useNavigate } from "react-router-dom";
+import { useImmediateRouteNavigate } from "@/components/ui/app-route-anchor";
 import type { IconName } from "@bb/shared-ui/icon";
 import type { PromptMentionLinkResolver } from "@/components/promptbox/editor/prompt-mention-link";
 import {
@@ -16,7 +19,9 @@ import {
 } from "@/components/promptbox/follow-up-placeholder";
 import { PERSONAL_PROJECT_ID } from "@bb/domain";
 import type {
-  EnvironmentStatus,
+  PermissionMode,
+  ReasoningLevel,
+  ServiceTier,
   PendingInteraction,
   PromptInput,
   ThreadQueuedMessage,
@@ -29,10 +34,23 @@ import type {
 } from "@bb/domain";
 import type {
   PullRequestMergeMethod,
+  SendMessageRequest,
   ThreadTimelineResponse,
   TimelineWorkflowWorkRow,
 } from "@bb/server-contract";
+import type {
+  ExperimentalComposerSelection,
+  ExperimentalComposerSubmitOptions,
+} from "@get-bb/plugin-sdk";
 import type { ChildThreadPendingAttention } from "@/hooks/queries/child-thread-pending-interactions";
+import {
+  readExecutionSelection,
+  resolveComposerSelectionDeadline,
+  useCommittedComposerState,
+  waitForSettledComposerState,
+  waitUntilComposerStateSettled,
+  type CommittedComposerState,
+} from "@/components/promptbox/composer-selection-settle";
 import { ThreadPendingInteractionBanner } from "@/components/thread/pending-interactions/ThreadPendingInteractionBanner";
 import {
   type PluginComposerHost,
@@ -54,15 +72,19 @@ import { ThreadWorkflowCard } from "@/components/promptbox/banner/ThreadWorkflow
 import { ThreadBackgroundCommandsCard } from "@/components/promptbox/banner/ThreadBackgroundCommandsCard";
 import { ThreadModelFallbackCard } from "@/components/promptbox/banner/ThreadModelFallbackCard";
 import { InlineMessageEditorFrame } from "@/components/promptbox/InlineMessageEditorFrame";
+import type { ModelReasoningPickerHandoffSelection } from "@/components/pickers/ModelReasoningPicker";
 import type {
   WorkspaceChangedFileSelection,
   WorkspaceChangedFilesSection,
 } from "@/components/workspace/workspace-change-summary";
 import {
   QueuedMessagesList,
+  QueuedMessagesPendingCard,
   type QueuedMessageInlineEditor,
 } from "@/components/promptbox/banner/QueuedMessagesList";
 import { ThreadEnvironmentSummary } from "@/components/promptbox/ThreadEnvironmentSummary";
+import type { MachineLabelHost } from "@/components/machines/MachineLabel";
+import type { MachineProviderPresentation } from "@/components/plugin/MachineProviderIcon";
 import type { WorkspaceCheckoutDisplay } from "@/lib/workspace-checkout-display";
 import { useComposerTextEffects } from "@/lib/composer-text-effects";
 import { useLatestRef } from "@/hooks/useLatestRef";
@@ -78,25 +100,36 @@ import {
   type InlineQueuedMessageEditState,
 } from "@/components/thread/embedded-chat";
 import {
+  useCreateThread,
   useCreateThreadQueuedMessage,
   useCancelThreadPlan,
   useClearThreadGoal,
   useStopThread,
 } from "@/hooks/mutations/thread-runtime-mutations";
-import { useUnarchiveThread } from "@/hooks/mutations/thread-state-mutations";
+import {
+  useRestoreThreadEnvironment,
+  useUnarchiveThread,
+} from "@/hooks/mutations/thread-state-mutations";
 import {
   getLatestPendingInteraction,
   useThreadQueuedMessages,
   useThreadPromptHistory,
 } from "@/hooks/queries/thread-queries";
 import { useThreadDefaultExecutionOptions } from "@/hooks/queries/thread-default-execution-options-query";
-import { getMutationErrorMessage } from "@/lib/mutation-errors";
+import {
+  getMutationErrorMessage,
+  showMutationErrorToast,
+} from "@/lib/mutation-errors";
 import { promptHistoryEntriesToDrafts } from "@/lib/prompt-history";
 import { usePromptHistoryEnabled } from "@/hooks/usePromptHistoryEnabled";
-import { getProjectComposeRoutePath } from "@/lib/route-paths";
+import { getThreadRoutePath } from "@/lib/route-paths";
 import { getThreadDisplayTitle } from "@/lib/thread-title";
-import { buildThreadHandoffLocationState } from "@bb/client-core";
-import { appToast } from "@/components/ui/app-toast";
+import {
+  buildThreadHandoffCreateRequest,
+  buildThreadHandoffFollowUpDraft,
+  stripThreadHandoffPrefix,
+  type ThreadHandoffCreateSeed,
+} from "@bb/client-core";
 import {
   emptyPromptDraftState,
   promptDraftToInput,
@@ -122,6 +155,7 @@ import {
 } from "@bb/client-core";
 
 const ignorePromptBannerFileClick = () => {};
+const ignoreToastedCreateThreadError = () => {};
 
 export interface ThreadDetailSentMessageEdit {
   draft: PromptDraftState;
@@ -139,27 +173,23 @@ export interface ThreadDetailSentMessageEdit {
 }
 
 const THREAD_DETAIL_COMPOSER_TEXTAREA_ID = "thread-detail-follow-up-composer";
+const EMPTY_QUEUED_MESSAGES: readonly ThreadQueuedMessage[] = [];
 
 interface ThreadDetailPromptAreaProps {
   activeBackgroundAgentCount: number;
+  canRestoreEnvironment: boolean;
   canUseGitUi: boolean;
   contextWindowUsage?: ThreadTimelineResponse["contextWindowUsage"];
   environmentCheckout?: WorkspaceCheckoutDisplay;
   environmentCompactLabel?: string;
-  /**
-   * Set when the thread's environment is gone (`destroying` or `destroyed`).
-   * Collapses the composer and shows a read-only context-banner row — the
-   * thread can no longer run work (Decision B*).
-   */
-  environmentGoneStatus: Extract<
-    EnvironmentStatus,
-    "destroying" | "destroyed"
-  > | null;
-  /** Machine of the thread's environment; routes host-scoped model catalogs by host. */
+  environmentGoneStatus: "destroyed" | MachineRemovalStatus | null;
   environmentHostId?: string;
+  environmentHost?: MachineLabelHost;
+  environmentMachineProvider?: MachineProviderPresentation | null;
   environmentIcon?: IconName;
   environmentLabel?: string;
-  onCreateNewThreadInWorktree?: () => void;
+  environmentProviderName?: string;
+  onCreateNewThreadInEnvironment?: () => void;
   onPullRequestDraft?: () => void;
   onPullRequestMerge?: (method: PullRequestMergeMethod) => void;
   onPullRequestReady?: () => void;
@@ -167,61 +197,26 @@ interface ThreadDetailPromptAreaProps {
   isEnvironmentActionPending: boolean;
   pendingInteractions: readonly PendingInteraction[];
   pendingInteractionsInitialLoading: boolean;
+  queuedMessageCount: number;
   onChangedFileClick: (selection: WorkspaceChangedFileSelection) => void;
   projectId: string;
-  /** Click handler for inserted mention pills (navigate to threads, open file previews). */
   resolveMentionLink: PromptMentionLinkResolver;
-  /**
-   * Resolved changed-files section for the thread's workspace. Null hides the
-   * banner. Production passes null when git UI is unavailable
-   * (canUseGitUi === false) or the workspace has no changes; otherwise the
-   * value is selectWorkspaceChangedFilesSection(workspaceStatus).
-   */
   workspaceChangedFilesSection: WorkspaceChangedFilesSection | null;
-  /**
-   * True while the workspace status query is in flight on initial load.
-   * Suppresses the prompt context banner until the result settles so the
-   * banner's first paint is its final form.
-   */
   workspaceStatusPending: boolean;
-  /**
-   * Merge-base picker config for the prompt context banner. Null hides the
-   * picker (e.g. thread is on default branch — no merge base to compare).
-   */
   contextBannerMergeBase: ContextBannerMergeBaseConfig | null;
-  /** Latest task/todo snapshot from the timeline projection. Null on older pages or when no candidate observed. */
   pendingTodos: ThreadTimelinePendingTodos | null;
-  /** Active provider prompt mode from the latest timeline projection. Null when no prompt mode is active. */
   activePromptMode: ThreadTimelineActivePromptMode | null;
-  /** Current provider goal from the timeline projection. Null when no goal is active. */
   goal: ThreadTimelineGoal | null;
-  /** Active provider fallback; controls the next model selection until another turn is requested. */
   modelFallback: ThreadTimelineModelFallback | null;
-  /**
-   * Running workflow rows from the timeline, most recently started first. A
-   * thread can run several workflows at once, so each gets its own card. Empty
-   * when none are running.
-   */
   activeWorkflows: TimelineWorkflowWorkRow[];
-  /** Running backgrounded shell command rows, most recent first. Empty when none. */
   activeBackgroundCommands: TimelineWorkflowWorkRow[];
-  /** Parent reference for child threads. Null for root threads. */
   parentThreadSection: ThreadPromptParentThreadSection | null;
-  /** Pending permission or question prompts from delegated child threads. */
   childPendingInteractions: readonly ChildThreadPendingAttention[];
-  /** Active child threads for parent threads. Null otherwise. */
   childThreadsSection: ThreadPromptChildThreadsSection | null;
-  /** Pull request summary for the active thread branch. Null when there is no PR. */
   pullRequest: ThreadPullRequest | null;
   sendMessage: SendMessageMutationLike;
-  /** Present only while a sent-message editor is mounted in the timeline. */
   sentMessageEdit?: ThreadDetailSentMessageEdit;
   steerActiveThreadOnEnter: boolean;
-  /**
-   * Bumped by the timeline host each time a quote is appended to the shared
-   * draft via "Add to chat", so the composer can focus its caret at the end —
-   * ready for the reply beneath the freshly inserted blockquote.
-   */
   composerFocusRequestNonce: number;
   thread: ThreadWithRuntime;
 }
@@ -231,16 +226,13 @@ interface InlineDraftComposerOptions {
   canModifierSubmit: boolean;
   compactPromptPlaceholder: string;
   composerId: string;
-  /** Live draft under edit; supplies the message text, mentions, and history draft. */
   draft: PromptDraftState;
   editFocusNonce: number;
   execution: FollowUpPromptBoxProps["execution"];
-  /** Combined with editFocusNonce to focus the caret at the end per edit session. */
   focusSessionKey: string | number;
   historyResetKey: string;
   isSubmitting: boolean;
   onChangeMessage: FollowUpComposerProps["onChangeMessage"];
-  /** Escape pressed in the editor; passes the editor's cancel action. */
   onEscape?: FollowUpComposerProps["onEscape"];
   onSelectHistoryEntry: (draft: PromptDraftState) => void;
   permission: FollowUpPromptBoxProps["permission"];
@@ -257,13 +249,6 @@ interface InlineDraftComposerOptions {
   collapseResetKey: string;
 }
 
-/**
- * The queued-message and sent-message inline editors render the same
- * FollowUpPromptBox shape: read-only execution/permission controls, no stack,
- * no environment summary, and a plugin-composer host bound to the draft under
- * edit. Only the draft accessors, submit wiring, and session keys differ, so
- * both call sites pass those in here and share the rest.
- */
 function buildInlineDraftComposer(options: InlineDraftComposerOptions) {
   return (
     <FollowUpPromptBox
@@ -307,11 +292,29 @@ function buildInlineDraftComposer(options: InlineDraftComposerOptions) {
       typeahead={options.typeahead}
       promptActions={options.promptActions}
       collapseResetKey={options.collapseResetKey}
+      preferExpanded
       focusEndKey={`${options.focusSessionKey}:${options.editFocusNonce}`}
       isPrimaryComposer={false}
       showScrollToBottomButton={false}
     />
   );
+}
+
+interface ThreadComposerSelectionState extends CommittedComposerState {
+  selectedProviderId: string;
+  selectedThreadModel: string;
+  reasoningLevel: ReasoningLevel;
+  serviceTier: ServiceTier | undefined;
+  supportsServiceTier: boolean;
+  permissionMode: PermissionMode;
+  providerIds: readonly string[];
+  isHandoffSelection: boolean;
+  changeProvider: (providerId: string) => void;
+  changeModel: (model: string) => void;
+  handoffSelect: (selection: ModelReasoningPickerHandoffSelection) => void;
+  changeReasoning: (level: ReasoningLevel) => void;
+  changeServiceTier: (tier: ServiceTier | undefined) => void;
+  changePermissionMode: (mode: PermissionMode) => void;
 }
 
 type InlineQueuedMessageEditSession = Pick<
@@ -329,13 +332,8 @@ function isInlineQueuedMessageEditSession(
   );
 }
 
-/**
- * Fallback for host draft reads that outlive their editor session: the ref no
- * longer holds the session, so there is no live draft to return.
- */
 const ENDED_EDIT_SESSION_DRAFT = emptyPromptDraftState();
 
-/** Plugin composer-host accessors for the queued-message inline editor (see below). */
 function readInlineQueuedMessageDraft(
   editStateRef: RefObject<InlineQueuedMessageEditState | null>,
   session: InlineQueuedMessageEditSession,
@@ -359,12 +357,6 @@ function writeInlineQueuedMessageDraft(
   }
 }
 
-/**
- * Plugin composer-host accessors for the sent-message inline editor. Module
- * level on purpose: inlined closures that return `ref.current.draft` in one
- * branch and the render-time `draft` in another make React Compiler type the
- * whole edit object as a ref value and bail out of the component.
- */
 function readSentMessageEditDraft(
   sentMessageEditRef: RefObject<ThreadDetailSentMessageEdit | undefined>,
   operationId: string,
@@ -385,12 +377,6 @@ function writeSentMessageEditDraft(
   }
 }
 
-/**
- * Flip the "sending" flag around a task. Kept outside the component: React
- * Compiler bails out of any function containing `try`/`finally`, and one such
- * block inside `ThreadDetailPromptArea` left the whole ~1600-line body
- * unmemoized.
- */
 async function runWhileFollowUpShortcutSending(
   setSending: (sending: boolean) => void,
   task: () => Promise<void>,
@@ -405,15 +391,19 @@ async function runWhileFollowUpShortcutSending(
 
 export function ThreadDetailPromptArea({
   activeBackgroundAgentCount,
+  canRestoreEnvironment,
   canUseGitUi,
   contextWindowUsage,
   environmentCheckout,
   environmentCompactLabel,
   environmentGoneStatus,
   environmentHostId,
+  environmentHost,
+  environmentMachineProvider,
   environmentIcon,
   environmentLabel,
-  onCreateNewThreadInWorktree,
+  environmentProviderName,
+  onCreateNewThreadInEnvironment,
   onPullRequestDraft,
   onPullRequestMerge,
   onPullRequestReady,
@@ -421,6 +411,7 @@ export function ThreadDetailPromptArea({
   isEnvironmentActionPending,
   pendingInteractions,
   pendingInteractionsInitialLoading,
+  queuedMessageCount,
   onChangedFileClick,
   projectId,
   resolveMentionLink,
@@ -443,7 +434,7 @@ export function ThreadDetailPromptArea({
   composerFocusRequestNonce,
   thread,
 }: ThreadDetailPromptAreaProps) {
-  const navigate = useNavigate();
+  const navigate = useImmediateRouteNavigate();
   const defaultExecutionOptionsQuery = useThreadDefaultExecutionOptions(
     thread.id,
     {
@@ -451,9 +442,6 @@ export function ThreadDetailPromptArea({
     },
   );
   const defaultExecutionOptions = defaultExecutionOptionsQuery.data;
-  // A replayed (placeholder) resolution seeds the pickers so the first frame
-  // shows the thread's last-known settings, but it is not proof of anything:
-  // submission and the permission controls wait for the live resolution.
   const verifiedDefaultExecutionOptions =
     defaultExecutionOptionsQuery.isPlaceholderData
       ? undefined
@@ -470,9 +458,12 @@ export function ThreadDetailPromptArea({
   });
   const isDefaultExecutionOptionsLoading =
     defaultExecutionOptionsState === "loading";
-  const { data: queuedMessages = [] } = useThreadQueuedMessages(thread.id, {
+  const queuedMessagesQuery = useThreadQueuedMessages(thread.id, {
     enabled: true,
   });
+  const queuedMessages = queuedMessagesQuery.data ?? EMPTY_QUEUED_MESSAGES;
+  const queuedMessagesPending =
+    queuedMessagesQuery.data === undefined && queuedMessageCount > 0;
   const queuedMessagesRef =
     useLatestRef<readonly ThreadQueuedMessage[]>(queuedMessages);
   const [bottomPluginFocusNonce, setBottomPluginFocusNonce] = useState(0);
@@ -491,16 +482,17 @@ export function ThreadDetailPromptArea({
     commitInlineQueuedMessage,
     dismissInlineQueuedMessageEditor,
     beginEditQueuedMessage,
+    queuedMessageDraftSession,
   } = useInlineQueuedMessageEditing({
     ownerThreadId: thread.id,
     queuedMessages,
     onBeginEdit: () => {
       clearInlineAttachmentErrorRef.current();
-      // Focus the composer caret at the end so the restored draft is ready to
-      // keep typing (FollowUpPromptBox `focusEndKey`).
       setEditFocusNonce((nonce) => nonce + 1);
     },
   });
+  const inlineDraftSession = queuedMessageDraftSession;
+  const inlineDraftSessionRef = useLatestRef(inlineDraftSession);
   const promptHistoryEnabled = usePromptHistoryEnabled();
   const { data: promptHistoryEntries = [] } = useThreadPromptHistory(
     thread.id,
@@ -513,7 +505,8 @@ export function ThreadDetailPromptArea({
   const cancelThreadPlan = useCancelThreadPlan();
   const clearThreadGoal = useClearThreadGoal();
   const unarchiveThread = useUnarchiveThread();
-  // The personal project isn't a meaningful label in the footer, so skip it.
+  const restoreThreadEnvironment = useRestoreThreadEnvironment();
+  const createThread = useCreateThread();
   const projectName = useProjectDisplayName(
     thread.projectId === PERSONAL_PROJECT_ID ? undefined : thread.projectId,
   );
@@ -532,12 +525,9 @@ export function ThreadDetailPromptArea({
       projectId,
       threadId: thread.id,
     },
-    inlineEditingQueuedMessage,
-    inlineEditingQueuedMessageRef,
-    commitInlineQueuedMessage,
+    inlineDraft: inlineEditingQueuedMessage?.draft ?? null,
+    inlineSessionRef: inlineDraftSessionRef,
   });
-  // subscribeDraft sources for the two state-backed editor hosts. The bottom
-  // composer's host subscribes through the prompt-draft store directly.
   const subscribeInlineQueuedDraft = useComposerHostDraftNotifier(
     inlineEditingQueuedMessage?.draft ?? null,
   );
@@ -565,21 +555,23 @@ export function ThreadDetailPromptArea({
     setBottomAttachmentError,
     handleAttachBottomFiles,
     isAttachingBottomFiles,
+    bottomPendingUploads,
     inlineAttachmentError,
     setInlineAttachmentError,
     handleAttachInlineFiles,
     isAttachingInlineFiles,
+    inlinePendingUploads,
   } = useComposerAttachmentUploads({
     projectId,
     addDraftAttachment: promptDraft.addAttachment,
-    inlineEditingQueuedMessage,
-    inlineEditingQueuedMessageRef,
-    commitInlineQueuedMessage,
+    inlineEditSessionId: inlineDraftSession?.editSessionId ?? null,
+    inlineSessionRef: inlineDraftSessionRef,
   });
   const {
     attachmentError: sentMessageAttachmentError,
     handleAttachFiles: handleAttachSentMessageFiles,
     isAttachingFiles: isAttachingSentMessageFiles,
+    pendingUploads: sentMessagePendingUploads,
   } = useDraftAttachmentUploads({
     projectId,
     target: sentMessageEdit
@@ -589,8 +581,6 @@ export function ThreadDetailPromptArea({
         }
       : null,
   });
-  // Read only from the queued-message edit handler (never during render), so
-  // a layout-effect write is current by the time it can run.
   useLayoutEffect(() => {
     clearInlineAttachmentErrorRef.current = () =>
       setInlineAttachmentError(null);
@@ -644,8 +634,6 @@ export function ThreadDetailPromptArea({
   const [isGoalExpanded, setIsGoalExpanded] = useState(false);
   const [isTodoExpanded, setIsTodoExpanded] = useState(false);
   const [isPromptModeExpanded, setIsPromptModeExpanded] = useState(false);
-  // Expansion is tracked per workflow id so concurrent workflows expand and
-  // collapse independently.
   const [expandedWorkflowIds, setExpandedWorkflowIds] = useState<
     ReadonlySet<string>
   >(() => new Set());
@@ -669,6 +657,9 @@ export function ThreadDetailPromptArea({
   const {
     executionOptionsRouting,
     selectedProviderId,
+    setSelectedProviderId,
+    setProviderModelReasoning,
+    providers,
     providerOptions,
     hasMultipleProviders,
     selectedProviderComposerActions,
@@ -684,6 +675,7 @@ export function ThreadDetailPromptArea({
     modelOptions,
     moreModelOptions,
     isLoadingModels,
+    modelCatalogIsSettled,
     modelLoadFailed,
     modelLoadError,
     reasoningOptions,
@@ -713,8 +705,19 @@ export function ThreadDetailPromptArea({
   const [overriddenFallbackIdentity, setOverriddenFallbackIdentity] = useState<
     string | null
   >(null);
+  const [handoffSourceSelection, setHandoffSourceSelection] = useState<{
+    threadId: string;
+    execution: ModelReasoningPickerHandoffSelection;
+    serviceTier: ServiceTier | undefined;
+    permissionMode: PermissionMode;
+    overriddenFallbackIdentity: string | null;
+  } | null>(null);
+  const isHandoffSelection = handoffSourceSelection?.threadId === thread.id;
   const isFallbackModelActive =
-    modelFallback !== null && overriddenFallbackIdentity !== fallbackIdentity;
+    !isHandoffSelection &&
+    selectedProviderId === thread.providerId &&
+    modelFallback !== null &&
+    overriddenFallbackIdentity !== fallbackIdentity;
   const effectiveSelectedModel = isFallbackModelActive
     ? modelFallback.fallbackModel
     : (activeModel?.model ?? selectedModel);
@@ -727,16 +730,154 @@ export function ThreadDetailPromptArea({
     },
     [fallbackIdentity, setSelectedModel],
   );
+  const sourceThreadDisplayTitle = getThreadDisplayTitle({
+    id: thread.id,
+    title: thread.title,
+    titleFallback: thread.titleFallback,
+  });
+  const handoffSeed = useMemo<ThreadHandoffCreateSeed>(
+    () => ({
+      environmentId: thread.environmentId,
+      projectId: thread.projectId,
+      sourceThreadId: thread.id,
+      sourceThreadTitle: sourceThreadDisplayTitle,
+    }),
+    [
+      sourceThreadDisplayTitle,
+      thread.environmentId,
+      thread.id,
+      thread.projectId,
+    ],
+  );
+  const beginHandoff = useCallback(() => {
+    setHandoffSourceSelection((current) =>
+      current?.threadId === thread.id
+        ? current
+        : {
+            threadId: thread.id,
+            execution: {
+              providerId: thread.providerId,
+              model: effectiveSelectedModel,
+              reasoningLevel,
+            },
+            serviceTier,
+            permissionMode,
+            overriddenFallbackIdentity,
+          },
+    );
+    const currentDraft = promptDraft.getCurrent();
+    const seededDraft = buildThreadHandoffFollowUpDraft(
+      handoffSeed,
+      currentDraft,
+    );
+    if (seededDraft !== currentDraft) {
+      promptDraft.setDraft(seededDraft);
+    }
+  }, [
+    effectiveSelectedModel,
+    handoffSeed,
+    overriddenFallbackIdentity,
+    permissionMode,
+    promptDraft,
+    reasoningLevel,
+    serviceTier,
+    thread.id,
+    thread.providerId,
+  ]);
+  const exitHandoff = useCallback(() => {
+    if (handoffSourceSelection?.threadId !== thread.id) return;
+    setProviderModelReasoning(handoffSourceSelection.execution);
+    setServiceTier(handoffSourceSelection.serviceTier);
+    setPermissionMode(handoffSourceSelection.permissionMode);
+    setOverriddenFallbackIdentity(
+      handoffSourceSelection.overriddenFallbackIdentity,
+    );
+    setHandoffSourceSelection(null);
+    const restoredDraft = stripThreadHandoffPrefix(
+      handoffSeed,
+      promptDraft.getCurrent(),
+    );
+    if (restoredDraft !== null) {
+      promptDraft.setDraft(restoredDraft);
+    }
+  }, [
+    handoffSeed,
+    handoffSourceSelection,
+    promptDraft,
+    setPermissionMode,
+    setProviderModelReasoning,
+    setServiceTier,
+    thread.id,
+  ]);
+  const handleProviderChange = useCallback(
+    (providerId: string) => {
+      if (providerId === selectedProviderId) {
+        return;
+      }
+      if (fallbackIdentity !== null) {
+        setOverriddenFallbackIdentity(fallbackIdentity);
+      }
+      beginHandoff();
+      setSelectedProviderId(providerId);
+    },
+    [fallbackIdentity, selectedProviderId, setSelectedProviderId, beginHandoff],
+  );
+  const handleHandoffSelect = useCallback(
+    (selection: ModelReasoningPickerHandoffSelection) => {
+      if (fallbackIdentity !== null) {
+        setOverriddenFallbackIdentity(fallbackIdentity);
+      }
+      beginHandoff();
+      setProviderModelReasoning(selection);
+    },
+    [beginHandoff, fallbackIdentity, setProviderModelReasoning],
+  );
+  useEffect(() => {
+    if (isHandoffSelection) {
+      return;
+    }
+    const restoredDraft = stripThreadHandoffPrefix(
+      handoffSeed,
+      promptDraft.getCurrent(),
+    );
+    if (restoredDraft !== null) {
+      promptDraft.setDraft(restoredDraft);
+    }
+  }, [handoffSeed, isHandoffSelection, promptDraft]);
+  const hasSentMessageEdit = sentMessageEdit !== undefined;
+  useEffect(() => {
+    if (hasSentMessageEdit && isHandoffSelection) {
+      exitHandoff();
+    }
+  }, [hasSentMessageEdit, isHandoffSelection, exitHandoff]);
   const { typeaheadConfig, promptActions } = useComposerTypeahead({
     projectId: thread.projectId,
     mentionsProjectId: projectId,
-    providerId: thread.providerId,
+    providerId: selectedProviderId,
+    commandScope: isHandoffSelection ? "new-thread" : "thread",
     environmentId: thread.environmentId,
     currentThreadId: thread.id,
     selectedProviderComposerActions,
     resolveMentionLink,
   });
+  const {
+    typeaheadConfig: inlineTypeaheadConfig,
+    promptActions: inlinePromptActions,
+  } = useComposerTypeahead({
+    projectId: thread.projectId,
+    mentionsProjectId: projectId,
+    providerId: thread.providerId,
+    environmentId: thread.environmentId,
+    currentThreadId: thread.id,
+    selectedProviderComposerActions: providers.find(
+      (provider) => provider.id === thread.providerId,
+    )?.composerActions,
+    resolveMentionLink,
+  });
   const runtimeDisplayStatus = thread.runtime.displayStatus;
+  const shouldSteerWhenReady =
+    runtimeDisplayStatus === "provisioning" ||
+    runtimeDisplayStatus === "starting";
   const isStopRequested =
     thread.status === "stopping" ||
     (stopThread.isPending && stopThread.variables === thread.id);
@@ -757,9 +898,6 @@ export function ThreadDetailPromptArea({
   } = useQueuedMessageActions({
     threadId: thread.id,
     queuedMessages,
-    // A steered ("send now") queued message keeps its "Sending..." label until
-    // it leaves the queue — i.e. the steer has been accepted and surfaces in
-    // the timeline — rather than clearing the moment the send request resolves.
     sendProcessingPersistence: "until-left-queue",
     onSendSuccess: () => setInlineAttachmentError(null),
     onSaveSuccess: () => setInlineAttachmentError(null),
@@ -774,6 +912,7 @@ export function ThreadDetailPromptArea({
   const isFollowUpSubmitting =
     sendMessage.isPending ||
     createQueuedMessage.isPending ||
+    createThread.isPending ||
     isFollowUpShortcutSending;
   const handleStopThread = useCallback(() => {
     stopThread.mutate(thread.id);
@@ -784,7 +923,16 @@ export function ThreadDetailPromptArea({
   const handleClearGoal = useCallback(() => {
     clearThreadGoal.mutate(thread.id);
   }, [clearThreadGoal, thread.id]);
-  const submitMode: FollowUpSubmitMode = useMemo(() => {
+  const submitMode = useMemo<FollowUpSubmitMode>(() => {
+    if (isHandoffSelection && !isStopRequested) {
+      if (effectiveSelectedModel.length > 0) {
+        return { kind: "ready" };
+      }
+      return {
+        kind: "blocked",
+        reason: modelLoadFailed ? "unavailable" : "loading-execution-options",
+      };
+    }
     return buildFollowUpSubmitMode({
       hasPendingInteraction,
       isDefaultExecutionOptionsLoading,
@@ -794,23 +942,131 @@ export function ThreadDetailPromptArea({
       runtimeDisplayStatus,
     });
   }, [
+    effectiveSelectedModel,
     handleStopThread,
     hasPendingInteraction,
     isDefaultExecutionOptionsLoading,
+    isHandoffSelection,
+    modelLoadFailed,
     pendingInteractionsInitialLoading,
     isStopRequested,
     runtimeDisplayStatus,
   ]);
-  const promptPlaceholder = isStopRequested
-    ? "Stopping thread..."
-    : getFollowUpPromptPlaceholder(runtimeDisplayStatus);
-  const compactPromptPlaceholder = isStopRequested
-    ? "Stopping thread..."
-    : getCompactFollowUpPromptPlaceholder(runtimeDisplayStatus);
-  // Identity-stable across keystrokes: the published host is held by large
-  // non-draft subscribers (the secondary-content body, the hosted-panel
-  // registry), so a per-keystroke host identity re-rendered the whole thread
-  // shell per character. The live draft flows through getCurrent/subscribeDraft.
+  const promptPlaceholder = getFollowUpPromptPlaceholder(
+    isStopRequested ? "stopping" : runtimeDisplayStatus,
+  );
+  const compactPromptPlaceholder = getCompactFollowUpPromptPlaceholder(
+    isStopRequested ? "stopping" : runtimeDisplayStatus,
+  );
+  const submitProgrammaticallyRef = useRef<
+    (
+      options: ExperimentalComposerSubmitOptions,
+      pluginSubmission: SendMessageRequest["pluginSubmission"],
+    ) => Promise<void>
+  >(async () => {});
+  const submitProgrammaticallyThroughRef = useCallback(
+    (
+      options: ExperimentalComposerSubmitOptions,
+      pluginSubmission: SendMessageRequest["pluginSubmission"],
+    ) => submitProgrammaticallyRef.current(options, pluginSubmission),
+    [],
+  );
+  const providerIds = useMemo(
+    () => providerOptions.map((option) => option.value),
+    [providerOptions],
+  );
+  const selectionState =
+    useCommittedComposerState<ThreadComposerSelectionState>((version) => ({
+      version,
+      isSettled: modelCatalogIsSettled,
+      selectedProviderId,
+      selectedThreadModel: effectiveSelectedModel,
+      reasoningLevel,
+      serviceTier,
+      supportsServiceTier,
+      permissionMode,
+      providerIds,
+      isHandoffSelection,
+      changeProvider: handleProviderChange,
+      changeModel: handleModelChange,
+      handoffSelect: handleHandoffSelect,
+      changeReasoning: setReasoningLevel,
+      changeServiceTier: setServiceTier,
+      changePermissionMode: setPermissionMode,
+    }));
+  const pendingSelectionRef = useRef<Promise<unknown>>(Promise.resolve());
+  const applySelection = useCallback(
+    async (
+      selection: ExperimentalComposerSelection,
+    ): Promise<ExperimentalComposerSelection> => {
+      const deadline = resolveComposerSelectionDeadline();
+      const { observer } = selectionState;
+      let state = await observer.waitUntil(() => true, deadline);
+      const settle = async (requireSettled: boolean) => {
+        state = await waitForSettledComposerState(
+          selectionState,
+          deadline,
+          requireSettled,
+        );
+      };
+      const ensureSettled = async () => {
+        if (state.isSettled) return;
+        state = await waitUntilComposerStateSettled(selectionState, deadline);
+      };
+      if (selection.providerId !== undefined) await ensureSettled();
+      if (
+        selection.providerId !== undefined &&
+        selection.providerId !== state.selectedProviderId &&
+        state.providerIds.includes(selection.providerId)
+      ) {
+        state.changeProvider(selection.providerId);
+        await settle(true);
+      }
+      const providerMatches =
+        selection.providerId === undefined ||
+        state.selectedProviderId === selection.providerId;
+      if (providerMatches && selection.model !== undefined) {
+        await ensureSettled();
+        if (state.isHandoffSelection) {
+          state.handoffSelect({
+            providerId: state.selectedProviderId,
+            model: selection.model,
+            reasoningLevel: selection.reasoningLevel ?? state.reasoningLevel,
+          });
+        } else {
+          state.changeModel(selection.model);
+        }
+        await settle(false);
+      }
+      if (providerMatches && selection.reasoningLevel !== undefined) {
+        await ensureSettled();
+        state.changeReasoning(selection.reasoningLevel);
+        await settle(false);
+      }
+      if (selection.serviceTier !== undefined && state.supportsServiceTier) {
+        state.changeServiceTier(selection.serviceTier);
+        await settle(false);
+      }
+      if (selection.permissionMode !== undefined) {
+        state.changePermissionMode(selection.permissionMode);
+        await settle(false);
+      }
+      await settle(true);
+      return readExecutionSelection(state);
+    },
+    [selectionState],
+  );
+  const setSelection = useCallback(
+    (selection: ExperimentalComposerSelection) => {
+      const run = pendingSelectionRef.current.then(
+        () => applySelection(selection),
+        () => applySelection(selection),
+      );
+      pendingSelectionRef.current = run;
+      return run;
+    },
+    [applySelection],
+  );
   const normalPluginComposerHost = useMemo<PluginComposerHost>(
     () => ({
       scope: { kind: "thread", threadId: thread.id },
@@ -819,6 +1075,8 @@ export function ThreadDetailPromptArea({
       subscribeDraft: promptDraft.subscribe,
       setDraft: promptDraft.setDraft,
       focus: focusBottomPluginComposer,
+      submit: submitProgrammaticallyThroughRef,
+      setSelection,
     }),
     [
       focusBottomPluginComposer,
@@ -826,18 +1084,22 @@ export function ThreadDetailPromptArea({
       promptDraft.setDraft,
       promptDraft.storageKey,
       promptDraft.subscribe,
+      setSelection,
+      submitProgrammaticallyThroughRef,
       thread.id,
     ],
   );
   const hasPromptDraftInput = currentPromptDraftInput.length > 0;
-  const canSubmitModifierShortcut = canSubmitFollowUpShortcut({
-    hasPromptDraftInput,
-    isFollowUpSubmitting,
-    isQueueMutationPending,
-    queuedMessageCount: queuedMessages.length,
-    runtimeDisplayStatus,
-    submitModeKind: submitMode.kind,
-  });
+  const canSubmitModifierShortcut =
+    !shouldHideComposer &&
+    canSubmitFollowUpShortcut({
+      hasPromptDraftInput,
+      isFollowUpSubmitting,
+      isQueueMutationPending,
+      queuedMessageCount: queuedMessages.length,
+      runtimeDisplayStatus,
+      submitModeKind: submitMode.kind,
+    });
   const followUpExecutionSelection = useMemo<FollowUpExecutionSelection>(() => {
     if (!hasConcreteDefaultExecutionOptions) {
       return null;
@@ -860,9 +1122,75 @@ export function ThreadDetailPromptArea({
     supportsServiceTier,
   ]);
 
+  const createHandoffThread = useCallback(
+    async (
+      submittedDraft: PromptDraftState,
+      sendAt?: number,
+      pluginSubmission?: SendMessageRequest["pluginSubmission"],
+    ) => {
+      const baseRequest = buildThreadHandoffCreateRequest({
+        execution: {
+          providerId: selectedProviderId,
+          model: effectiveSelectedModel,
+          reasoningLevel,
+          serviceTier,
+          supportsServiceTier,
+          permissionMode,
+        },
+        draft: submittedDraft,
+        seed: handoffSeed,
+        ...(sendAt === undefined ? {} : { sendAt }),
+      });
+      if (baseRequest === null) {
+        return false;
+      }
+      const request = {
+        ...baseRequest,
+        ...(pluginSubmission === undefined ? {} : { pluginSubmission }),
+      };
+      const clearedSubmittedDraft =
+        promptDraft.clearIfCurrentMatches(submittedDraft);
+      setBottomAttachmentError(null);
+      try {
+        const created = await createThread.mutateAsync(request);
+        navigate(
+          getThreadRoutePath({
+            projectId: created.projectId,
+            threadId: created.id,
+          }),
+        );
+      } catch (error) {
+        if (clearedSubmittedDraft) {
+          promptDraft.restoreIfEmpty(submittedDraft);
+        }
+        throw error;
+      }
+      return true;
+    },
+    [
+      createThread,
+      effectiveSelectedModel,
+      handoffSeed,
+      navigate,
+      permissionMode,
+      promptDraft,
+      reasoningLevel,
+      selectedProviderId,
+      serviceTier,
+      setBottomAttachmentError,
+      supportsServiceTier,
+    ],
+  );
+
   const handleSend = useCallback(async () => {
     const submittedDraft = currentPromptDraft;
     const submittedInput = currentPromptDraftInput;
+    if (isHandoffSelection) {
+      await createHandoffThread(submittedDraft).catch(
+        ignoreToastedCreateThreadError,
+      );
+      return;
+    }
     const isQueuingMessage = shouldQueueFollowUpMessage(runtimeDisplayStatus);
     if (
       submittedInput.length === 0 ||
@@ -896,30 +1224,112 @@ export function ThreadDetailPromptArea({
       }
     } catch (nextError) {
       promptDraft.restoreIfEmpty(submittedDraft);
-      appToast.error(
-        getMutationErrorMessage({
-          error: nextError,
-          fallbackMessage: isQueuingMessage
-            ? "Failed to queue message"
-            : "Failed to send message",
-          lifecycleOperation: isQueuingMessage
-            ? "queue_message"
-            : "send_message",
-        }),
-      );
+      showMutationErrorToast({
+        error: nextError,
+        fallbackMessage: isQueuingMessage
+          ? "Failed to queue message"
+          : "Failed to send message",
+        lifecycleOperation: isQueuingMessage ? "queue_message" : "send_message",
+      });
     }
   }, [
+    createHandoffThread,
     createQueuedMessage,
     currentPromptDraft,
     currentPromptDraftInput,
     followUpExecutionSelection,
     isDefaultExecutionOptionsLoading,
+    isHandoffSelection,
     promptDraft,
     sendMessage,
     setBottomAttachmentError,
     thread.id,
     runtimeDisplayStatus,
   ]);
+  const submitProgrammatically = useCallback(
+    async (
+      submitOptions: ExperimentalComposerSubmitOptions,
+      pluginSubmission: SendMessageRequest["pluginSubmission"],
+    ) => {
+      if (shouldHideComposer) throw new Error("This thread is read-only.");
+      if (isHandoffSelection) {
+        if (effectiveSelectedModel.length === 0) {
+          throw new Error("The selected model is still loading.");
+        }
+        let created = false;
+        try {
+          created = await createHandoffThread(
+            promptDraft.getCurrent(),
+            submitOptions.sendAt,
+            pluginSubmission,
+          );
+        } catch (submitError) {
+          throw new Error(
+            getMutationErrorMessage({
+              error: submitError,
+              fallbackMessage: "Failed to create thread",
+              lifecycleOperation: "create_thread",
+            }),
+          );
+        }
+        if (!created) {
+          throw new Error("Type a message before submitting it.");
+        }
+        return;
+      }
+      if (isDefaultExecutionOptionsLoading) {
+        throw new Error("This thread's model options are still loading.");
+      }
+      const submittedDraft = promptDraft.getCurrent();
+      const request = buildAutoFollowUpRequest({
+        threadId: thread.id,
+        input: promptDraftToInput(submittedDraft),
+        execution: followUpExecutionSelection,
+      });
+      if (request === null) {
+        throw new Error("Type a message before submitting it.");
+      }
+      const clearedSubmittedDraft =
+        promptDraft.clearIfCurrentMatches(submittedDraft);
+      setBottomAttachmentError(null);
+      try {
+        await sendMessage.mutateAsync({
+          ...request,
+          ...(submitOptions.sendAt === undefined
+            ? {}
+            : { sendAt: submitOptions.sendAt }),
+          ...(pluginSubmission === undefined ? {} : { pluginSubmission }),
+        });
+      } catch (scheduleError) {
+        if (clearedSubmittedDraft) {
+          promptDraft.restoreIfEmpty(submittedDraft);
+        }
+        throw new Error(
+          getMutationErrorMessage({
+            error: scheduleError,
+            fallbackMessage: "Failed to submit message",
+            lifecycleOperation: "send_message",
+          }),
+        );
+      }
+    },
+    [
+      createHandoffThread,
+      shouldHideComposer,
+      effectiveSelectedModel,
+      followUpExecutionSelection,
+      isDefaultExecutionOptionsLoading,
+      isHandoffSelection,
+      promptDraft,
+      sendMessage,
+      setBottomAttachmentError,
+      thread.id,
+    ],
+  );
+  useEffect(() => {
+    submitProgrammaticallyRef.current = submitProgrammatically;
+  }, [submitProgrammatically]);
+
   const handleModifierSubmit = useCallback(async () => {
     if (!canSubmitModifierShortcut) {
       return;
@@ -947,13 +1357,11 @@ export function ThreadDetailPromptArea({
             await sendMessage.mutateAsync(shortcutRequest.request);
           } catch (nextError) {
             promptDraft.restoreIfEmpty(submittedDraft);
-            appToast.error(
-              getMutationErrorMessage({
-                error: nextError,
-                fallbackMessage: "Failed to send message",
-                lifecycleOperation: "send_message",
-              }),
-            );
+            showMutationErrorToast({
+              error: nextError,
+              fallbackMessage: "Failed to send message",
+              lifecycleOperation: "send_message",
+            });
           }
         },
       );
@@ -971,6 +1379,7 @@ export function ThreadDetailPromptArea({
         await sendQueuedMessageById({
           guard: "current-head",
           messageId: queuedMessageId,
+          mode: shortcutRequest.request.mode,
         });
       },
     );
@@ -987,14 +1396,15 @@ export function ThreadDetailPromptArea({
     thread.id,
   ]);
 
-  const handleSendQueuedImmediately = useCallback(
+  const handleSendQueuedMessage = useCallback(
     (messageId: string) => {
       void sendQueuedMessageById({
         guard: "exists",
         messageId,
+        mode: shouldSteerWhenReady ? "steer" : "auto",
       });
     },
-    [sendQueuedMessageById],
+    [sendQueuedMessageById, shouldSteerWhenReady],
   );
 
   const bottomFocusEndKey = `${composerFocusRequestNonce}:${bottomPluginFocusNonce}`;
@@ -1012,33 +1422,18 @@ export function ThreadDetailPromptArea({
   const handleUnarchiveCurrentThread = useCallback(() => {
     unarchiveThread.mutate({ id: thread.id });
   }, [thread.id, unarchiveThread]);
-  const sourceThreadDisplayTitle = getThreadDisplayTitle({
-    id: thread.id,
-    title: thread.title,
-    titleFallback: thread.titleFallback,
-  });
-  const handleHandoffToNewThread = useCallback(() => {
-    navigate(getProjectComposeRoutePath(thread.projectId), {
-      state: buildThreadHandoffLocationState({
-        environmentId: thread.environmentId,
-        projectId: thread.projectId,
-        sourceThreadId: thread.id,
-        sourceThreadTitle: sourceThreadDisplayTitle,
-      }),
-    });
-  }, [
-    navigate,
-    sourceThreadDisplayTitle,
-    thread.environmentId,
-    thread.id,
-    thread.projectId,
-  ]);
-
+  const isRestoreCurrentEnvironmentPending =
+    restoreThreadEnvironment.isPending &&
+    restoreThreadEnvironment.variables?.id === thread.id;
+  const handleRestoreCurrentEnvironment = useCallback(() => {
+    restoreThreadEnvironment.mutate({ id: thread.id });
+  }, [restoreThreadEnvironment, thread.id]);
   const bottomAttachmentsConfig = useMemo(
     () => ({
       items: currentPromptDraft.attachments,
       projectId,
       isAttaching: isAttachingBottomFiles,
+      pendingUploads: bottomPendingUploads,
       error: bottomAttachmentError,
       onAttachFiles: handleAttachBottomFiles,
       onRemove: promptDraft.removeAttachment,
@@ -1048,6 +1443,7 @@ export function ThreadDetailPromptArea({
       currentPromptDraft.attachments,
       handleAttachBottomFiles,
       isAttachingBottomFiles,
+      bottomPendingUploads,
       projectId,
       promptDraft.removeAttachment,
     ],
@@ -1076,6 +1472,13 @@ export function ThreadDetailPromptArea({
       onChangeMessage: promptDraft.setTextAndMentions,
       onModifierSubmit: handleBottomComposerModifierSubmit,
       onSubmit: handleBottomComposerSubmit,
+      ...(isHandoffSelection
+        ? {
+            submitLabel: "New thread",
+            submitIcon: "MessageSquarePlus",
+            submitTitle: "Create new thread (Enter)",
+          }
+        : {}),
       compactPromptPlaceholder,
       promptPlaceholder,
       canModifierSubmit: canSubmitModifierShortcut,
@@ -1090,6 +1493,7 @@ export function ThreadDetailPromptArea({
       handleBottomComposerModifierSubmit,
       handleBottomComposerSubmit,
       isFollowUpSubmitting,
+      isHandoffSelection,
       promptHistoryDrafts,
       promptPlaceholder,
       promptDraft.setDraft,
@@ -1114,12 +1518,9 @@ export function ThreadDetailPromptArea({
     !isFollowUpSubmitting &&
     !isQueueMutationPending &&
     !sentMessageEdit.isSubmitting &&
-    queuedMessages.length === 0 &&
     activeBackgroundAgentCount === 0 &&
     activeWorkflows.length === 0 &&
     activeBackgroundCommands.length === 0;
-  // Empty input renders as "ready" with a no-op submit, matching the queued
-  // inline editor; handleSentMessageEditSubmit guards on canSubmitSentMessageEdit.
   const sentMessageEditSubmitMode = useMemo<FollowUpSubmitMode>(
     () =>
       canSubmitSentMessageEdit || sentMessageEditInput.length === 0
@@ -1145,10 +1546,14 @@ export function ThreadDetailPromptArea({
   ]);
   const bottomExecutionConfig = useMemo(
     () => ({
-      providerRouting: executionOptionsRouting,
+      providerRouting:
+        thread.environmentId === null
+          ? executionOptionsRouting
+          : { environmentId: thread.environmentId },
       provider: {
         options: providerOptions,
         selectedId: selectedProviderId,
+        onChange: handleProviderChange,
         hasMultiple: hasMultipleProviders,
       },
       model: {
@@ -1175,17 +1580,24 @@ export function ThreadDetailPromptArea({
         options: reasoningOptions,
         onChange: setReasoningLevel,
       },
-      footerAction: {
-        label: "Handoff to new thread",
-        onClick: handleHandoffToNewThread,
+      handoff: {
+        sourceProviderId: thread.providerId,
+        active: isHandoffSelection,
+        onStart: beginHandoff,
+        onExit: exitHandoff,
+        onSelect: handleHandoffSelect,
       },
     }),
     [
       effectiveSelectedModel,
       executionOptionsRouting,
       hasMultipleProviders,
-      handleHandoffToNewThread,
+      handleHandoffSelect,
+      beginHandoff,
+      isHandoffSelection,
+      exitHandoff,
       handleModelChange,
+      handleProviderChange,
       isLoadingModels,
       modelLoadFailed,
       modelLoadError,
@@ -1202,13 +1614,21 @@ export function ThreadDetailPromptArea({
       setServiceTier,
       supportsServiceTier,
       serviceTierFastLabel,
+      thread.environmentId,
+      thread.providerId,
     ],
   );
   const compactExecutionConfig = useMemo(() => {
-    const { footerAction: _footerAction, ...executionWithoutFooterAction } =
-      bottomExecutionConfig;
-    return executionWithoutFooterAction;
-  }, [bottomExecutionConfig]);
+    const {
+      handoff: _handoff,
+      provider: { onChange: _onProviderChange, ...lockedProvider },
+      ...lockedExecution
+    } = bottomExecutionConfig;
+    return {
+      ...lockedExecution,
+      provider: { ...lockedProvider, selectedId: thread.providerId },
+    };
+  }, [bottomExecutionConfig, thread.providerId]);
   const inlineExecutionConfig = useMemo(() => {
     if (!inlineEditingQueuedMessage) return null;
     return {
@@ -1258,23 +1678,30 @@ export function ThreadDetailPromptArea({
 
   const environmentSummary = useMemo(
     () =>
-      environmentLabel ? (
+      thread.environmentId !== null ? (
         <ThreadEnvironmentSummary
           projectName={projectName}
           environmentLabel={environmentLabel}
           environmentCompactLabel={environmentCompactLabel}
+          environmentHost={environmentHost}
           environmentIcon={environmentIcon}
+          environmentProviderName={environmentProviderName}
+          environmentMachineProvider={environmentMachineProvider}
           environmentCheckout={environmentCheckout}
-          onCreateNewThreadInWorktree={onCreateNewThreadInWorktree}
+          onCreateNewThreadInEnvironment={onCreateNewThreadInEnvironment}
         />
       ) : null,
     [
       environmentCheckout,
       environmentCompactLabel,
+      environmentHost,
       environmentIcon,
       environmentLabel,
-      onCreateNewThreadInWorktree,
+      environmentMachineProvider,
+      environmentProviderName,
+      onCreateNewThreadInEnvironment,
       projectName,
+      thread.environmentId,
     ],
   );
   const activePromptModeCard = useMemo(
@@ -1306,9 +1733,6 @@ export function ThreadDetailPromptArea({
     ),
     [clearThreadGoal.isPending, goal, handleClearGoal, isGoalExpanded],
   );
-  // Stable for the whole edit session (keyed on the session scalars, not the
-  // per-keystroke edit state), so publishing it does not churn the pane scope
-  // while the user types in the inline editor.
   const inlineEditSessionId = inlineEditingQueuedMessage?.editSessionId ?? null;
   const inlineEditQueuedMessageId =
     inlineEditingQueuedMessage?.queuedMessageId ?? null;
@@ -1372,6 +1796,7 @@ export function ThreadDetailPromptArea({
           items: activeComposerDraft.attachments,
           projectId,
           isAttaching: isAttachingInlineFiles,
+          pendingUploads: inlinePendingUploads,
           error: inlineAttachmentError,
           onAttachFiles: handleAttachInlineFiles,
           onRemove: removeActiveComposerAttachment,
@@ -1390,13 +1815,13 @@ export function ThreadDetailPromptArea({
         onSelectHistoryEntry: setActiveComposerDraft,
         permission: inlinePermissionConfig,
         pluginComposerHost: queuedMessagePluginComposerHost,
-        promptActions,
+        promptActions: inlinePromptActions,
         promptPlaceholder,
         submit: handleInlineComposerSubmit,
         submitMode: { kind: "ready" },
         textEffects: queuedComposerTextEffects,
         threadRuntimeDisplayStatus: runtimeDisplayStatus,
-        typeahead: typeaheadConfig,
+        typeahead: inlineTypeaheadConfig,
         collapseResetKey: `queued-message:${queuedMessageId}`,
       }),
     };
@@ -1415,9 +1840,10 @@ export function ThreadDetailPromptArea({
     inlineExecutionConfig,
     inlinePermissionConfig,
     isAttachingInlineFiles,
+    inlinePendingUploads,
     isUpdateQueuedMessagePending,
     projectId,
-    promptActions,
+    inlinePromptActions,
     promptPlaceholder,
     queuedComposerTextEffects,
     queuedMessagePluginComposerHost,
@@ -1425,21 +1851,13 @@ export function ThreadDetailPromptArea({
     runtimeDisplayStatus,
     setActiveComposerDraft,
     thread.id,
-    typeaheadConfig,
+    inlineTypeaheadConfig,
   ]);
-  // The published value only ever flips between two stable host identities
-  // (per thread / per edit session): keystrokes do not notify the pane scope.
-  // While the inline editor cannot render (execution/permission configs still
-  // loading), the bottom composer is what is on screen, so its host stays
-  // published.
   usePublishPluginComposerHost(
     queuedMessageEditor
       ? queuedMessagePluginComposerHost
       : normalPluginComposerHost,
   );
-  // Stable per edit operation like every other host: the composer config
-  // around it legitimately rebuilds per keystroke, but context consumers of
-  // the host must not re-render on identity churn.
   const sentMessageEditOperationId = sentMessageEdit?.operationId ?? null;
   const sentMessagePluginComposerHost =
     useMemo<PluginComposerHost | null>(() => {
@@ -1485,6 +1903,7 @@ export function ThreadDetailPromptArea({
             items: draft.attachments,
             projectId,
             isAttaching: isAttachingSentMessageFiles,
+            pendingUploads: sentMessagePendingUploads,
             error: sentMessageAttachmentError,
             onAttachFiles: handleAttachSentMessageFiles,
             onRemove: (path) => {
@@ -1516,7 +1935,7 @@ export function ThreadDetailPromptArea({
             sentMessageEdit.updateDraft(() => nextDraft),
           permission: bottomPermissionConfig,
           pluginComposerHost: sentMessagePluginComposerHost,
-          promptActions,
+          promptActions: inlinePromptActions,
           promptPlaceholder: "Edit message",
           submit: handleSentMessageEditSubmit,
           submitMode: sentMessageEditSubmitMode,
@@ -1524,7 +1943,7 @@ export function ThreadDetailPromptArea({
           suppressPluginComposerCustomizations: true,
           textEffects: sentMessageComposerTextEffects,
           threadRuntimeDisplayStatus: runtimeDisplayStatus,
-          typeahead: typeaheadConfig,
+          typeahead: inlineTypeaheadConfig,
           collapseResetKey: `sent-message:${operationId}`,
         })}
       </InlineMessageEditorFrame>,
@@ -1538,8 +1957,9 @@ export function ThreadDetailPromptArea({
     handleAttachSentMessageFiles,
     handleSentMessageEditSubmit,
     isAttachingSentMessageFiles,
+    sentMessagePendingUploads,
     projectId,
-    promptActions,
+    inlinePromptActions,
     runtimeDisplayStatus,
     sentMessageAttachmentError,
     sentMessageComposerTextEffects,
@@ -1547,7 +1967,7 @@ export function ThreadDetailPromptArea({
     sentMessageEditSubmitMode,
     sentMessagePluginComposerHost,
     thread.id,
-    typeaheadConfig,
+    inlineTypeaheadConfig,
   ]);
   const childPendingInteractionBanners = useMemo(
     () =>
@@ -1578,8 +1998,8 @@ export function ThreadDetailPromptArea({
           isExpanded={isBackgroundCommandsExpanded}
           onToggle={() => setIsBackgroundCommandsExpanded((value) => !value)}
         />
-        {activePromptModeCard}
-        {activeGoalCard}
+        {shouldHideComposer ? null : activePromptModeCard}
+        {shouldHideComposer ? null : activeGoalCard}
         <ThreadTodoCard
           pendingTodos={
             thread.archivedAt === null && environmentGoneStatus === null
@@ -1589,6 +2009,11 @@ export function ThreadDetailPromptArea({
           isExpanded={isTodoExpanded}
           onToggle={() => setIsTodoExpanded((value) => !value)}
         />
+        {environmentHostId &&
+        thread.archivedAt === null &&
+        environmentGoneStatus === null ? (
+          <ThreadMachineStatus hostId={environmentHostId} />
+        ) : null}
         <ThreadPromptContextBanner
           archivedSection={
             thread.archivedAt !== null
@@ -1602,7 +2027,15 @@ export function ThreadDetailPromptArea({
           environmentGoneSection={
             environmentGoneStatus === null
               ? null
-              : { status: environmentGoneStatus }
+              : {
+                  status: environmentGoneStatus,
+                  ...(canRestoreEnvironment
+                    ? {
+                        onRestore: handleRestoreCurrentEnvironment,
+                        restorePending: isRestoreCurrentEnvironmentPending,
+                      }
+                    : {}),
+                }
           }
           parentThreadSection={parentThreadSection}
           childThreadsSection={childThreadsSection}
@@ -1629,15 +2062,17 @@ export function ThreadDetailPromptArea({
             threadId={thread.id}
           />
         ) : null}
-        {shouldHideComposer ? null : (
+        {shouldHideComposer ? null : queuedMessagesPending ? (
+          <QueuedMessagesPendingCard queuedMessageCount={queuedMessageCount} />
+        ) : (
           <QueuedMessagesList
+            attachedToComposer={true}
             queuedMessages={queuedMessages}
             resolveMentionLink={resolveMentionLink}
             inlineEditor={queuedMessageEditor ?? undefined}
+            sendAction={shouldSteerWhenReady ? "steer-when-ready" : "send-now"}
             sendDisabled={
-              !(submitMode.kind === "ready" || submitMode.kind === "queue") ||
-              runtimeDisplayStatus === "provisioning" ||
-              runtimeDisplayStatus === "starting" ||
+              submitMode.kind === "blocked" ||
               runtimeDisplayStatus === "waiting-for-host" ||
               isFollowUpSubmitting ||
               isQueueMutationPending
@@ -1645,7 +2080,7 @@ export function ThreadDetailPromptArea({
             actionDisabled={isQueueMutationPending}
             processingMessageId={displayedProcessingQueuedMessage?.id ?? null}
             processingAction={displayedProcessingQueuedMessage?.action ?? null}
-            onSendImmediately={handleSendQueuedImmediately}
+            onSend={handleSendQueuedMessage}
             onReorder={handleReorderQueuedMessage}
             onSetGroupBoundary={handleSetQueuedMessageGroupBoundary}
             onEdit={beginEditQueuedMessage}
@@ -1658,17 +2093,21 @@ export function ThreadDetailPromptArea({
       canUseGitUi,
       childPendingInteractionBanners,
       contextBannerMergeBase,
+      environmentHostId,
       expandedBannerSection,
       handleDeleteQueuedMessage,
       beginEditQueuedMessage,
       onChangedFileClick,
       handleReorderQueuedMessage,
-      handleSendQueuedImmediately,
+      handleSendQueuedMessage,
       handleSetQueuedMessageGroupBoundary,
       handleToggleBannerSection,
       handleUnarchiveCurrentThread,
+      handleRestoreCurrentEnvironment,
+      canRestoreEnvironment,
       environmentGoneStatus,
       isFollowUpSubmitting,
+      isRestoreCurrentEnvironmentPending,
       isUnarchiveCurrentThreadPending,
       isQueueMutationPending,
       queuedMessageEditor,
@@ -1686,9 +2125,12 @@ export function ThreadDetailPromptArea({
       pullRequestSection,
       pendingTodos,
       displayedProcessingQueuedMessage,
+      queuedMessageCount,
       queuedMessages,
+      queuedMessagesPending,
       resolveMentionLink,
       runtimeDisplayStatus,
+      shouldSteerWhenReady,
       shouldHideComposer,
       submitMode.kind,
       thread.archivedAt,
@@ -1698,12 +2140,6 @@ export function ThreadDetailPromptArea({
     ],
   );
 
-  // A pending permission/question takes the composer's place, but the
-  // composer itself stays mounted (hidden) inside FollowUpPromptBox so the
-  // TipTap editor, draft and pickers survive every approval instead of being
-  // rebuilt per interaction (submitMode is already "blocked" here). The
-  // interaction shows as the last stack item above a reduced stack: child
-  // banners, plan mode and goal cards, plus plugin banners.
   const pendingInteractionNode = useMemo(() => {
     if (!activePendingInteraction || shouldHideComposer) {
       return null;
@@ -1738,9 +2174,10 @@ export function ThreadDetailPromptArea({
       attachments={bottomAttachmentsConfig}
       stack={pendingInteractionNode ? pendingInteractionStack : promptStack}
       pendingInteraction={pendingInteractionNode}
-      activePromptMode={activePromptMode}
+      activePromptMode={isHandoffSelection ? null : activePromptMode}
       composer={shouldHideComposer ? null : bottomComposerConfig}
       pluginComposerHost={normalPluginComposerHost}
+      voiceDraft={promptDraft}
       pluginComposerScope={normalPluginComposerHost.scope}
       textEffects={promptTextEffects}
       collapseResetKey={thread.id}

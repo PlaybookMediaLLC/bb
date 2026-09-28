@@ -32,6 +32,8 @@
  *                              advertising a thought_level config option
  * - FAKE_ACP_SET_CONFIG_MODEL_ERROR=1
  *                            → fail session/set_config_option for model values
+ * - FAKE_ACP_SET_CONFIG_MODEL_ERROR_VALUE
+ *                            → fail session/set_config_option for one model
  * - FAKE_ACP_SET_CONFIG_FAST_ERROR=1
  *                            → fail session/set_config_option for Fast values
  * - FAKE_ACP_CURSOR_PARAMETERIZED_MODELS=1
@@ -63,12 +65,14 @@
  *                              count model-discovery spawns in cache/TTL tests)
  * - FAKE_ACP_PROMPT_LOG      → append one JSON-encoded prompt text per request
  * - FAKE_ACP_PROMPT_ERROR=1  → reject every session/prompt request
+ * - FAKE_ACP_GROK_CONTEXT=1  → advertise Grok model _meta.totalContextTokens
+ *                              and prompt-result _meta.usage
  * - FAKE_ACP_COMPACT_STOP_REASON
  *                            → stop reason returned for /compact
  */
 
 import { createInterface } from "node:readline";
-import { appendFileSync, writeFileSync } from "node:fs";
+import { appendFileSync, renameSync, writeFileSync } from "node:fs";
 
 const failLoad = process.env.FAKE_ACP_FAIL_LOAD === "1";
 const loadSession = process.env.FAKE_ACP_LOAD_SESSION === "1" || failLoad;
@@ -79,11 +83,14 @@ const usageSessionId = process.env.FAKE_ACP_USAGE_SESSION_ID;
 const modelConfig = process.env.FAKE_ACP_MODEL_CONFIG === "1";
 const modelsField = process.env.FAKE_ACP_MODELS_FIELD === "1";
 const thoughtLevelConfig = process.env.FAKE_ACP_THOUGHT_LEVEL_CONFIG === "1";
+const grokContext = process.env.FAKE_ACP_GROK_CONTEXT === "1";
 const unmappedReasoningConfig =
   process.env.FAKE_ACP_UNMAPPED_REASONING_CONFIG === "1";
 const acceptNativeReasoning =
   process.env.FAKE_ACP_ACCEPT_NATIVE_REASONING === "1";
 const setConfigModelError = process.env.FAKE_ACP_SET_CONFIG_MODEL_ERROR === "1";
+const setConfigModelErrorValue =
+  process.env.FAKE_ACP_SET_CONFIG_MODEL_ERROR_VALUE;
 const setConfigFastError = process.env.FAKE_ACP_SET_CONFIG_FAST_ERROR === "1";
 const cursorParameterizedModels =
   process.env.FAKE_ACP_CURSOR_PARAMETERIZED_MODELS === "1";
@@ -144,7 +151,12 @@ for (let i = fakeModels.length; i < modelCount; i += 1) {
 
 process.on("SIGTERM", () => {
   if (process.env.FAKE_ACP_SIGNAL_FILE) {
-    writeFileSync(process.env.FAKE_ACP_SIGNAL_FILE, "SIGTERM\n");
+    const signalFile = process.env.FAKE_ACP_SIGNAL_FILE;
+    const stagedSignalFile = `${signalFile}.${process.pid}.tmp`;
+    // The final path is the test's completion boundary: publish it only after
+    // the marker bytes are complete.
+    writeFileSync(stagedSignalFile, "SIGTERM\n");
+    renameSync(stagedSignalFile, signalFile);
   }
   process.exit(0);
 });
@@ -211,6 +223,7 @@ function cursorModelOptions() {
         { value: "composer-2.5", name: "Composer 2.5" },
         { value: "grok-4.6", name: "Cursor Grok 4.6" },
         { value: "grok-4.5", name: "Cursor Grok 4.5" },
+        { value: "claude-sonnet-4-6", name: "Claude Sonnet 4.6" },
       ]
     : [
         { value: "default[]", name: "Auto" },
@@ -244,7 +257,10 @@ function cursorConfigOptions() {
       options: models,
     },
   ];
-  if (clientSupportsParameterizedModels && selectedModel.startsWith("grok-")) {
+  if (
+    clientSupportsParameterizedModels &&
+    (selectedModel.startsWith("grok-") || selectedModel === "claude-sonnet-4-6")
+  ) {
     options.push(
       {
         id: "effort",
@@ -312,12 +328,13 @@ function configState() {
         name: model.name,
       })),
     };
-  } else if (modelsField) {
+  } else if (modelsField || grokContext) {
     state.models = {
       currentModelId: selectedModel,
       availableModels: fakeModels.map((model) => ({
         modelId: model.value,
         name: model.name,
+        ...(grokContext ? { _meta: { totalContextTokens: 500_000 } } : {}),
       })),
     };
   }
@@ -425,6 +442,10 @@ async function handlePrompt(message) {
 
   if (text === "/compact") {
     // OpenCode treats this exact prompt as a provider-local control.
+    const compactMessage = process.env.FAKE_ACP_COMPACT_AGENT_MESSAGE;
+    if (compactMessage !== undefined) {
+      notifyUpdate(messageChunk(compactMessage));
+    }
   } else if (text.includes("request-external-directory-permission")) {
     // opencode's external_directory permission: the running edit tool asks
     // with the generic kind "other", a bare directory title, and
@@ -502,11 +523,14 @@ async function handlePrompt(message) {
     notifyUpdate(messageChunk(`permission:${outcome}`));
   } else if (text.includes("write-file")) {
     try {
-      await requestClient("fs/write_text_file", {
+      const result = await requestClient("fs/write_text_file", {
         sessionId: activeSessionId,
         path: process.env.FAKE_ACP_WRITE_PATH,
         content: "hello from agent\n",
       });
+      if (!result || typeof result !== "object" || Array.isArray(result)) {
+        throw new Error("Invalid fs/write_text_file response");
+      }
       notifyUpdate(messageChunk("write:ok"));
     } catch {
       notifyUpdate(messageChunk("write:denied"));
@@ -559,7 +583,12 @@ async function handlePrompt(message) {
     send({
       jsonrpc: "2.0",
       id: message.id,
-      result: { stopReason },
+      result: {
+        stopReason,
+        ...(grokContext
+          ? { _meta: { usage: { inputTokens: 17_504, totalTokens: 17_531 } } }
+          : {}),
+      },
     });
   }
 }
@@ -726,7 +755,7 @@ async function handleMessage(message) {
       const configId = message.params?.configId;
       const value = message.params?.value;
       if (configId === "model") {
-        if (setConfigModelError) {
+        if (setConfigModelError || value === setConfigModelErrorValue) {
           send({
             jsonrpc: "2.0",
             id: message.id,

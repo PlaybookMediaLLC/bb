@@ -1,23 +1,47 @@
+import { z } from "zod";
+import { validateDirectServerUrl } from "../profiles/direct-url";
 import { MOBILE_APP_SURFACE_HEADER } from "./app-surface";
 
-export interface MobileFetchOptions {
-  /**
-   * Called for every 401/403 response. The bb server itself never answers
-   * the app's routes with those statuses; they come from the connect gate
-   * when the session cookie is missing, expired, or the machine credential
-   * was revoked, so the owner can re-check the session.
-   */
-  onAuthFailure?: (status: number) => void;
+const SERVER_MOVED_STATUS = 410;
+
+const serverMovedBodySchema = z.object({
+  code: z.literal("server_moved"),
+  details: z.object({
+    serverUrl: z.string().min(1),
+    toHostName: z.string().min(1),
+  }),
+});
+
+export interface ServerMovedResponse {
+  serverUrl: string;
+  toHostName: string;
 }
 
-/**
- * Wrap a fetch so every request carries the mobile app-surface header and
- * auth rejections are reported.
- *
- * Never spread a `Headers` instance into the init on React Native: its
- * polyfill exposes internal fields as enumerable props and `expo/fetch`
- * then fails to cast the init. Always rebuild via `new Headers(...)`.
- */
+export interface MobileFetchOptions {
+  onAuthFailure?: (status: number) => void;
+  onServerMoved?: (moved: ServerMovedResponse) => void;
+}
+
+export async function readServerMovedResponse(
+  response: Response,
+): Promise<ServerMovedResponse | null> {
+  if (response.status !== SERVER_MOVED_STATUS) return null;
+  let body: unknown;
+  try {
+    body = await response.clone().json();
+  } catch {
+    return null;
+  }
+  const parsed = serverMovedBodySchema.safeParse(body);
+  if (!parsed.success) return null;
+  const validation = validateDirectServerUrl(parsed.data.details.serverUrl);
+  if (!validation.ok) return null;
+  return {
+    serverUrl: validation.serverUrl,
+    toHostName: parsed.data.details.toHostName,
+  };
+}
+
 export function createMobileFetch(
   baseFetch: typeof fetch,
   options: MobileFetchOptions = {},
@@ -31,6 +55,10 @@ export function createMobileFetch(
     const response = await baseFetch(input, { ...init, headers });
     if (response.status === 401 || response.status === 403) {
       options.onAuthFailure?.(response.status);
+    }
+    if (options.onServerMoved && response.status === SERVER_MOVED_STATUS) {
+      const moved = await readServerMovedResponse(response);
+      if (moved) options.onServerMoved(moved);
     }
     return response;
   };

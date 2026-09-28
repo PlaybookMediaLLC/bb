@@ -4,11 +4,9 @@ import {
   getThread,
   listIdleThreadsWithQueuedMessages,
   listQueuedThreadMessages,
+  updateHost,
 } from "@bb/db";
-import {
-  applyEnvironmentLifecycleEvent,
-  requireEnvironmentLifecycleEventApplied,
-} from "@bb/db/internal-environment-lifecycle";
+import { applyEnvironmentLifecycleEvent } from "@bb/db/internal-environment-lifecycle";
 import {
   encodeClientTurnRequestIdNumber,
   threadScope,
@@ -23,20 +21,11 @@ import {
   seedProjectWithSource,
   seedQueuedMessage,
   seedThread,
+  seedThreadIdentity,
   seedTurnStarted,
 } from "../helpers/seed.js";
 import { withTestHarness, type TestAppHarness } from "../helpers/test-app.js";
 
-/**
- * Regression test for get-bb/bb#1789.
- *
- * A direct send into a thread whose environment is destroying/destroyed is
- * rejected with 409 `thread_environment_unavailable` (see
- * public-thread-environment-decoupling.test.ts). The queued-message create
- * route used to have no such guard: it answered 201 with a queued-message id,
- * the thread kept reporting `idle`, and the message could never drain because
- * the auto-send path threw the very 409 the create route should have returned.
- */
 const earlierTurnEventData = {
   direction: "outbound",
   requestId: encodeClientTurnRequestIdNumber({ value: 1 }),
@@ -69,8 +58,65 @@ async function postQueuedMessage(
 }
 
 describe("queued message into a thread whose environment is gone (#1789)", () => {
+  it.each([
+    { phase: "removing", destroyedAt: null, code: "machine_removing" },
+    { phase: "destroyed", destroyedAt: 1, code: "host_not_found" },
+  ] as const)(
+    "rejects queue-create when the machine is $phase but the environment is still ready",
+    async ({ phase, destroyedAt, code }) => {
+      await withTestHarness(async (harness) => {
+        const { host } = seedHostSession(harness.deps);
+        const { project } = seedProjectWithSource(harness.deps, {
+          hostId: host.id,
+        });
+        const environment = seedEnvironment(harness.deps, {
+          hostId: host.id,
+          projectId: project.id,
+          status: "ready",
+        });
+        const thread = seedThread(harness.deps, {
+          projectId: project.id,
+          environmentId: environment.id,
+          status: "idle",
+        });
+        updateHost(harness.db, harness.hub, host.id, { phase, destroyedAt });
+
+        const sendResponse = await harness.app.request(
+          `/api/v1/threads/${thread.id}/send`,
+          {
+            method: "POST",
+            headers: { "content-type": "application/json" },
+            body: JSON.stringify({
+              mode: "auto",
+              input: [{ type: "text", text: "direct send" }],
+            }),
+          },
+        );
+        expect(sendResponse.status).toBe(phase === "removing" ? 409 : 404);
+        expect(await readJson(sendResponse)).toMatchObject({ code });
+        expect(getThread(harness.db, thread.id)?.status).toBe("idle");
+        expect(listQueuedThreadMessages(harness.db, thread.id)).toHaveLength(0);
+
+        const response = await postQueuedMessage(
+          harness,
+          thread.id,
+          "new work",
+          {
+            model: "gpt-5",
+          },
+        );
+        const body = await readJson(response);
+
+        expect(response.status, JSON.stringify(body)).toBe(
+          phase === "removing" ? 409 : 404,
+        );
+        expect(body).toMatchObject({ code });
+        expect(listQueuedThreadMessages(harness.db, thread.id)).toHaveLength(0);
+      });
+    },
+  );
+
   for (const status of [
-    "destroying",
     "destroyed",
   ] as const satisfies readonly EnvironmentStatus[]) {
     it(`rejects queue-create when the environment is ${status}`, async () => {
@@ -83,11 +129,10 @@ describe("queued message into a thread whose environment is gone (#1789)", () =>
         });
         const environment = seedEnvironment(harness.deps, {
           hostId: host.id,
-          managed: true,
           projectId: project.id,
           path: null,
           status,
-          workspaceProvisionType: "managed-worktree",
+          isGitRepo: false,
         });
         const thread = seedThread(harness.deps, {
           projectId: project.id,
@@ -95,8 +140,6 @@ describe("queued message into a thread whose environment is gone (#1789)", () =>
           status: "idle",
         });
 
-        // A prior accepted turn: the thread has a stored execution model and
-        // a provider thread id, exactly like a real idle thread that ran once.
         seedEvent(harness.deps, {
           threadId: thread.id,
           environmentId: environment.id,
@@ -106,7 +149,6 @@ describe("queued message into a thread whose environment is gone (#1789)", () =>
           data: earlierTurnEventData,
         });
 
-        // Control: the direct send path already refuses.
         const sendResponse = await harness.app.request(
           `/api/v1/threads/${thread.id}/send`,
           {
@@ -120,7 +162,6 @@ describe("queued message into a thread whose environment is gone (#1789)", () =>
         );
         expect(sendResponse.status).toBe(409);
 
-        // The queue-create path must refuse the same message.
         const queueResponse = await postQueuedMessage(
           harness,
           thread.id,
@@ -145,11 +186,12 @@ describe("queued message into a thread whose environment is gone (#1789)", () =>
 
   it("rejects queue-create when a thread that ran before lost its environment row", async () => {
     await withTestHarness(async (harness) => {
-      const { host } = seedHostSession(harness.deps, { id: "host-queue-pruned" });
+      const { host } = seedHostSession(harness.deps, {
+        id: "host-queue-pruned",
+      });
       const { project } = seedProjectWithSource(harness.deps, {
         hostId: host.id,
       });
-      // After the destroyed row is pruned, the FK sets environmentId to NULL.
       const thread = seedThread(harness.deps, {
         projectId: project.id,
         environmentId: null,
@@ -162,6 +204,11 @@ describe("queued message into a thread whose environment is gone (#1789)", () =>
         type: "client/turn/requested",
         scope: threadScope(),
         data: earlierTurnEventData,
+      });
+      seedThreadIdentity(harness.deps, {
+        threadId: thread.id,
+        environmentId: null,
+        providerThreadId: "provider-turn-1",
       });
       seedTurnStarted(harness.deps, {
         threadId: thread.id,
@@ -208,16 +255,17 @@ describe("queued message into a thread whose environment is gone (#1789)", () =>
 
   it("drops a thread from the auto-send sweep once its environment is gone, so pre-existing queued rows stop failing every cycle", async () => {
     await withTestHarness(async (harness) => {
-      const { host } = seedHostSession(harness.deps, { id: "host-queue-sweep" });
+      const { host } = seedHostSession(harness.deps, {
+        id: "host-queue-sweep",
+      });
       const { project } = seedProjectWithSource(harness.deps, {
         hostId: host.id,
       });
       const environment = seedEnvironment(harness.deps, {
         hostId: host.id,
-        managed: true,
         projectId: project.id,
         status: "ready",
-        workspaceProvisionType: "managed-worktree",
+        isGitRepo: false,
       });
       const thread = seedThread(harness.deps, {
         projectId: project.id,
@@ -229,43 +277,27 @@ describe("queued message into a thread whose environment is gone (#1789)", () =>
         environmentId: environment.id,
         turnId: "turn-1",
       });
-      // The row was queued while the environment was still ready.
       seedQueuedMessage(harness.deps, {
         threadId: thread.id,
-        content: [{ type: "text", text: "queued before destroy", mentions: [] }],
+        content: [
+          { type: "text", text: "queued before destroy", mentions: [] },
+        ],
       });
       const sweepCandidates = () =>
-        listIdleThreadsWithQueuedMessages(harness.db).map((row) => row.threadId);
+        listIdleThreadsWithQueuedMessages(harness.db).map(
+          (row) => row.threadId,
+        );
       expect(sweepCandidates()).toEqual([thread.id]);
 
-      // Archive → grace window elapses → destroy → unarchive. The queued row
-      // survives all of it.
       archiveThread(harness.db, harness.hub, thread.id);
-      requireEnvironmentLifecycleEventApplied(
-        applyEnvironmentLifecycleEvent(harness.db, harness.hub, {
-          environmentId: environment.id,
-          event: { type: "retire.requested" },
-        }),
-      );
-      requireEnvironmentLifecycleEventApplied(
-        applyEnvironmentLifecycleEvent(harness.db, harness.hub, {
-          environmentId: environment.id,
-          event: { type: "destroy.started", destroyAttemptId: "rpc_sweep" },
-        }),
-      );
-      expect(getEnvironment(harness.db, environment.id)?.status).toBe(
-        "destroying",
-      );
-      expect(sweepCandidates()).toEqual([]);
-      requireEnvironmentLifecycleEventApplied(
-        applyEnvironmentLifecycleEvent(harness.db, harness.hub, {
-          environmentId: environment.id,
-          event: { type: "destroy.completed", destroyAttemptId: "rpc_sweep" },
-        }),
-      );
+      applyEnvironmentLifecycleEvent(harness.db, harness.hub, {
+        environmentId: environment.id,
+        event: { type: "destroy.recorded" },
+      });
       expect(getEnvironment(harness.db, environment.id)?.status).toBe(
         "destroyed",
       );
+      expect(sweepCandidates()).toEqual([]);
       const unarchiveResponse = await harness.app.request(
         `/api/v1/threads/${thread.id}/unarchive`,
         { method: "POST" },
@@ -276,8 +308,6 @@ describe("queued message into a thread whose environment is gone (#1789)", () =>
         status: "idle",
       });
 
-      // The row is still there for the user to see, but the sweep no longer
-      // picks the thread up, so there is no send to fail every 10 s.
       expect(listQueuedThreadMessages(harness.db, thread.id)).toHaveLength(1);
       expect(sweepCandidates()).toEqual([]);
     });

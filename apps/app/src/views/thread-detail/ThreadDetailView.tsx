@@ -8,8 +8,9 @@ import {
 } from "react";
 import { nanoid } from "nanoid";
 import { useSystemProviderInfo } from "@/hooks/queries/system-queries";
-import { useNavigate } from "react-router-dom";
+import { useImmediateRouteNavigate } from "@/components/ui/app-route-anchor";
 import { useAtom } from "jotai";
+import { useDesktopBrowserReveal } from "@/lib/use-desktop-browser-reveal";
 import { atomWithStorage } from "jotai/utils";
 import {
   isRunningThreadRuntimeDisplayStatus,
@@ -17,7 +18,6 @@ import {
   type ThreadTimelineEditMessageTarget,
   type ThreadTimelineInlineMessageEditor,
   type ThreadTimelineForkMessageHandler,
-  type ThreadTimelineSendToMainMessageHandler,
   type ThreadTimelineLinkHandler,
   type ThreadTimelineLocalFileLink,
   type ThreadTimelineLocalFileLinkHandler,
@@ -42,6 +42,10 @@ import type { WorkspaceOpenTarget } from "@bb/host-daemon-contract";
 import { appToast } from "@/components/ui/app-toast";
 import { copyToClipboardWithToast } from "@/lib/clipboard";
 import type { ThreadSecondaryPanel as ThreadSecondaryPanelTab } from "@/lib/thread-secondary-panel";
+import {
+  PluginDetailPanelContext,
+  usePluginDetailPanelState,
+} from "@/components/plugin/plugin-detail-navigation";
 import { useForkThreadFromMessage } from "@/hooks/useForkThreadFromMessage";
 import { isThreadForkable } from "@bb/client-core";
 import { useRequestEnvironmentAction } from "../../hooks/mutations/environment-mutations";
@@ -68,12 +72,12 @@ import {
 import {
   didThreadDetailBootstrapRefreshAfterMount,
   getLatestPendingInteraction,
+  isPendingInteractionStateUnknown,
   useChildThreads,
   useProjectThreadSubset,
   useThread,
   useThreadDetailBootstrap,
   useThreadPendingInteractions,
-  useThreadQueuedMessages,
   type ProjectThreadSubsetFilters,
 } from "../../hooks/queries/thread-queries";
 import { isTransientReadError } from "@/hooks/queries/query-helpers";
@@ -94,10 +98,10 @@ import {
   type EnvironmentDisplayHostContext,
 } from "@bb/core-ui";
 import { assertNever } from "@bb/thread-view";
-import { useCreateThreadInWorktree } from "@/hooks/useCreateThreadInWorktree";
+import { useCreateThreadInEnvironment } from "@/hooks/useCreateThreadInEnvironment";
 import { useHostDaemon } from "@/hooks/useHostDaemon";
 import { useLocalOpenTargets } from "@/hooks/useLocalOpenTargets";
-import { useHosts } from "@/hooks/queries/host-queries";
+import { selectHosts, useHosts } from "@/hooks/queries/host-queries";
 import { useSystemConfig } from "@/hooks/queries/system-queries";
 import { useConnectionAwareQueryState } from "@/hooks/queries/connection-aware-query-state";
 import {
@@ -105,7 +109,13 @@ import {
   useCreateThreadTerminal,
   useThreadTerminals,
 } from "@/hooks/queries/thread-terminal-queries";
-import { getEnvironmentWorkspaceLabelIconName } from "@/lib/environment-workspace-display";
+import {
+  findEnvironmentDisplayProvider,
+  getEnvironmentSummaryChrome,
+  isHostAmbiguous,
+} from "@/lib/environment-workspace-display";
+import { useSystemEnvironmentProviders } from "@/hooks/queries/environment-provider-queries";
+import { useSystemMachineProviders } from "@/hooks/queries/machine-provider-queries";
 import { formatWorkspaceCheckoutDisplay } from "@/lib/workspace-checkout-display";
 import {
   getAbsoluteDirname,
@@ -118,7 +128,11 @@ import {
   type WorkspaceChangedFileSelection,
 } from "@/components/workspace/workspace-change-summary";
 import { getThreadDisplayTitle } from "@/lib/thread-title";
-import { getMutationErrorMessage } from "@/lib/mutation-errors";
+import { hasThreadProvisioningFailure } from "@/lib/thread-provisioning-failure";
+import {
+  getMutationErrorMessage,
+  showMutationErrorToast,
+} from "@/lib/mutation-errors";
 import {
   promptInputToDraft,
   type PromptDraftAttachment,
@@ -216,6 +230,7 @@ import {
 } from "@/lib/app-navigation-host";
 import { openAppFixedTabFromDestinations } from "@/lib/app-fixed-tab-navigation";
 import {
+  getFileBasename,
   normalizeExperimentalFileOpenOptions,
   toFilePreviewLineRange,
 } from "@/lib/live-file-navigation";
@@ -238,11 +253,11 @@ import type {
 } from "@/components/secondary-panel/ThreadSecondaryPanel";
 import { useEnvironmentMergeBase } from "@/components/secondary-panel/git-diff/useEnvironmentMergeBase";
 import { useThreadGitActions } from "./useThreadGitActions";
+import { useSendSideChatMessageToMain } from "./useSendSideChatMessageToMain";
 import { useThreadReadTracking } from "@/hooks/useThreadReadTracking";
 import { useThreadUnreadDividerState } from "./useThreadUnreadDividerState";
 import {
   buildTerminalSyncedSecondaryFileTabs,
-  getRetainedTerminalTabId,
   syncTerminalTabsInFixedPanelState,
 } from "@/components/secondary-panel/terminalPanelTabs";
 import {
@@ -361,6 +376,7 @@ function getPullRequestMergeLoadingTitle(
 
 interface ThreadDetailViewPageProps {
   surface: "page";
+  onRequestClose?: (() => void) | null;
 }
 
 interface ThreadDetailViewPaneProps extends ThreadRoutePathArgs {
@@ -386,27 +402,12 @@ interface ResolveHostFilePreviewLinkRootPathArgs {
 
 function buildHostConnectionNotice(
   thread: ThreadWithRuntime,
-  /** Machine name to blame explicitly. Only passed when more than one
-   * machine exists — a bare "Host" is unambiguous
-   * on a single-machine setup. */
   hostName: string | null,
 ): HostConnectionNotice | null {
-  const displayStatus = thread.runtime.displayStatus;
-  if (
-    displayStatus !== "host-reconnecting" &&
-    displayStatus !== "waiting-for-host"
-  ) {
+  if (thread.runtime.displayStatus !== "waiting-for-host") {
     return null;
   }
-
-  const subject = hostName ?? "Host";
-  return {
-    label:
-      displayStatus === "host-reconnecting"
-        ? `${subject} disconnected. Waiting for reconnection...`
-        : `${subject} disconnected`,
-    tone: displayStatus === "host-reconnecting" ? "pending" : "error",
-  };
+  return { label: `${hostName ?? "Host"} disconnected` };
 }
 
 function buildMarkdownPreviewLinkRouting({
@@ -439,11 +440,6 @@ function buildMarkdownPreviewLinkRouting({
     localFile: localFileRouting,
     onOpenLink,
   };
-}
-
-function getLocalFileBasename(path: string): string {
-  const normalizedPath = path.replace(/[\\/]+$/u, "");
-  return normalizedPath.split(/[\\/]/u).at(-1) ?? path;
 }
 
 function buildOpenTargetMenuItemLabel(target: WorkspaceOpenTarget): string {
@@ -490,7 +486,11 @@ function ThreadDetailNotFound() {
   );
 }
 
-function RoutedThreadDetailView() {
+function RoutedThreadDetailView({
+  onRequestClose,
+}: {
+  onRequestClose?: (() => void) | null;
+}) {
   const { projectId, threadId } = useRouteState();
 
   if (!projectId || !threadId) {
@@ -498,7 +498,7 @@ function RoutedThreadDetailView() {
   }
 
   return (
-    <DefaultPaneContextProvider>
+    <DefaultPaneContextProvider onRequestClose={onRequestClose}>
       <ThreadDetailViewInternal projectId={projectId} threadId={threadId} />
     </DefaultPaneContextProvider>
   );
@@ -508,14 +508,14 @@ export function ThreadDetailView(props: ThreadDetailViewProps) {
   if (props.surface === "pane") {
     return <ThreadDetailViewInternal {...props} />;
   }
-  return <RoutedThreadDetailView />;
+  return <RoutedThreadDetailView onRequestClose={props.onRequestClose} />;
 }
 
 function ThreadDetailViewInternal(props: ThreadRoutePathArgs) {
   const { projectId, threadId } = props;
   const { isFocused, navigateInPane, onRequestClose, isBoundedPane } =
     usePaneContext();
-  const navigate = useNavigate();
+  const navigate = useImmediateRouteNavigate();
   useFixedPanelTabsStorageMaintenance();
   const systemConfigQuery = useSystemConfig();
   const threadDetailBootstrapQuery = useThreadDetailBootstrap(threadId);
@@ -528,8 +528,6 @@ function ThreadDetailViewInternal(props: ThreadRoutePathArgs) {
     error,
   } = useThread(threadId, {
     enabled: hasThreadDetailBootstrapSettled,
-    // A successful bootstrap just populated this exact query with a fresh
-    // thread response; refetching it immediately adds redundant tunnel work.
     refetchOnMount: didThreadDetailBootstrapRefreshAfterMount(
       threadDetailBootstrapQuery,
     )
@@ -541,11 +539,19 @@ function ThreadDetailViewInternal(props: ThreadRoutePathArgs) {
     staleTime: 5_000,
   });
   const environment = environmentQuery.data;
+  const hostLifecycle =
+    environment === undefined || environment.hostLifecycle === "active"
+      ? null
+      : environment.hostLifecycle;
+  const executionUnavailable =
+    hostLifecycle !== null || environment?.status === "destroyed";
   const gitDiffTabStatus = resolveGitDiffTabStatus({
     environmentId: thread?.environmentId ?? null,
     environmentIsGitRepo: environment?.isGitRepo,
     environmentLoadFailed: environmentQuery.isError,
+    environmentOwnsPath: environment?.managed,
     hasResolvedThread: thread !== undefined,
+    threadArchived: thread?.archivedAt != null || executionUnavailable,
   });
   const threadFixedViewTabs = useMemo(
     () => [
@@ -570,10 +576,6 @@ function ThreadDetailViewInternal(props: ThreadRoutePathArgs) {
   const openFixedSecondaryTab = isPersistedSecondaryPanelOpen
     ? activeFixedSecondaryTab
     : null;
-  const retainedTerminalId = getRetainedTerminalTabId({
-    activeTab: activeFixedSecondaryTab,
-    isPanelOpen: isPersistedSecondaryPanelOpen,
-  });
   const activeFixedSecondaryTabId = activeFixedSecondaryTab?.id ?? null;
   const renderSecondaryPanelAsDrawer = useIsCompactViewport();
   const secondaryPanelDrawerVisibility =
@@ -581,9 +583,12 @@ function ThreadDetailViewInternal(props: ThreadRoutePathArgs) {
       isCompactViewport: renderSecondaryPanelAsDrawer,
       threadId,
     });
-  const isSecondaryPanelOpen = renderSecondaryPanelAsDrawer
+  const pluginDetails = usePluginDetailPanelState(threadId, isFocused);
+  const isWorkspacePanelOpen = renderSecondaryPanelAsDrawer
     ? secondaryPanelDrawerVisibility.isDrawerVisible
     : isPersistedSecondaryPanelOpen;
+  const isSecondaryPanelOpen =
+    isWorkspacePanelOpen || pluginDetails.activePluginId !== null;
   const touchFixedPanelTabsState = useTouchFixedPanelTabsState(
     threadId,
     threadId,
@@ -592,8 +597,6 @@ function ThreadDetailViewInternal(props: ThreadRoutePathArgs) {
     threadId,
     threadId,
   );
-  // Route-driven panel remounts are passive. Explicit terminal actions keep
-  // this request pending until the asynchronously mounted xterm handles it.
   const [shouldAutoFocusTerminal, setShouldAutoFocusTerminal] = useState(false);
   const handleTerminalAutoFocusHandled = useCallback(
     () => setShouldAutoFocusTerminal(false),
@@ -602,6 +605,7 @@ function ThreadDetailViewInternal(props: ThreadRoutePathArgs) {
   const removeFixedTerminalTab = useRemoveFixedRightTerminalTab(
     threadId,
     threadId,
+    secondaryPanelDrawerVisibility.closeDrawer,
   );
   const updateFixedPanelTabsState = useUpdateFixedPanelTabsState(
     threadId,
@@ -613,11 +617,6 @@ function ThreadDetailViewInternal(props: ThreadRoutePathArgs) {
   );
   const toggleDefaultPersistedSecondaryPanel =
     useToggleThreadSecondaryPanelSelection(threadId, threadId);
-  // Treat placeholder data (a full thread row primed from the sidebar list
-  // cache) as resolved so switching to an uncached thread renders the shell
-  // immediately instead of flashing a full-page "Loading..." while the
-  // bootstrap request is in flight. The timeline pane shows its own loading
-  // state as content streams in.
   const threadQueryState = useConnectionAwareQueryState({
     hasResolvedData: thread !== undefined,
     isFetching: threadDetailBootstrapQuery.isFetching || isFetching,
@@ -625,8 +624,6 @@ function ThreadDetailViewInternal(props: ThreadRoutePathArgs) {
     isRecoverableLoadingError: isTransientReadError(error),
   });
   const threadOriginKind = thread?.originKind ?? null;
-  // This thread is one of the side-chat plugin's hidden forks. Migration 0084
-  // moved every legacy side chat onto this canonical shape.
   const isSideChatThread =
     threadOriginKind === "fork" &&
     thread?.originPluginId === SIDE_CHAT_PLUGIN_ID;
@@ -642,15 +639,12 @@ function ThreadDetailViewInternal(props: ThreadRoutePathArgs) {
     },
   );
   const pendingInteractions = pendingInteractionsQuery.data ?? [];
-  const pendingInteractionsInitialLoading =
-    pendingInteractionsQuery.data === undefined &&
-    (pendingInteractionsQuery.isLoading || pendingInteractionsQuery.isFetching);
+  const pendingInteractionsInitialLoading = isPendingInteractionStateUnknown(
+    pendingInteractionsQuery.data,
+    pendingInteractionsQuery.isFetching,
+  );
   const hasPendingInteraction =
     getLatestPendingInteraction(pendingInteractions) !== null;
-  const { data: queuedMessagesForEditEligibility = [] } =
-    useThreadQueuedMessages(thread?.id ?? "", {
-      enabled: threadQueryState.status === "ready" && Boolean(thread?.id),
-    });
   const unreadDividerState = useThreadUnreadDividerState({
     routeThreadId: threadId,
     thread,
@@ -670,6 +664,7 @@ function ThreadDetailViewInternal(props: ThreadRoutePathArgs) {
     secondaryTabs: fixedPanelTabsState.secondary.tabs,
   });
   const {
+    checkThreadStorageFileExists,
     isThreadStorageFilesLoading,
     refetchThreadStorageFiles,
     threadStorageFiles,
@@ -695,6 +690,7 @@ function ThreadDetailViewInternal(props: ThreadRoutePathArgs) {
     openTab,
     openPluginPanel,
     orderedSecondaryFileTabs,
+    reopenClosedTab,
     reorderTab,
     selectFileSearchResult,
     updateBrowserTab,
@@ -702,8 +698,9 @@ function ThreadDetailViewInternal(props: ThreadRoutePathArgs) {
     panelStateId: threadId,
     syncThreadId: threadId,
     environmentId: thread?.environmentId,
-    retainedTerminalId,
-    storageFiles: threadStorageFiles?.files,
+    onCloseLastTab: secondaryPanelDrawerVisibility.closeDrawer,
+    storageFileExists: checkThreadStorageFileExists,
+    storageFiles: threadStorageFiles,
     terminalSessions: terminalsListQuery.data?.sessions,
   });
   const pluginPanelActions = usePluginPanelActions({
@@ -732,9 +729,6 @@ function ThreadDetailViewInternal(props: ThreadRoutePathArgs) {
     },
     [],
   );
-  // Browser tabs are not rendered through the ordinary tab-content callback:
-  // each one keeps a live native view that must persist across tab switches, so
-  // the deck stays mounted independently of which tab is active.
   const renderBrowserDeck = useCallback(
     ({
       canHandleBrowserCommands,
@@ -812,8 +806,6 @@ function ThreadDetailViewInternal(props: ThreadRoutePathArgs) {
     openTab({ kind: "new-tab" });
   }, [openTab]);
   const [openLinksInAppBrowser] = useOpenLinksInAppBrowserPreference();
-  // The in-app browser surface only exists on desktop; on web this stays false
-  // and handled web links keep their external-open behavior.
   const desktopBrowserAvailable = isDesktopBrowserAvailable();
   const canOpenUrlsInAppBrowser = desktopBrowserAvailable;
   const browserTabIds = useMemo(
@@ -834,7 +826,6 @@ function ThreadDetailViewInternal(props: ThreadRoutePathArgs) {
     filters: EMPTY_PROJECT_THREAD_SUBSET_FILTERS,
     projectId,
   });
-  // Children may live in other projects, so the list is keyed by parent only.
   const childThreadSubsetQuery = useChildThreads({
     enabled: threadQueryState.status === "ready" && Boolean(thread?.id),
     parentThreadId: thread?.id,
@@ -860,6 +851,7 @@ function ThreadDetailViewInternal(props: ThreadRoutePathArgs) {
     activeThinking,
     activeWorkflows,
     activeBackgroundCommands,
+    contextBoundarySeq,
     contextWindowUsage,
     goal,
     hasOlderTimelineRows,
@@ -899,10 +891,9 @@ function ThreadDetailViewInternal(props: ThreadRoutePathArgs) {
         ? orderedSecondaryFileTabs
         : buildTerminalSyncedSecondaryFileTabs({
             orderedTabs: orderedSecondaryFileTabs,
-            retainedTerminalId,
             terminalSessions: loadedTerminalSessions,
           }),
-    [loadedTerminalSessions, orderedSecondaryFileTabs, retainedTerminalId],
+    [loadedTerminalSessions, orderedSecondaryFileTabs],
   );
   useEffect(() => {
     if (terminalsListQuery.data === undefined) {
@@ -910,17 +901,11 @@ function ThreadDetailViewInternal(props: ThreadRoutePathArgs) {
     }
     updateFixedPanelTabsState((state) =>
       syncTerminalTabsInFixedPanelState({
-        retainedTerminalId,
         state,
         terminalSessions,
       }),
     );
-  }, [
-    retainedTerminalId,
-    terminalSessions,
-    terminalsListQuery.data,
-    updateFixedPanelTabsState,
-  ]);
+  }, [terminalSessions, terminalsListQuery.data, updateFixedPanelTabsState]);
   const hostsQuery = useHosts({
     enabled:
       hasThreadDetailBootstrapSettled &&
@@ -936,15 +921,20 @@ function ThreadDetailViewInternal(props: ThreadRoutePathArgs) {
       ),
     [hostsQuery.data],
   );
-  // Name the thread's machine on multi-machine setups so offline notices and
-  // metadata say which computer is involved instead of a generic "host".
-  const threadEnvironmentHost = useMemo(() => {
+  const resolvedThreadEnvironmentHost = useMemo(() => {
     const hosts = hostsQuery.data ?? [];
-    if (hosts.length <= 1) return null;
     const environmentHostId = environment?.hostId;
     if (!environmentHostId) return null;
     return hosts.find((host) => host.id === environmentHostId) ?? null;
   }, [environment?.hostId, hostsQuery.data]);
+  const hasMultipleMachines =
+    selectHosts(hostsQuery.data, "persistent").length > 1;
+  const threadEnvironmentHost = isHostAmbiguous(
+    hasMultipleMachines,
+    resolvedThreadEnvironmentHost?.type ?? null,
+  )
+    ? resolvedThreadEnvironmentHost
+    : null;
   const hostConnectionNotice = useMemo(
     () =>
       thread
@@ -961,9 +951,6 @@ function ThreadDetailViewInternal(props: ThreadRoutePathArgs) {
     },
     [forkThreadFromMessage],
   );
-  // Provider capabilities do not depend on model discovery. Load them from the
-  // lightweight provider roster so fork/edit affordances are not held behind
-  // the composer's slower execution-options probe.
   const threadProviderInfo = useSystemProviderInfo(
     thread?.environmentId
       ? {
@@ -977,8 +964,6 @@ function ThreadDetailViewInternal(props: ThreadRoutePathArgs) {
         },
   );
   const threadProviderPluginId = threadProviderInfo?.pluginId ?? null;
-  // Declared here, above the loading / not-found early returns below, so the
-  // hook order is the same on every render of this component.
   const threadProviderContextValue = useMemo(
     () => ({
       providerId: thread?.providerId ?? null,
@@ -994,21 +979,11 @@ function ThreadDetailViewInternal(props: ThreadRoutePathArgs) {
     if (!renderSecondaryPanelAsDrawer) {
       return;
     }
-    // A selection action can leave a previously focused composer active. Blur
-    // it on compact web so the keyboard never covers the updated composer or a
-    // side-chat drawer; users choose when to focus an input again.
     const activeElement = document.activeElement;
     if (activeElement instanceof HTMLElement) {
       activeElement.blur();
     }
   }, [renderSecondaryPanelAsDrawer]);
-  // Same scope (`projectId` + `thread.id`) the composer's `ThreadDetailPromptArea`
-  // uses, so the timeline "Add to chat" action and the composer share one
-  // localStorage-backed draft — the quoted text is appended to the draft as a
-  // `> ` blockquote block and renders inline in the composer immediately, with
-  // no duplicated draft state.
-  // This view only needs draft actions at event time. Subscribing to the draft
-  // here made every composer write re-render the surrounding thread tree.
   const selectionPromptDraftProjectId = thread?.projectId ?? projectId;
   const selectionPromptDraftThreadId = thread?.id ?? "";
   const selectionPromptDraft = useMemo(
@@ -1021,8 +996,6 @@ function ThreadDetailViewInternal(props: ThreadRoutePathArgs) {
     [selectionPromptDraftProjectId, selectionPromptDraftThreadId],
   );
   const addQuoteToComposer = selectionPromptDraft.addQuote;
-  // Desktop quote actions keep their existing focus handoff. Mobile web does
-  // not focus inputs programmatically; see PromptBoxInternal.
   const [composerFocusRequestNonce, setComposerFocusRequestNonce] = useState(0);
   const [sentMessageEditSession, setSentMessageEditSession] =
     useState<SentMessageEditSession | null>(null);
@@ -1032,13 +1005,8 @@ function ThreadDetailViewInternal(props: ThreadRoutePathArgs) {
     sentMessageEditSession?.threadId === thread?.id
       ? sentMessageEditSession
       : null;
-  // Client-side affordance policy for the UX prototype. The eventual mutation
-  // must repeat the full eligibility check on the server before changing state.
   const canEditSentMessages =
     thread !== undefined &&
-    (systemConfigQuery.data?.experiments.editMessages ?? false) &&
-    // Declared capability, same source as the fork affordance above: an edit
-    // is a rewind to an earlier point in the provider session.
     (threadProviderInfo?.capabilities.supportsSessionRewind ?? false) &&
     thread.archivedAt === null &&
     thread.deletedAt === null &&
@@ -1048,7 +1016,6 @@ function ThreadDetailViewInternal(props: ThreadRoutePathArgs) {
     !createQueuedMessage.isPending &&
     !editMessage.isPending &&
     !(timelineLoading && timelineRows.length === 0) &&
-    queuedMessagesForEditEligibility.length === 0 &&
     activeWorkflows.length === 0 &&
     thread.activeBackgroundAgentCount === 0 &&
     activeBackgroundCommands.length === 0;
@@ -1147,13 +1114,11 @@ function ThreadDetailViewInternal(props: ThreadRoutePathArgs) {
           closeSentMessageEdit(session.operationId);
         })
         .catch((error) => {
-          appToast.error(
-            getMutationErrorMessage({
-              error,
-              fallbackMessage: "Failed to edit the message",
-              lifecycleOperation: "edit_message",
-            }),
-          );
+          showMutationErrorToast({
+            error,
+            fallbackMessage: "Failed to edit the message",
+            lifecycleOperation: "edit_message",
+          });
         });
     },
     [activeSentMessageEditSession, closeSentMessageEdit, editMessage],
@@ -1194,8 +1159,6 @@ function ThreadDetailViewInternal(props: ThreadRoutePathArgs) {
       updateSentMessageEditDraft,
     ],
   );
-  // Plugin useComposer() writes ride the focus bus (they can't reach this
-  // view's local nonce); same storage key = same draft the composer shows.
   useEffect(
     () =>
       subscribeComposerFocusRequests(selectionPromptDraft.storageKey, () =>
@@ -1211,40 +1174,31 @@ function ThreadDetailViewInternal(props: ThreadRoutePathArgs) {
     },
     [addQuoteToComposer, dismissCompactKeyboard],
   );
-  const sendSideChatMessageToMain =
-    useCallback<ThreadTimelineSendToMainMessageHandler>(
-      (target) => {
-        if (
-          thread?.id === undefined ||
-          !isSideChatThread ||
-          threadSourceThreadId === null ||
-          createQueuedMessage.isPending
-        ) {
-          return;
-        }
-
-        createQueuedMessage.mutate({
-          id: threadSourceThreadId,
-          input: [{ type: "text", text: target.messageText, mentions: [] }],
-          senderThreadId: thread.id,
-        });
-      },
-      [createQueuedMessage, isSideChatThread, thread?.id, threadSourceThreadId],
-    );
+  const sendSideChatMessageToMain = useSendSideChatMessageToMain({
+    createQueuedMessage,
+    isSideChatThread,
+    threadId: thread?.id,
+    threadSourceThreadId,
+  });
   const handleSendToMainMessage =
     isSideChatThread && threadSourceThreadId !== null
       ? sendSideChatMessageToMain
       : undefined;
-  const canUseGitUi = gitDiffTabStatus === "eligible";
+  const canUseGitUi = !executionUnavailable && gitDiffTabStatus === "eligible";
   const canCreateTerminal =
+    !executionUnavailable &&
     thread?.environmentId !== null &&
     thread?.environmentId !== undefined &&
     environment?.status === "ready" &&
     connectedHostIds.has(environment.hostId);
-  const createThreadInWorktree = useCreateThreadInWorktree({
+  const createThreadInEnvironment = useCreateThreadInEnvironment({
     projectId,
     environmentId: thread?.environmentId ?? "",
+    sectionId: thread?.sectionId ?? null,
   });
+  const { providers: registeredEnvironmentProviders } =
+    useSystemEnvironmentProviders();
+  const { providers: registeredMachineProviders } = useSystemMachineProviders();
   const environmentMergeBaseBranch =
     resolveEnvironmentMergeBaseBranch(environment);
   const {
@@ -1275,7 +1229,7 @@ function ThreadDetailViewInternal(props: ThreadRoutePathArgs) {
     threadId,
   });
   const {
-    closePanel: closeSecondaryPanel,
+    closePanel: closeWorkspacePanel,
     openCommitDiff: openGitDiffCommitDestination,
     openCompactDrawer,
     openDiffFile: openGitDiffFileDestination,
@@ -1284,7 +1238,7 @@ function ThreadDetailViewInternal(props: ThreadRoutePathArgs) {
     openPanel: openFixedViewDestination,
     openStorageFile,
     openWorkspaceFile,
-    togglePanel: toggleSecondaryPanel,
+    togglePanel: toggleWorkspacePanel,
   } = useThreadSecondaryPanelVisibility({
     closePersistedPanel: closeThreadSecondaryPanel,
     drawerVisibility: secondaryPanelDrawerVisibility,
@@ -1299,6 +1253,15 @@ function ThreadDetailViewInternal(props: ThreadRoutePathArgs) {
     openPersistedWorkspaceFile,
     togglePersistedPanel: toggleDefaultPersistedSecondaryPanel,
   });
+  const dismissPluginDetails = pluginDetails.dismiss;
+  const closeSecondaryPanel = useCallback(() => {
+    dismissPluginDetails();
+    closeWorkspacePanel();
+  }, [dismissPluginDetails, closeWorkspacePanel]);
+  const toggleSecondaryPanel = useCallback(() => {
+    if (pluginDetails.activePluginId !== null) closeSecondaryPanel();
+    else toggleWorkspacePanel();
+  }, [pluginDetails.activePluginId, closeSecondaryPanel, toggleWorkspacePanel]);
   const fixedTabDestinations = useMemo(
     () => [
       createThreadInfoFixedTabDestination(() =>
@@ -1467,8 +1430,12 @@ function ThreadDetailViewInternal(props: ThreadRoutePathArgs) {
     },
     [activateTab, openCompactDrawer],
   );
-  // Popups (`window.open`/`target=_blank`) from a browser view open as a new
-  // in-panel browser tab; the native OS popup is denied in the main process.
+  useDesktopBrowserReveal({
+    threadId,
+    isFocused,
+    browserTabs,
+    activateTab: handleActivateFileTab,
+  });
   useEffect(() => {
     const browserApi = getDesktopBrowserApi();
     if (browserApi === null) {
@@ -1507,9 +1474,6 @@ function ThreadDetailViewInternal(props: ThreadRoutePathArgs) {
     getThreadConversationCollapsedAtom(threadId),
   );
   const isConversationCollapsed = storedConversationCollapsed;
-  // The collapse preference only applies while the panel is open on a wide
-  // viewport; ThreadDetailSecondaryContent gates it (there is nothing to expand
-  // into otherwise) and surfaces the toggle on the seam arrow.
   const toggleConversationCollapse = useCallback(() => {
     setStoredConversationCollapsed((collapsed) => !collapsed);
   }, [setStoredConversationCollapsed]);
@@ -1552,10 +1516,6 @@ function ThreadDetailViewInternal(props: ThreadRoutePathArgs) {
       ),
     [handleSecondaryPanelChange, threadFixedViewTabs],
   );
-  // Click handler for inserted mention pills in the follow-up composer: threads
-  // navigate, files open an in-app preview (workspace files need an
-  // environment; thread-storage files need thread storage). Returning null
-  // leaves the pill non-interactive.
   const resolveMentionLink = useCallback<PromptMentionLinkResolver>(
     (resource) => {
       if (resource.kind === "thread") {
@@ -1606,6 +1566,11 @@ function ThreadDetailViewInternal(props: ThreadRoutePathArgs) {
   useAppCommandHandler("panel.newTab", () => {
     if (!isFocused) return false;
     handleOpenNewTab();
+    return true;
+  });
+  useAppCommandHandler("panel.reopenClosedTab", () => {
+    if (!isFocused || !reopenClosedTab()) return false;
+    openCompactDrawer();
     return true;
   });
   useAppCommandHandler("file.quickOpen", () => {
@@ -1691,9 +1656,10 @@ function ThreadDetailViewInternal(props: ThreadRoutePathArgs) {
     [closeTerminal, removeFixedTerminalTab, threadId],
   );
   const handleCloseWindowRequest = useCallback(() => {
-    // Gate on the visible panel state, not the persisted flag: on compact
-    // viewports the drawer can be dismissed while tabs stay persisted, and
-    // Cmd+W must not consume hidden tabs.
+    if (pluginDetails.activePluginId !== null) {
+      pluginDetails.close(pluginDetails.activePluginId);
+      return true;
+    }
     if (!isSecondaryPanelOpen) {
       return false;
     }
@@ -1708,8 +1674,6 @@ function ThreadDetailViewInternal(props: ThreadRoutePathArgs) {
       }
       return true;
     }
-    // No closable tab is active (e.g. thread-info or git-diff): hide the
-    // panel before letting the next Cmd+W close the window.
     closeSecondaryPanel();
     return true;
   }, [
@@ -1718,6 +1682,7 @@ function ThreadDetailViewInternal(props: ThreadRoutePathArgs) {
     closeTab,
     handleCloseTerminalTab,
     isSecondaryPanelOpen,
+    pluginDetails,
   ]);
   useAppCommandHandler("panel.toggle", () => {
     if (!isFocused) return false;
@@ -1895,6 +1860,10 @@ function ThreadDetailViewInternal(props: ThreadRoutePathArgs) {
   const threadEnvironmentIsLocal = environment
     ? isLocalDaemonHost(environment.hostId)
     : false;
+  const removedEnvironmentHostName =
+    environment !== undefined && environment.hostLifecycle !== "active"
+      ? (threadDetailBootstrapQuery.data?.environmentHostName ?? null)
+      : null;
   const environmentDisplayHostContext = useMemo<EnvironmentDisplayHostContext>(
     () => ({
       locality: threadEnvironmentIsLocal ? "local" : "remote",
@@ -1903,16 +1872,27 @@ function ThreadDetailViewInternal(props: ThreadRoutePathArgs) {
             name: threadEnvironmentHost.name,
             connected: threadEnvironmentHost.status === "connected",
           }
-        : null,
+        : removedEnvironmentHostName
+          ? {
+              name: removedEnvironmentHostName,
+              connected: false,
+            }
+          : null,
     }),
-    [threadEnvironmentIsLocal, threadEnvironmentHost],
+    [
+      removedEnvironmentHostName,
+      threadEnvironmentIsLocal,
+      threadEnvironmentHost,
+    ],
   );
   const workspacePreviewRootPath = environment?.path ?? null;
-  const threadOpenContext = resolveEnvironmentOpenContext({
-    environment,
-    serverOrigin: window.location.origin,
-    threadEnvironmentIsLocal,
-  });
+  const threadOpenContext = executionUnavailable
+    ? null
+    : resolveEnvironmentOpenContext({
+        environment,
+        serverOrigin: window.location.origin,
+        threadEnvironmentIsLocal,
+      });
   const {
     canOpenPreferredDirectoryTarget,
     canOpenPreferredFileTarget,
@@ -1934,7 +1914,6 @@ function ThreadDetailViewInternal(props: ThreadRoutePathArgs) {
           ? threadSourceThreadId
           : thread?.parentThreadId;
       if (!thread || !relatedThreadId) return null;
-      // A side chat is a fork too, so it is tested first.
       const relationship = isSideChatThread
         ? "side-chat"
         : threadOriginKind === "fork"
@@ -1942,23 +1921,17 @@ function ThreadDetailViewInternal(props: ThreadRoutePathArgs) {
           : "parent";
       const relatedThread =
         relationship === "parent" ? parentThread : sourceThread;
-      // A hierarchy parent may live in another project, so the link routes
-      // through the parent's own project once it is loaded.
       const href = getThreadRoutePath({
         projectId: relatedThread?.projectId ?? thread.projectId,
         threadId: relatedThreadId,
       });
       if (relatedThread === undefined) {
-        // Related record not yet loaded — show id-based fallback so the user
-        // doesn't get a flicker of "no related thread" before resolution.
         return {
           parentThreadTitle: relatedThreadId.slice(0, 8),
           href,
           relationship,
         };
       }
-      // Plan ownership invariants: silently exclude dirty references rather
-      // than rendering a stale or unreachable related-thread link.
       if (
         relatedThread.archivedAt !== null ||
         relatedThread.deletedAt !== null ||
@@ -1986,11 +1959,6 @@ function ThreadDetailViewInternal(props: ThreadRoutePathArgs) {
       const activeItems = list
         .filter(
           (entry) =>
-            // Forks / side chats are user-driven branches opened directly, not
-            // delegated work the parent is waiting on — keep them out of the
-            // active-child banner count and drawer. A child blocked on the user
-            // stays visible even if its runtime status later leaves the active
-            // set.
             entry.originKind === null &&
             (isThreadDisplayStatusBannerActive(entry.runtime.displayStatus) ||
               entry.hasPendingInteraction),
@@ -2041,11 +2009,6 @@ function ThreadDetailViewInternal(props: ThreadRoutePathArgs) {
     thread,
     workspaceStatus,
   });
-  useEffect(() => {
-    if (gitActions.threadGitActionDialog.target !== null) {
-      setHasRequestedMergeBaseOptions(true);
-    }
-  }, [gitActions.threadGitActionDialog.target]);
   const parentThreadId = thread?.parentThreadId;
   const parentThreadDisplayName =
     parentThread?.title && parentThread.title.trim().length > 0
@@ -2189,22 +2152,23 @@ function ThreadDetailViewInternal(props: ThreadRoutePathArgs) {
             });
           };
         default:
-          // Surfaces a compile-time error if a future TimelineTitleAction
-          // variant is added without app-side handling, instead of silently
-          // returning undefined and leaving a kind unrouted.
           return assertNever(action);
       }
     },
     [openSecondaryPanelDiffFile, handleOpenTimelinePluginPanel, threadId],
   );
   const metadataStorage = useMemo(
-    () => ({
-      controller: storageBrowserController,
-      filesError: threadStorageFilesError,
-      isFilesLoading: isThreadStorageFilesLoading,
-    }),
+    () =>
+      resolvedThreadEnvironmentHost?.status === "connected"
+        ? {
+            controller: storageBrowserController,
+            filesError: threadStorageFilesError,
+            isFilesLoading: isThreadStorageFilesLoading,
+          }
+        : undefined,
     [
       isThreadStorageFilesLoading,
+      resolvedThreadEnvironmentHost?.status,
       storageBrowserController,
       threadStorageFilesError,
     ],
@@ -2254,13 +2218,13 @@ function ThreadDetailViewInternal(props: ThreadRoutePathArgs) {
     canOpenPreferredFileTarget,
     openPathInPreferredFileTarget,
   ]);
-  const workspaceOpenPath = resolveThreadWorkspaceOpenPath({
-    canOpenWorkspace: canOpenPreferredDirectoryTarget,
-    environment,
-    hasWorkspaceOpenTargets: directoryOpenTargets.length > 0,
-  });
-  // The quick palette is mounted outside this view's provider, so publish the
-  // opener for it. Focused pane only: a split has one per pane.
+  const workspaceOpenPath = executionUnavailable
+    ? null
+    : resolveThreadWorkspaceOpenPath({
+        canOpenWorkspace: canOpenPreferredDirectoryTarget,
+        environment,
+        hasWorkspaceOpenTargets: directoryOpenTargets.length > 0,
+      });
   usePublishThreadPanelOpener(handleOpenTimelinePluginPanel, isFocused);
   useAppCommandHandler("workspace.openPreferred", () => {
     if (!isFocused) return false;
@@ -2285,9 +2249,6 @@ function ThreadDetailViewInternal(props: ThreadRoutePathArgs) {
     }
     return false;
   });
-  // Right-click local file links: per-open native app choices, optional
-  // preview/plugin viewer choices, and utility copy actions. Left-click behavior
-  // stays unchanged.
   const getLocalFileContextMenuItems = useCallback(
     (link: ThreadTimelineLocalFileLink) => {
       const extension = getFileExtension(link.path);
@@ -2362,7 +2323,7 @@ function ThreadDetailViewInternal(props: ThreadRoutePathArgs) {
           id: "copy-name",
           label: "Copy file name",
           onSelect: () => {
-            void copyToClipboardWithToast(getLocalFileBasename(link.path), {
+            void copyToClipboardWithToast(getFileBasename(link.path), {
               successMessage: "File name copied",
               errorMessage: "Failed to copy file name",
             });
@@ -2399,7 +2360,7 @@ function ThreadDetailViewInternal(props: ThreadRoutePathArgs) {
   );
 
   if (threadQueryState.status === "loading") {
-    return <RouteLoadingSkeleton />;
+    return <RouteLoadingSkeleton isBoundedPane={isBoundedPane} />;
   }
   if (!thread || thread.projectId !== projectId) {
     return (
@@ -2412,33 +2373,38 @@ function ThreadDetailViewInternal(props: ThreadRoutePathArgs) {
   }
   const canAssignToParent = isThreadRoot;
   const canTakeOverThread = Boolean(thread.parentThreadId);
+  const environmentProvisioningFailure =
+    thread.status === "error" && thread.environmentId === null
+      ? hasThreadProvisioningFailure(timelineRows)
+      : false;
+  const threadEnvironmentProviderLookup = findEnvironmentDisplayProvider(
+    registeredEnvironmentProviders,
+    environment?.environmentProviderId ?? null,
+  );
   const threadEnvironmentDisplay = environment
     ? formatEnvironmentDisplay({
         environment,
         host: environmentDisplayHostContext,
+        providerLookup: threadEnvironmentProviderLookup,
       })
     : undefined;
-  // `threadEnvironmentHost` is populated only when the server knows multiple
-  // machines, so name that machine in the full follow-up composer label in
-  // exactly that case. Compact layouts use the host-free compact label.
-  const environmentMachinePrefix =
-    threadEnvironmentHost !== null ? `${threadEnvironmentHost.name} · ` : "";
-  const threadEnvironmentIcon = threadEnvironmentDisplay
-    ? getEnvironmentWorkspaceLabelIconName(
-        threadEnvironmentDisplay.workspaceDisplayKind,
-      )
-    : null;
-  const isThreadOnProvisionedWorktreeEnvironment =
+  const composerEnvironmentChrome = threadEnvironmentDisplay
+    ? getEnvironmentSummaryChrome({
+        display: threadEnvironmentDisplay,
+        providerLookup: threadEnvironmentProviderLookup,
+        hasMultipleMachines,
+        host: resolvedThreadEnvironmentHost,
+        machineProviders: registeredMachineProviders,
+      })
+    : undefined;
+  const isThreadOnReusableEnvironment =
+    !executionUnavailable &&
     environment !== undefined &&
     environment.status === "ready" &&
-    environment.path !== null &&
-    (environment.isWorktree ||
-      environment.workspaceProvisionType === "managed-worktree");
-  const onCreateNewThreadInWorktree =
-    isThreadOnProvisionedWorktreeEnvironment &&
-    projectId &&
-    thread.environmentId !== null
-      ? createThreadInWorktree
+    environment.path !== null;
+  const onCreateNewThreadInEnvironment =
+    isThreadOnReusableEnvironment && projectId && thread.environmentId !== null
+      ? createThreadInEnvironment
       : undefined;
   const promptBannerMergeBaseBranch = effectiveMergeBaseBranch;
   const threadBranchName = workspaceBranch?.currentBranch ?? undefined;
@@ -2446,13 +2412,9 @@ function ThreadDetailViewInternal(props: ThreadRoutePathArgs) {
     ? formatWorkspaceCheckoutDisplay({ checkout: workspaceStatus.checkout })
     : undefined;
   const isWorkspaceDeleted = environment?.status === "destroyed";
-  // Decision B*: a thread whose environment is gone (being torn down or already
-  // destroyed) is read-only — un-archive never resurrects it, so the composer is
-  // replaced with the "environment is gone" banner instead of allowing a send.
   const threadEnvironmentGoneStatus =
-    environment?.status === "destroying" || environment?.status === "destroyed"
-      ? environment.status
-      : null;
+    hostLifecycle ??
+    (environment?.status === "destroyed" ? environment.status : null);
   const threadGitStatusDisplay = getGitStatusDisplay(workspaceStatus, {
     mergeBaseBranch: effectiveMergeBaseBranch,
     showBranchComparison: showBranchComparisonUi,
@@ -2488,14 +2450,15 @@ function ThreadDetailViewInternal(props: ThreadRoutePathArgs) {
           },
         }))
       : [];
-  const responsiveGitActions: ThreadActionsMenuResponsiveAction[] =
-    gitActions.threadHeaderGitActions.map((action) => ({
-      icon: "GitBranch" as const,
-      label: action.label,
-      onSelect: () => {
-        gitActions.threadGitActionDialog.onOpen(action.target);
-      },
-    }));
+  const responsiveGitActions: ThreadActionsMenuResponsiveAction[] = (
+    executionUnavailable ? [] : gitActions.threadHeaderGitActions
+  ).map((action) => ({
+    icon: "GitBranch" as const,
+    label: action.label,
+    onSelect: () => {
+      gitActions.threadGitActionDialog.onOpen(action.target);
+    },
+  }));
   const responsiveHeaderActions = [
     ...responsiveWorkspaceActions,
     ...responsiveGitActions,
@@ -2545,7 +2508,9 @@ function ThreadDetailViewInternal(props: ThreadRoutePathArgs) {
           projectId={thread.projectId}
         />
       }
-      threadHeaderGitActions={gitActions.threadHeaderGitActions}
+      threadHeaderGitActions={
+        executionUnavailable ? [] : gitActions.threadHeaderGitActions
+      }
       threadId={thread.id}
       threadTitle={threadTitle}
       workspaceOpenButton={workspaceOpenButton}
@@ -2558,20 +2523,22 @@ function ThreadDetailViewInternal(props: ThreadRoutePathArgs) {
       contextWindowUsage={contextWindowUsage}
       environmentCheckout={threadCheckoutDisplay}
       environmentCompactLabel={
-        threadEnvironmentDisplay
-          ? threadEnvironmentDisplay.compactModeLabel
-          : undefined
+        composerEnvironmentChrome?.environmentCompactLabel
       }
-      environmentIcon={threadEnvironmentIcon ?? undefined}
-      environmentLabel={
-        threadEnvironmentDisplay
-          ? `${environmentMachinePrefix}${threadEnvironmentDisplay.modeLabel}`
-          : undefined
+      environmentHost={composerEnvironmentChrome?.environmentHost}
+      environmentIcon={composerEnvironmentChrome?.environmentIcon}
+      environmentLabel={composerEnvironmentChrome?.environmentLabel}
+      environmentMachineProvider={
+        composerEnvironmentChrome?.environmentMachineProvider
       }
+      environmentProviderName={
+        composerEnvironmentChrome?.environmentProviderName
+      }
+      canRestoreEnvironment={thread.canRestoreEnvironment}
       environmentGoneStatus={threadEnvironmentGoneStatus}
       environmentHostId={environment?.hostId}
       isEnvironmentActionPending={requestEnvironmentAction.isPending}
-      onCreateNewThreadInWorktree={onCreateNewThreadInWorktree}
+      onCreateNewThreadInEnvironment={onCreateNewThreadInEnvironment}
       onPullRequestMerge={handlePullRequestMerge}
       onPullRequestDraft={handlePullRequestDraft}
       onPullRequestReady={handlePullRequestReady}
@@ -2608,6 +2575,7 @@ function ThreadDetailViewInternal(props: ThreadRoutePathArgs) {
       }
       pendingInteractions={pendingInteractions}
       pendingInteractionsInitialLoading={pendingInteractionsInitialLoading}
+      queuedMessageCount={thread.queuedMessageCount}
       pendingTodos={pendingTodos}
       activePromptMode={activePromptMode}
       goal={goal}
@@ -2760,6 +2728,7 @@ function ThreadDetailViewInternal(props: ThreadRoutePathArgs) {
             onOpenLink={handleOpenTimelineLink}
             onOpenLocalFileLink={handleOpenTimelineLocalFileLink}
             resolveMentionLink={resolveMentionLink}
+            threadId={thread.id}
             workspaceRootPath={environment?.path ?? undefined}
           >
             <PluginPanelTabContent
@@ -2931,6 +2900,7 @@ function ThreadDetailViewInternal(props: ThreadRoutePathArgs) {
               isLoadingParentThreads: parentThreadSubsetQuery.isLoading,
               isParentThreadsError: parentThreadSubsetQuery.isError,
               environment: environment ?? null,
+              environmentProvisioningFailure,
               environmentDisplayHost: environmentDisplayHostContext,
               workspaceStatus,
               workspaceStatusError: workspaceStatusError ?? null,
@@ -2958,6 +2928,7 @@ function ThreadDetailViewInternal(props: ThreadRoutePathArgs) {
                 : undefined,
             }}
             secondaryPanel={{
+              canNavigateTabs: isFocused,
               activeTab: activeFixedSecondaryTab,
               canUseGitUi,
               gitDiffTabStatus,
@@ -2987,6 +2958,7 @@ function ThreadDetailViewInternal(props: ThreadRoutePathArgs) {
             timeline={{
               activeThinking,
               canSpawnChild: thread.canSpawnChild,
+              contextBoundarySeq,
               threadOriginKind,
               hasOlderTimelineRows,
               hostConnectionNotice,
@@ -3010,18 +2982,11 @@ function ThreadDetailViewInternal(props: ThreadRoutePathArgs) {
               resolveMentionLink,
               showOngoingIndicator:
                 thread.status !== "stopping" &&
-                // A pending interaction (question or approval) already renders its
-                // own inline shimmer row, so the bottom indicator would just
-                // duplicate it.
                 !hasPendingInteraction &&
                 isRunningThreadRuntimeDisplayStatus(
                   thread.runtime.displayStatus,
                 ) &&
                 !isThreadTimelinePending,
-              ongoingIndicatorLabel:
-                thread.runtime.displayStatus === "host-reconnecting"
-                  ? "Waiting for reconnection"
-                  : undefined,
               timelineRows,
               isStopping: thread.status === "stopping",
               stoppingAnchorAt: thread.updatedAt,
@@ -3038,23 +3003,12 @@ function ThreadDetailViewInternal(props: ThreadRoutePathArgs) {
               branchName={threadBranchName}
               gitStatusDisplay={threadGitStatusDisplay}
               changedFilesSection={workingTreeChangedFilesSection}
-              showMergeBaseDetails={showBranchComparisonUi}
-              mergeBaseBranch={effectiveMergeBaseBranch}
-              mergeBaseBranchOptions={mergeBaseBranchOptions}
-              mergeBaseBranchRef={selectedMergeBaseBranchRef}
-              mergeBaseRemoteBranchOptions={mergeBaseRemoteBranchOptions}
-              mergeBaseBranchOptionsLoading={isLoadingMergeBaseBranchOptions}
-              onMergeBaseBranchSearchQueryChange={setMergeBaseBranchSearchQuery}
-              onMergeBaseBranchChange={
-                showBranchComparisonUi ? handleMergeBaseBranchChange : undefined
-              }
               onOpenChange={(open) => {
                 if (!open) {
                   gitActions.threadGitActionDialog.onClose();
                 }
               }}
               onCommit={gitActions.handleCommitThread}
-              onSquashMerge={gitActions.handleSquashMergeThread}
             />
           ) : null}
         </AppNavigationHostProvider>
@@ -3069,7 +3023,9 @@ function ThreadDetailViewInternal(props: ThreadRoutePathArgs) {
         <PluginThreadPanelNavigationProvider
           openThreadPanel={handleOpenTimelinePluginPanel}
         >
-          {threadDetailContent}
+          <PluginDetailPanelContext.Provider value={pluginDetails}>
+            {threadDetailContent}
+          </PluginDetailPanelContext.Provider>
         </PluginThreadPanelNavigationProvider>
       </ThreadProviderContext.Provider>
     </>

@@ -1,4 +1,5 @@
 import type { Thread } from "@bb/domain";
+import { makeThread as makeThreadFixture } from "@bb/test-helpers/domain-fixtures";
 import { describe, expect, it } from "vitest";
 import {
   buildForkThreadRequest,
@@ -6,38 +7,30 @@ import {
 } from "../src/prompt/fork-thread-request.js";
 
 function makeThread(overrides: Partial<Thread> = {}): Thread {
-  const base: Thread = {
-    archivedAt: null,
+  return makeThreadFixture({
     createdAt: 1,
-    deletedAt: null,
     environmentId: "env_source",
     id: "thr_source",
     lastReadAt: null,
     latestAttentionAt: 1,
-    originKind: null,
-    originPluginId: null,
-    visibility: "visible",
-    parentThreadId: null,
-    pinnedAt: null,
-    projectId: "proj_test",
-    providerId: "codex",
-    sourceThreadId: null,
-    status: "idle",
     title: "Investigate flaky test",
     titleFallback: null,
-    sectionId: null,
     updatedAt: 1,
-  };
-  return { ...base, ...overrides };
+    ...overrides,
+  });
 }
 
 describe("buildForkThreadRequest", () => {
-  it("reuses the source environment and starts with the user's first message", () => {
+  it("preserves plugin submission data in a fork dispatch request", () => {
     const request = buildForkThreadRequest({
       environmentId: "env_source",
       input: [{ type: "text", text: "Continue from here", mentions: [] }],
       model: "gpt-5",
       permissionMode: "accept-edits",
+      pluginSubmission: {
+        pluginId: "drafts",
+        data: { kind: "draft" },
+      },
       projectId: "proj_test",
       providerId: "codex",
       providerSupportsFork: true,
@@ -54,6 +47,10 @@ describe("buildForkThreadRequest", () => {
       model: "gpt-5",
       originKind: "fork",
       permissionMode: "accept-edits",
+      pluginSubmission: {
+        pluginId: "drafts",
+        data: { kind: "draft" },
+      },
       projectId: "proj_test",
       providerId: "codex",
       reasoningLevel: "high",
@@ -70,6 +67,7 @@ describe("buildForkThreadRequest", () => {
       input: [{ type: "text", text: "Continue from here", mentions: [] }],
       model: "gpt-5",
       permissionMode: "auto",
+      pluginSubmission: undefined,
       projectId: "proj_test",
       providerId: "codex",
       providerSupportsFork: true,
@@ -81,6 +79,7 @@ describe("buildForkThreadRequest", () => {
     });
 
     expect(request).not.toHaveProperty("serviceTier");
+    expect(request).not.toHaveProperty("pluginSubmission");
   });
 
   it("builds a fork request for a generic ACP provider", () => {
@@ -90,6 +89,7 @@ describe("buildForkThreadRequest", () => {
         input: [{ type: "text", text: "Continue from here", mentions: [] }],
         model: "gpt-5",
         permissionMode: "auto",
+        pluginSubmission: undefined,
         projectId: "proj_test",
         providerId: "acp-amp",
         providerSupportsFork: true,
@@ -113,6 +113,7 @@ describe("buildForkThreadRequest", () => {
         input: [{ type: "text", text: "Continue from here", mentions: [] }],
         model: "unknown-model",
         permissionMode: "auto",
+        pluginSubmission: undefined,
         projectId: "proj_test",
         providerId: "not-a-provider",
         providerSupportsFork: false,
@@ -127,6 +128,13 @@ describe("buildForkThreadRequest", () => {
 });
 
 describe("isThreadForkable", () => {
+  it("rejects an archived source and permits it after unarchiving", () => {
+    const source = makeThread({ archivedAt: 123 });
+
+    expect(isThreadForkable(source, true)).toBe(false);
+    expect(isThreadForkable({ ...source, archivedAt: null }, true)).toBe(true);
+  });
+
   it("is true only with an environment id and a fork-capable provider", () => {
     expect(
       isThreadForkable(makeThread({ environmentId: "env_source" }), true),
@@ -134,8 +142,6 @@ describe("isThreadForkable", () => {
     expect(isThreadForkable(makeThread({ environmentId: null }), true)).toBe(
       false,
     );
-    // The capability now arrives from server-provided ProviderInfo; absence
-    // (unknown provider, data not loaded) reads as false.
     expect(
       isThreadForkable(makeThread({ providerId: "not-a-provider" }), false),
     ).toBe(false);

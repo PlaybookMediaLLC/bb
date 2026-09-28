@@ -1,9 +1,15 @@
+import { recheckEnvironmentProvisioning } from "./services/threads/thread-environment-providers.js";
+import { enrolledInstallerScript } from "./services/machines/manual-enrollment-command.js";
+import { reconnectBootstrapForCredential } from "./services/machines/reconnect.js";
+import { getMachineEnrollmentService } from "./services/machines/machine-services.js";
+import { withManualMachineProvider } from "./services/machines/manual-provider.js";
+import { registerDesktopBrowserRoutes } from "./routes/desktop-browsers.js";
+import { INSTALL_MACHINE_SCRIPT_PATH } from "./install-machine-asset.js";
 import { createNodeWebSocket } from "@hono/node-ws";
-import { createHash } from "node:crypto";
+import { createHash, randomUUID } from "node:crypto";
 import { readFile, stat } from "node:fs/promises";
 import { performance } from "node:perf_hooks";
 import { extname, join, resolve } from "node:path";
-import { fileURLToPath } from "node:url";
 import { Hono } from "hono";
 import { terminalWebSocketQuerySchema } from "@bb/server-contract";
 import { compress } from "hono/compress";
@@ -16,8 +22,10 @@ import { registerHostRoutes } from "./routes/hosts.js";
 import { registerProjectRoutes } from "./routes/projects.js";
 import { registerThreadSectionRoutes } from "./routes/thread-sections.js";
 import { registerSystemRoutes } from "./routes/system.js";
+import { registerUiPreferenceRoutes } from "./routes/ui-preferences.js";
 import { registerTerminalRoutes } from "./routes/terminals.js";
 import { registerThreadRoutes } from "./routes/threads/index.js";
+import { registerQueueRoutes } from "./routes/queue.js";
 import { registerPluginRoutes } from "./routes/plugins.js";
 import { registerPluginCatalogRoutes } from "./routes/plugin-catalog.js";
 import { registerSkillsRegistryRoutes } from "./routes/skills-registry.js";
@@ -27,7 +35,20 @@ import {
 } from "./services/plugins/plugin-service.js";
 import { setPluginAgentContributions } from "./services/plugins/plugin-agent-contributions.js";
 import { setPluginThreadEventEmitter } from "./services/plugins/plugin-thread-events.js";
-import { requestDeferredThreadMessageFlush } from "./services/threads/thread-send-request.js";
+import { setPluginHookProvider } from "./services/plugins/plugin-hook-registry.js";
+import {
+  setEnvironmentProviderRecheckHandler,
+  setEnvironmentProvisioningRecheckHandler,
+  setPluginEnvironmentProviderBridge,
+} from "./services/plugins/plugin-environment-provider-registry.js";
+import { recheckEnvironmentProviderCreations } from "./services/threads/thread-environment-providers.js";
+import {
+  setServerAccessBridge,
+  setServerAccessRecheckHandler,
+} from "./services/plugins/plugin-server-access-registry.js";
+import { setPluginMachineProviderBridge } from "./services/plugins/plugin-machine-provider-registry.js";
+import { invalidateEnvironmentProviderMachineAvailability } from "./services/environments/provider-machine-availability.js";
+import { requestQueuedMessageDispatch } from "./services/threads/queued-message-dispatch.js";
 import { registerInternalEventRoutes } from "./internal/events.js";
 import { registerInternalHostRoutes } from "./internal/hosts.js";
 import { registerInternalInteractiveRequestRoutes } from "./internal/interactive-requests.js";
@@ -56,7 +77,7 @@ import {
   onDaemonSocketOpen,
   validateDaemonWebSocket,
 } from "./ws/daemon-protocol.js";
-import { roundDurationMs } from "./services/lib/duration.js";
+import { roundDurationMs } from "@bb/process-utils";
 import {
   onTerminalSocketClose,
   onTerminalSocketMessage,
@@ -71,7 +92,8 @@ import {
   createPluginCatalogService,
   type PluginCatalogService,
 } from "./services/plugin-catalog/plugin-catalog-service.js";
-import { callHostRetryableOnlineRpc } from "./services/hosts/online-rpc.js";
+import { callHostRetryableOnlineRpcForWork } from "./services/hosts/online-rpc.js";
+import { requestMatchesEntityTag } from "./services/hosts/daemon-file-response.js";
 import {
   allowedAppOrigins,
   browserRequestProblem,
@@ -81,13 +103,32 @@ import {
   disposePluginHostWorkers,
 } from "./services/plugins/plugin-host-rpc.js";
 
-/**
- * `/api/v1/plugins/<id>/http/...` — the plugin-owned wire, whose auth mode is
- * declared per route by the plugin itself.
- */
 const PLUGIN_WIRE_HTTP_PATH = /^\/api\/v1\/plugins\/[^/]+\/http(?:\/|$)/u;
 import { rankAcceptedAssetEncodings } from "./asset-content-encoding.js";
 import { apiJsonCompression } from "./api-response-compression.js";
+import { APP_SURFACE_WEB, type AppSurface } from "@bb/config/app-surface";
+import type { ServerBindHost } from "@bb/config/server";
+import { registerServerMoveRoutes } from "./routes/server-move.js";
+import {
+  INTERNAL_SERVER_MOVE_PENDING_PATH,
+  registerInternalServerMoveRoutes,
+} from "./internal/server-move.js";
+import {
+  createServerMoveCoordinator,
+  type ServerMoveCoordinator,
+} from "./services/server-move/coordinator.js";
+import { createDefaultServerMoveEnvironment } from "./services/server-move/environment.js";
+import { readServerMoveHealth } from "./services/server-move/health.js";
+import type { RestoredServerMoveRun } from "./services/server-move/reconcile.js";
+import {
+  serverMoveFreezeMiddleware,
+  serverMoveWriteFreezeMiddleware,
+} from "./services/server-move/freeze.js";
+import { isServerMoveSnapshotFenced } from "./services/server-move/freeze-state.js";
+import {
+  createManualServerImportCompletion,
+  type PendingServerMove,
+} from "./services/server-move/pending-boot.js";
 
 type CloseWebSockets = () => Promise<void>;
 type NodeWebSocketServer = ReturnType<typeof createNodeWebSocket>["wss"];
@@ -99,6 +140,7 @@ interface ServerApp {
   injectWebSocket: ReturnType<typeof createNodeWebSocket>["injectWebSocket"];
   pluginService: PluginService;
   pluginCatalogService: PluginCatalogService;
+  serverMove: ServerMoveCoordinator;
 }
 
 interface CloseWebSocketServerArgs {
@@ -124,8 +166,18 @@ function normalizeInternalAuthPath(path: string): string {
   return path.replace(/\/+$/u, "");
 }
 
+export interface ServerMoveAppOptions {
+  appSurface: AppSurface;
+  bindHost: ServerBindHost | null;
+  manualImportPending: boolean;
+  pending: PendingServerMove | null;
+  restoredRun: RestoredServerMoveRun | null;
+  retireProcess(): void;
+}
+
 interface CreateAppOptions {
   bbAppArtifactService?: BbAppArtifactService;
+  serverMove?: ServerMoveAppOptions;
   slowApiRequestLogThresholdMs?: number;
   staticDir?: string;
 }
@@ -134,39 +186,21 @@ interface StaticResponseHeadersArgs {
   contentEncoding?: string;
   contentLength?: number;
   contentType: string;
-  /** Present only for the app shell; other static files rely on hashes/TTLs. */
   etag?: string;
   urlPath: string;
 }
 
-// `no-cache` (not `no-store`): every client — browsers, the desktop window,
-// the connect worker's edge copy — revalidates the document on every
-// navigation, so a new build is picked up immediately. The document travels
-// with a build-id ETag (see shellEtag), so that revalidation is an
-// If-None-Match answered with an empty 304: a handful of header bytes, also
-// through the connect tunnel, where the worker keeps the last confirmed
-// document at the edge. A positive max-age would let a browser reuse the
-// shell without asking (`must-revalidate` only governs stale entries) and
-// boot a stale build — whose hashed assets no longer exist after an in-place
-// update — for the whole window. Not `no-store`: WebKit may still keep the
-// page in the back/forward cache and restore it without a reload.
 const STATIC_INDEX_CACHE_CONTROL = "no-cache";
 const STATIC_ASSET_CACHE_CONTROL = "public, max-age=31536000, immutable";
-// Icons and manifests under public/ are not content-hashed but change only
-// with a release; a day of caching keeps favicon/badge flips and PWA
-// relaunches from refetching them.
 const STATIC_PUBLIC_FILE_CACHE_CONTROL = "public, max-age=86400";
 const WEB_SOCKET_SHUTDOWN_CODE = 1001;
 const WEB_SOCKET_SHUTDOWN_FORCE_CLOSE_MS = 1_000;
 const WEB_SOCKET_SHUTDOWN_REASON = "server-shutdown";
 const SLOW_API_REQUEST_LOG_THRESHOLD_MS = 1_000;
-const INSTALL_MACHINE_SCRIPT_PATH = fileURLToPath(
-  new URL("./assets/install-machine.sh", import.meta.url),
-);
 const THREAD_EVENT_WAIT_PATH_PATTERN =
   /^\/api\/v1\/threads\/[^/]+\/events\/wait$/u;
 const PLUGIN_APP_ASSET_PATH_PATTERN =
-  /^\/api\/v1\/plugins\/[^/]+\/assets\/app\.(?:js|css)$/u;
+  /^\/api\/v1\/(?:plugins\/[^/]+\/assets|plugin-app-assets\/[a-f0-9]{16})\/app\.(?:js|css)$/u;
 const PRECOMPRESSED_STATIC_FILES = [
   { encoding: "br", extension: ".br" },
   { encoding: "gzip", extension: ".gz" },
@@ -212,14 +246,6 @@ function createStaticResponseHeaders(args: StaticResponseHeadersArgs): Headers {
   return headers;
 }
 
-/**
- * Build-id ETag for the app shell, derived from the served file's bytes:
- * index.html embeds every content-hashed asset URL, so its content changes
- * exactly when a build does. Cached per path and revalidated by (size,
- * mtime) so an in-place dist swap gets a fresh tag without hashing every
- * request. Weak, because the precompressed sidecars are equivalent — not
- * byte-identical — representations of the same document.
- */
 const shellEtagCache = new Map<
   string,
   { etag: string; mtimeMs: number; size: number }
@@ -247,23 +273,8 @@ async function shellEtag(filePath: string): Promise<string | undefined> {
     });
     return etag;
   } catch {
-    // Unreadable file: serve without a validator rather than failing the
-    // request here; the read below will surface the real error.
     return undefined;
   }
-}
-
-/** RFC 9110 §13.1.2: If-None-Match always compares weakly for GET. */
-export function ifNoneMatchSatisfied(
-  ifNoneMatchHeader: string,
-  etag: string,
-): boolean {
-  if (ifNoneMatchHeader.trim() === "*") return true;
-  const opaque = (tag: string): string => tag.trim().replace(/^W\//u, "");
-  const target = opaque(etag);
-  return ifNoneMatchHeader
-    .split(",")
-    .some((candidate) => opaque(candidate) === target);
 }
 
 const STATIC_MIME_TYPES: Record<string, string> = {
@@ -281,12 +292,6 @@ const STATIC_MIME_TYPES: Record<string, string> = {
   ".map": "application/json",
 };
 
-/**
- * Serves the built app from `staticDir`: content-hashed assets, public files,
- * and the shell (index.html — directly and as the single-page-app fallback
- * for every client route). Registered by createApp; exported so tests can
- * exercise the shell contract (sidecar, ETag, 304) against a bare Hono app.
- */
 export function registerStaticAppRoutes(app: Hono, staticDir: string): void {
   const root = resolve(staticDir);
 
@@ -297,18 +302,13 @@ export function registerStaticAppRoutes(app: Hono, staticDir: string): void {
     ifNoneMatchHeader: string | undefined;
     urlPath: string;
   }): Promise<Response> => {
-    // Only the shell carries a validator: assets are immutable by hash and
-    // public files by TTL, but the document is `no-cache` and revalidated on
-    // every navigation — the 304 here is what keeps that revalidation a few
-    // header bytes instead of the document each time.
     const etag =
       args.contentType === "text/html"
         ? await shellEtag(args.filePath)
         : undefined;
     if (
       etag !== undefined &&
-      args.ifNoneMatchHeader !== undefined &&
-      ifNoneMatchSatisfied(args.ifNoneMatchHeader, etag)
+      requestMatchesEntityTag(args.ifNoneMatchHeader, etag)
     ) {
       const headers = new Headers();
       headers.set("cache-control", staticCacheControlForPath(args.urlPath));
@@ -360,20 +360,10 @@ export function registerStaticAppRoutes(app: Hono, staticDir: string): void {
           urlPath,
         });
       }
-    } catch {
-      // File not found — fall through to SPA fallback
-    }
-    // /assets/ holds content-hashed build output, never a client route, so
-    // a miss there is a stale reference rather than a page to render. The
-    // single-page-app fallback would answer it with index.html at status
-    // 200, and the browser would report a confusing MIME type error for a
-    // script instead of a plain 404. Mirrors the /api/v1/* guard above.
+    } catch {}
     if (urlPath.startsWith("/assets/")) {
       return context.notFound();
     }
-    // The SPA fallback is the document response for every client route
-    // (every thread page a phone opens), so it serves the same sidecar and
-    // validator as a direct /index.html hit.
     return serveStaticAppFile({
       acceptEncodingHeader: context.req.header("accept-encoding"),
       contentType: "text/html",
@@ -423,9 +413,7 @@ async function findPrecompressedStaticFile(args: {
           filePath: encodedFilePath,
         };
       }
-    } catch {
-      // Sidecar missing — try the next acceptable encoding.
-    }
+    } catch {}
   }
 
   return null;
@@ -471,6 +459,20 @@ export function createApp(
       dataDir: deps.config.dataDir,
       serverEntryUrl: import.meta.url,
     });
+  const serverMoveOptions: ServerMoveAppOptions = options?.serverMove ?? {
+    appSurface: APP_SURFACE_WEB,
+    bindHost: null,
+    manualImportPending: false,
+    pending: null,
+    restoredRun: null,
+    retireProcess: () => {
+      deps.logger.warn(
+        {},
+        "Server move finished, but this server has no process retire hook",
+      );
+    },
+  };
+  const pendingServerMove = serverMoveOptions.pending;
 
   app.use("*", async (context, next) => {
     captureTrustedRemoteAddress(context);
@@ -487,6 +489,9 @@ export function createApp(
     "*",
     cors({
       origin: (origin, context) => {
+        if (context.req.path === "/health") {
+          return "*";
+        }
         const allowedCorsOrigins = allowedAppOrigins(deps);
         const requestOrigin = new URL(context.req.url).origin;
         if (origin === requestOrigin || allowedCorsOrigins.has(origin)) {
@@ -499,38 +504,74 @@ export function createApp(
   const compressResponse = compress();
   const compressApiJson = apiJsonCompression();
   app.use("*", (context, next) => {
-    // Plugin JS/CSS negotiates Brotli and gzip itself and caches immutable
-    // variants. Letting this outer middleware transform an identity fallback
-    // would also ignore explicit q=0 values in Hono's current parser.
     if (PLUGIN_APP_ASSET_PATH_PATTERN.test(context.req.path)) {
       return next();
     }
-    // Core API JSON is buffered and Brotli-encoded (gzip fallback) with an
-    // exact Content-Length by the inner middleware; the streaming gzip
-    // fallback then only touches what the inner one leaves untransformed.
     return compressResponse(context, async () => {
       await compressApiJson(context, next);
     });
   });
   app.onError((error) => errorToResponse(error, deps.logger));
-  // The launch id lets the bb-app launcher prove that the process answering on
-  // its port is the child it just spawned, not another bb server that already
-  // owned the port (its own child then dies with EADDRINUSE a moment later).
-  app.get("/health", (context) =>
-    context.json(
-      deps.config.launchId === undefined
-        ? { ok: true }
-        : { ok: true, launchId: deps.config.launchId },
-    ),
-  );
-  app.get("/install.sh", async (context) => {
-    const script = await readFile(INSTALL_MACHINE_SCRIPT_PATH);
-    return new Response(script, {
-      headers: {
-        "cache-control": "no-store",
-        "content-type": "text/x-shellscript; charset=utf-8",
-      },
+  app.get("/health", async (context) => {
+    const serverMove = await readServerMoveHealth({
+      dataDir: deps.config.dataDir,
+      pending: pendingServerMove,
     });
+    return context.json({
+      ok: true,
+      ...(deps.config.launchId === undefined
+        ? {}
+        : { launchId: deps.config.launchId }),
+      ...(serverMove === null ? {} : { serverMove }),
+    });
+  });
+  app.get("/install.sh", async (context) => {
+    const script = await readFile(INSTALL_MACHINE_SCRIPT_PATH, "utf8");
+    const credential = context.req.header("X-BB-Enrollment");
+    let bootstrap =
+      credential === undefined
+        ? null
+        : await getMachineEnrollmentService(deps).pendingBootstrapForCredential(
+            credential,
+          );
+    if (credential !== undefined && bootstrap === null) {
+      try {
+        bootstrap = await reconnectBootstrapForCredential(deps, credential);
+      } catch (error) {
+        deps.logger.warn({ error }, "Could not refresh machine access");
+        return new Response(
+          "echo 'Could not refresh machine access. Run the command again, or generate a new one in bb.' >&2\nexit 1\n",
+          {
+            status: 503,
+            headers: {
+              "cache-control": "no-store",
+              "content-type": "text/x-shellscript; charset=utf-8",
+            },
+          },
+        );
+      }
+    }
+    if (credential !== undefined && bootstrap === null) {
+      return new Response(
+        "echo 'This enrollment command has already been used, replaced, or expired. Generate a new command in bb.' >&2\nexit 1\n",
+        {
+          status: 403,
+          headers: {
+            "cache-control": "no-store",
+            "content-type": "text/x-shellscript; charset=utf-8",
+          },
+        },
+      );
+    }
+    return new Response(
+      bootstrap === null ? script : enrolledInstallerScript(script, bootstrap),
+      {
+        headers: {
+          "cache-control": "no-store",
+          "content-type": "text/x-shellscript; charset=utf-8",
+        },
+      },
+    );
   });
   app.get("/install/version", async (context) => {
     return context.json({
@@ -538,17 +579,49 @@ export function createApp(
       protocolVersion: HOST_DAEMON_PROTOCOL_VERSION,
     });
   });
-  // bb-app is public on npm. A paired tunnel can expose an unpublished build
-  // slightly before release; serving the exact server build is an accepted
-  // tradeoff so remote daemons cannot be stranded by protocol skew.
   app.get("/install/bb-app.tgz", async (context) => {
-    const tarball = await readFile(await bbAppArtifactService.getTarballPath());
-    return new Response(tarball, {
-      headers: {
+    try {
+      const artifact = await bbAppArtifactService.getArtifact();
+      const etag = `"sha256-${artifact.digest}"`;
+      const headers = {
         "cache-control": "public, max-age=300",
         "content-type": "application/gzip",
-      },
-    });
+        etag,
+        "x-bb-artifact-sha256": artifact.digest,
+      };
+      if (context.req.header("if-none-match") === etag) {
+        return new Response(null, { headers, status: 304 });
+      }
+      const tarball = await readFile(artifact.path);
+      return new Response(tarball, {
+        headers: { ...headers, "content-length": String(artifact.size) },
+      });
+    } catch (error) {
+      const diagnosticId = randomUUID();
+      const code =
+        error instanceof Error && "code" in error ? error.code : undefined;
+      const reason =
+        code === "ENOENT"
+          ? "A required server package file or packaging tool is missing."
+          : code === "EACCES" || code === "EPERM"
+            ? "The server lacks permission to prepare or read the host package."
+            : code === "ENOSPC"
+              ? "The server ran out of disk space while preparing the host package."
+              : "The server could not build or read its host package.";
+      deps.logger.error(
+        { err: error, diagnosticId },
+        "Host package download failed",
+      );
+      return context.json(
+        {
+          code: "host_package_unavailable",
+          message: `${reason} Check the server logs for diagnostic ID ${diagnosticId}, then retry installation.`,
+          diagnosticId,
+        },
+        500,
+        { "cache-control": "no-store" },
+      );
+    }
   });
   app.use("/api/v1/*", async (context, next) => {
     const startedAt = performance.now();
@@ -590,6 +663,9 @@ export function createApp(
     if (normalizedPath === "/internal/ws") {
       return next();
     }
+    if (normalizedPath === INTERNAL_SERVER_MOVE_PENDING_PATH) {
+      return next();
+    }
     try {
       const daemon = await verifyAuthenticatedDaemon(
         deps,
@@ -602,6 +678,7 @@ export function createApp(
     return next();
   });
   const pluginService = createPluginService({
+    machineEnrollments: getMachineEnrollmentService(deps),
     db: deps.db,
     hub: deps.hub,
     logger: deps.logger,
@@ -609,13 +686,14 @@ export function createApp(
     pendingInteractions: deps.pendingInteractions,
     dataDir: deps.config.dataDir,
     appVersion: deps.config.appVersion,
+    getAppUrl: () => deps.config.appUrl ?? null,
     sharedPorts: deps.sharedPorts,
     providerRegistry: deps.providerRegistry,
     pluginHostArtifacts: deps.pluginHostArtifacts,
     aiServices: deps.aiServices,
     ensureSharedPortTunnel: (hostId) =>
       deps.sharedPorts.ensureTunnelIdentity(hostId, () =>
-        callHostRetryableOnlineRpc(deps, {
+        callHostRetryableOnlineRpcForWork(deps, {
           command: { type: "connect-tunnel.ensure-identity" },
           hostId,
           timeoutMs: 30_000,
@@ -623,38 +701,94 @@ export function createApp(
       ),
     callPluginHost: (args) => callPluginHostRpc(deps, args),
     disposePluginHost: (args) => disposePluginHostWorkers(deps, args),
-    // A plugin resolves its providers' native roots from its settings, so a
-    // settings save must reach the next listing, not the cached answer.
-    onSettingsChanged: (pluginId) => deps.providerNativeRoots.invalidate(pluginId),
+    onSettingsChanged: (pluginId) => {
+      deps.providerNativeRoots.invalidate(pluginId);
+      deps.providerRegistry.forgetAllInstalled();
+    },
+    onPluginUnregistered: (pluginId) => {
+      requestQueuedMessageDispatch(deps, {
+        kind: "plugin-unregistered",
+        pluginId,
+      });
+    },
+    // `bb.experimental_hooks.recheck()`: a plugin whose wait condition
+    // may have changed asks core to re-attempt the plugin-queued rows. Core
+    // owns the walk, the coalescing and the pacing; the plugin owns knowing
+    // when to ask.
+    requestQueueDrain: () => {
+      requestQueuedMessageDispatch(deps, { kind: "plugin-recheck" });
+    },
     watchBuiltinPluginSources:
       process.env.BB_MANAGED_DEV_BUILTIN_PLUGIN_HOT_RELOAD === "1",
   });
-  // Messages held back while a thread awaited user interaction deliver once
-  // that interaction settles (#1650); the periodic sweep covers the rest.
+  // Messages queued while a thread awaited user interaction stop waiting once
+  // that interaction settles (#1650); the idle drain then delivers them.
   deps.pendingInteractions.setThreadInteractionSettledListener((threadId) => {
-    requestDeferredThreadMessageFlush(deps, threadId);
+    requestQueuedMessageDispatch(deps, {
+      kind: "interaction-settled",
+      threadId,
+    });
   });
-  // Bridge the thread lifecycle seams to this service's plugins (§4.5).
   setPluginThreadEventEmitter(pluginService.events);
+  // Bridge the dispatch pipeline to this service's hooks. Until this runs
+  // there are no hooks, which is exactly the zero-overhead path.
+  setPluginHookProvider(pluginService.hooks);
+  setPluginEnvironmentProviderBridge(pluginService.environmentProviders);
+  setEnvironmentProvisioningRecheckHandler((threadId) =>
+    recheckEnvironmentProvisioning(deps, threadId),
+  );
+  setPluginMachineProviderBridge(
+    withManualMachineProvider(
+      pluginService.machineProviders,
+      getMachineEnrollmentService(deps),
+    ),
+  );
+  setServerAccessBridge(pluginService.serverAccessProviders);
+  setServerAccessRecheckHandler(() => {
+    deps.hub.notifySystem(["config-changed"]);
+  });
+  setEnvironmentProviderRecheckHandler((pluginId) => {
+    invalidateEnvironmentProviderMachineAvailability();
+    deps.hub.notifySystem(["config-changed"]);
+    void recheckEnvironmentProviderCreations(deps, pluginId);
+  });
   // Bridge runtime-config assembly to plugin skills + context (§4.4).
   setPluginAgentContributions(pluginService);
+  const serverMove = createServerMoveCoordinator(
+    createDefaultServerMoveEnvironment({
+      appSurface: serverMoveOptions.appSurface,
+      bindHost: serverMoveOptions.bindHost,
+      deps,
+      env: process.env,
+      pluginService,
+      retireProcess: serverMoveOptions.retireProcess,
+      serverEntryUrl: import.meta.url,
+    }),
+  );
+  if (serverMoveOptions.restoredRun !== null) {
+    serverMove.restore(serverMoveOptions.restoredRun);
+  }
+  const serverMoveFreezeState = {
+    isFrozen: () => pendingServerMove !== null || serverMove.isFrozen(),
+  };
+  const daemonWriteFreezeState = {
+    isFrozen: () =>
+      pendingServerMove !== null || isServerMoveSnapshotFenced(deps.db),
+  };
+  app.use("/api/v1/*", serverMoveFreezeMiddleware(serverMoveFreezeState));
+  for (const path of ["/internal/hosts/enroll", "/internal/hosts/enroll-key"]) {
+    app.use(path, serverMoveWriteFreezeMiddleware(serverMoveFreezeState));
+  }
+  for (const path of [
+    "/internal/session/events",
+    "/internal/session/tool-call",
+    "/internal/session/interactive-request",
+    "/internal/session/interactive-request/interrupt",
+  ]) {
+    app.use(path, serverMoveWriteFreezeMiddleware(daemonWriteFreezeState));
+  }
   const publicApi = new Hono();
-  // CORS decides whether a browser may *read* a response; it does not stop the
-  // request being sent and acted on. A `no-cors` POST with a simple content
-  // type skips the preflight entirely, and the typed route parser reads the
-  // body with `c.req.json()` regardless of content type — so a page on any
-  // origin could drive this API blind. Reject a foreign browser origin here
-  // instead. `requireJsonForMutation` is deliberately NOT set: it answers 415
-  // to any mutation without `application/json`, which would break every
-  // existing `curl -d` caller. The origin check alone stops browser CSRF,
-  // because a browser always sends `Origin` on a cross-origin mutation.
-  // Non-browser callers (curl, the `bb` CLI, the SDK) send no `Origin` and pass
-  // through untouched.
   publicApi.use("*", async (context, next) => {
-    // A plugin's own HTTP routes declare their auth mode (`local` | `token` |
-    // `none`). `none` is deliberately reachable from any origin, and `token`
-    // authenticates with a secret rather than an origin, so this blanket check
-    // must not pre-empt the per-route one `registerPluginRoutes` applies.
     if (PLUGIN_WIRE_HTTP_PATH.test(context.req.path)) {
       return next();
     }
@@ -670,8 +804,6 @@ export function createApp(
     marketplaceUrl: deps.config.marketplaceUrl,
     dataDir: deps.config.dataDir,
     plugins: pluginService,
-    // The store's installed/compatible flags ride the plugin-list broadcast,
-    // so a refreshed catalog reaches open windows without polling.
     notifyCatalogChanged: () => deps.hub.notifySystem(["plugins-changed"]),
     warn: (message) => deps.logger.warn(message),
   });
@@ -679,13 +811,17 @@ export function createApp(
   registerThreadSectionRoutes(publicApi, deps);
   registerFileRoutes(publicApi, deps);
   registerHostRoutes(publicApi, deps, pluginService);
+  registerDesktopBrowserRoutes(publicApi, deps);
   registerTerminalRoutes(publicApi, deps);
   registerEnvironmentRoutes(publicApi, deps);
   registerThreadRoutes(publicApi, deps);
+  registerQueueRoutes(publicApi, deps);
   registerSystemRoutes(publicApi, deps, pluginService);
+  registerUiPreferenceRoutes(publicApi, deps);
   registerPluginCatalogRoutes(publicApi, pluginCatalogService);
-  registerPluginRoutes(publicApi, deps, pluginService);
+  registerPluginRoutes(publicApi, deps, pluginService, upgradeWebSocket);
   registerSkillsRegistryRoutes(publicApi, deps);
+  registerServerMoveRoutes(publicApi, deps, serverMove);
   app.route("/api/v1", publicApi);
   app.use("/api/v1/*", () => {
     throw new ApiError(404, "not_found", "Not found");
@@ -693,7 +829,18 @@ export function createApp(
 
   const internalApi = new Hono();
   registerInternalHostRoutes(internalApi, deps);
-  registerInternalSessionRoutes(internalApi, deps, pluginService);
+  registerInternalSessionRoutes(internalApi, deps, pluginService, {
+    movedTo: () => serverMove.movedTo(),
+    pendingMoveId: () => pendingServerMove?.moveId ?? null,
+    sessionOpened: createManualServerImportCompletion({
+      deps,
+      pending: serverMoveOptions.manualImportPending,
+    }),
+  });
+  registerInternalServerMoveRoutes(internalApi, deps, {
+    pending: pendingServerMove,
+    serverMove,
+  });
   registerInternalSkillRoutes(internalApi, deps);
   registerInternalPluginHostArtifactRoutes(internalApi, deps);
   registerInternalEventRoutes(internalApi, deps);
@@ -701,18 +848,24 @@ export function createApp(
   registerInternalInteractiveRequestRoutes(internalApi, deps);
   app.route("/internal", internalApi);
 
+  const assertBrowserWebSocketAllowed = (
+    context: Parameters<typeof browserRequestProblem>[0],
+  ): void => {
+    const problem = browserRequestProblem(context, deps);
+    if (problem !== null) {
+      throw new ApiError(
+        problem.status,
+        "forbidden_origin",
+        problem.error,
+        false,
+      );
+    }
+  };
+
   app.get(
     "/ws",
     upgradeWebSocket((context) => {
-      const problem = browserRequestProblem(context, deps);
-      if (problem !== null) {
-        throw new ApiError(
-          problem.status,
-          "forbidden_origin",
-          problem.error,
-          false,
-        );
-      }
+      assertBrowserWebSocketAllowed(context);
       return {
         onOpen: (_event, socket) => onClientSocketOpen(deps.hub, socket),
         onMessage: (event, socket) =>
@@ -725,15 +878,7 @@ export function createApp(
   app.get(
     "/ws/terminals/:terminalId",
     upgradeWebSocket((context) => {
-      const problem = browserRequestProblem(context, deps);
-      if (problem !== null) {
-        throw new ApiError(
-          problem.status,
-          "forbidden_origin",
-          problem.error,
-          false,
-        );
-      }
+      assertBrowserWebSocketAllowed(context);
       const terminalId = context.req.param("terminalId");
       const query = terminalWebSocketQuerySchema.safeParse({
         sinceSeq: context.req.query("sinceSeq"),
@@ -751,14 +896,12 @@ export function createApp(
             socket,
             sinceSeq: query.data.sinceSeq,
             terminalId,
-            threadId: null,
           }),
         onMessage: (event, socket) =>
           onTerminalSocketMessage(deps, {
             raw: event.data,
             socket,
             terminalId,
-            threadId: null,
           }),
         onClose: (_event, socket) =>
           onTerminalSocketClose(deps, {
@@ -793,18 +936,17 @@ export function createApp(
               socket,
             },
             pluginService,
+            serverMove,
           ),
         onClose: () => onDaemonSocketClose(deps, websocketContext.sessionId),
       };
     }),
   );
 
-  if (!options?.staticDir) {
-    app.get("/", (context) => context.text("bb server"));
-  }
-
   if (options?.staticDir) {
     registerStaticAppRoutes(app, options.staticDir);
+  } else {
+    app.get("/", (context) => context.text("bb server"));
   }
 
   return {
@@ -818,5 +960,6 @@ export function createApp(
     injectWebSocket,
     pluginService,
     pluginCatalogService,
+    serverMove,
   };
 }

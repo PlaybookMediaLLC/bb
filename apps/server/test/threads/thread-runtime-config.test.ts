@@ -12,17 +12,15 @@ import {
   encodeClientTurnRequestIdNumber,
 } from "@bb/domain";
 import { validatePluginProviderDeclaration } from "@get-bb/plugin-sdk/internal/host-policy";
+import type { PluginAgentConfigurationContext } from "@get-bb/plugin-sdk";
 import { buildPluginProviderRegistration } from "../../src/services/providers/plugin-provider-registration.js";
 import type { DiscoveredSkill } from "@bb/host-daemon-contract";
 import { setPluginAgentContributions } from "../../src/services/plugins/plugin-agent-contributions.js";
 import { readSkillTreeManifest } from "../../src/services/skills/injected-skills.js";
 import type { PluginAgentToolContribution } from "../../src/services/plugins/plugin-service.js";
+import { resolveThreadRuntimeCommandConfig } from "../../src/services/threads/thread-runtime-config.js";
 import {
-  resolvePermissionEscalation,
-  resolveExecutionOptions,
-  resolveThreadRuntimeCommandConfig,
-} from "../../src/services/threads/thread-runtime-config.js";
-import {
+  buildExecutionOptions,
   buildThreadStartCommand,
   prepareTurnSubmitCommandPayload,
 } from "../../src/services/threads/thread-commands.js";
@@ -157,9 +155,6 @@ function registerRemoteRuntimeFileResponder(
 }
 
 describe("thread runtime config", () => {
-  // A configured agent's launch spec reaches the bridge the way every
-  // provider's static options do: on the registration, inside the opaque
-  // `bridgeLaunch.providerOptions` bag.
   it("carries a configured ACP agent's launch spec on thread start and turn submit", async () => {
     await withTestHarness(
       {
@@ -291,25 +286,9 @@ describe("thread runtime config", () => {
         command: "grok",
         args: ["agent", "stdio"],
         env: {},
-        modelCli: {
-          listArgs: ["models"],
-          selectFlag: "--model",
-          primaryModels: ["grok-4.5", "grok-composer-2.5-fast"],
-        },
         permissionCli: {
           full: ["--always-approve"],
           insertAfterArgs: 1,
-        },
-        reasoningCli: {
-          flag: "--reasoning-effort",
-          supportedLevels: ["low", "medium", "high"],
-          levelValues: {
-            none: "low",
-            xhigh: "high",
-            ultracode: "high",
-            max: "high",
-          },
-          defaultLevel: "high",
         },
       },
       providerId: "acp-grok",
@@ -472,13 +451,11 @@ describe("thread runtime config", () => {
           providerId: childProviderId,
         });
 
-        const execution = await resolveExecutionOptions(harness.deps, {
-          threadId: thread.id,
-          requestedExecution: {
-            model: requestedModel,
-            source: "client/turn/requested",
-          },
-        });
+        const execution = await buildExecutionOptions(
+          harness.deps,
+          { model: requestedModel },
+          { threadId: thread.id },
+        );
 
         expect(execution.permissionMode).toBe(expectedPermissionMode);
       });
@@ -508,20 +485,20 @@ describe("thread runtime config", () => {
         providerId: "codex",
       });
 
-      const execution = await resolveExecutionOptions(harness.deps, {
-        threadId: childThread.id,
-        projectDefaults: {
-          providerId: "codex",
-          model: "gpt-5",
-          reasoningLevel: "medium",
-          permissionMode: "accept-edits",
-          serviceTier: "default",
+      const execution = await buildExecutionOptions(
+        harness.deps,
+        { model: "gpt-5" },
+        {
+          threadId: childThread.id,
+          projectDefaults: {
+            providerId: "codex",
+            model: "gpt-5",
+            reasoningLevel: "medium",
+            permissionMode: "accept-edits",
+            serviceTier: "default",
+          },
         },
-        requestedExecution: {
-          model: "gpt-5",
-          source: "client/turn/requested",
-        },
-      });
+      );
 
       expect(execution.permissionMode).toBe("accept-edits");
     });
@@ -556,24 +533,83 @@ describe("thread runtime config", () => {
         providerId: "codex",
       });
 
-      const execution = await resolveExecutionOptions(harness.deps, {
-        threadId: childThread.id,
-        projectDefaults: {
-          providerId: "codex",
-          model: "gpt-5",
-          reasoningLevel: "medium",
-          permissionMode: "accept-edits",
-          serviceTier: "default",
+      const execution = await buildExecutionOptions(
+        harness.deps,
+        { model: "gpt-5" },
+        {
+          threadId: childThread.id,
+          projectDefaults: {
+            providerId: "codex",
+            model: "gpt-5",
+            reasoningLevel: "medium",
+            permissionMode: "accept-edits",
+            serviceTier: "default",
+          },
         },
-        requestedExecution: {
-          model: "gpt-5",
-          source: "client/turn/requested",
-        },
-      });
+      );
 
       expect(execution.permissionMode).toBe("accept-edits");
     });
   });
+
+  it.each([
+    { providerId: "pi", model: "openai/codex-mini", modeSource: "default" },
+    { providerId: "pi", model: "openai/codex-mini", modeSource: "requested" },
+    { providerId: "pi", model: "openai/codex-mini", modeSource: "recorded" },
+    { providerId: "codex", model: "gpt-5", modeSource: "requested" },
+    { providerId: "codex", model: "gpt-5", modeSource: "recorded" },
+  ])(
+    "allows $providerId full mode from $modeSource under an auto parent",
+    async ({ providerId, model, modeSource }) => {
+      await withTestHarness(async (harness) => {
+        const { host } = seedHostSession(harness.deps, {
+          id: "host-runtime-child-full-mode",
+        });
+        const { project } = seedProjectWithSource(harness.deps, {
+          hostId: host.id,
+        });
+        const environment = seedEnvironment(harness.deps, {
+          hostId: host.id,
+          projectId: project.id,
+        });
+        const parentThread = seedThread(harness.deps, {
+          projectId: project.id,
+          environmentId: environment.id,
+        });
+        seedThreadRuntimeState(harness.deps, {
+          threadId: parentThread.id,
+          environmentId: environment.id,
+          providerThreadId: "provider-parent-auto",
+          permissionMode: "auto",
+        });
+        const childThread = seedThread(harness.deps, {
+          projectId: project.id,
+          environmentId: environment.id,
+          parentThreadId: parentThread.id,
+          providerId,
+        });
+        if (modeSource === "recorded") {
+          seedThreadRuntimeState(harness.deps, {
+            threadId: childThread.id,
+            environmentId: environment.id,
+            providerThreadId: "provider-child-full",
+            permissionMode: "full",
+          });
+        }
+
+        const execution = await buildExecutionOptions(
+          harness.deps,
+          {
+            model,
+            ...(modeSource === "requested" ? { permissionMode: "full" } : {}),
+          },
+          { threadId: childThread.id },
+        );
+
+        expect(execution.permissionMode).toBe("full");
+      });
+    },
+  );
 
   it("treats ghost parent references as root-thread execution defaults", async () => {
     await withTestHarness(async (harness) => {
@@ -601,20 +637,20 @@ describe("thread runtime config", () => {
         providerId: "codex",
       });
 
-      const execution = await resolveExecutionOptions(harness.deps, {
-        threadId: childThread.id,
-        projectDefaults: {
-          providerId: "codex",
-          model: "gpt-5",
-          reasoningLevel: "medium",
-          permissionMode: "accept-edits",
-          serviceTier: "default",
+      const execution = await buildExecutionOptions(
+        harness.deps,
+        { model: "gpt-5" },
+        {
+          threadId: childThread.id,
+          projectDefaults: {
+            providerId: "codex",
+            model: "gpt-5",
+            reasoningLevel: "medium",
+            permissionMode: "accept-edits",
+            serviceTier: "default",
+          },
         },
-        requestedExecution: {
-          model: "gpt-5",
-          source: "client/turn/requested",
-        },
-      });
+      );
 
       expect(execution.permissionMode).toBe("accept-edits");
     });
@@ -637,14 +673,11 @@ describe("thread runtime config", () => {
         environmentId: environment.id,
       });
 
-      const execution = await resolveExecutionOptions(harness.deps, {
-        threadId: thread.id,
-        requestedExecution: {
-          model: "gpt-5",
-          permissionMode: "accept-edits",
-          source: "client/turn/requested",
-        },
-      });
+      const execution = await buildExecutionOptions(
+        harness.deps,
+        { model: "gpt-5", permissionMode: "accept-edits" },
+        { threadId: thread.id },
+      );
 
       expect(execution.permissionMode).toBe("accept-edits");
     });
@@ -669,14 +702,11 @@ describe("thread runtime config", () => {
       });
 
       await expect(
-        resolveExecutionOptions(harness.deps, {
-          threadId: thread.id,
-          requestedExecution: {
-            model: "openai/codex-mini",
-            permissionMode: "accept-edits",
-            source: "client/turn/requested",
-          },
-        }),
+        buildExecutionOptions(
+          harness.deps,
+          { model: "openai/codex-mini", permissionMode: "accept-edits" },
+          { threadId: thread.id },
+        ),
       ).rejects.toThrow("Provider pi only supports full permission mode.");
     });
   });
@@ -701,15 +731,15 @@ describe("thread runtime config", () => {
           providerId: "pi",
         });
 
-        const execution = await resolveExecutionOptions(harness.deps, {
-          threadId: thread.id,
-          requestedExecution: {
+        const execution = await buildExecutionOptions(
+          harness.deps,
+          {
             model: "openai-codex/gpt-5.6-luna",
             permissionMode: "full",
             reasoningLevel,
-            source: "client/turn/requested",
           },
-        });
+          { threadId: thread.id },
+        );
 
         expect(execution.reasoningLevel).toBe(reasoningLevel);
       });
@@ -735,14 +765,11 @@ describe("thread runtime config", () => {
       });
 
       await expect(
-        resolveExecutionOptions(harness.deps, {
-          threadId: thread.id,
-          requestedExecution: {
-            model: "gpt-5.4",
-            reasoningLevel: "ultracode",
-            source: "client/turn/requested",
-          },
-        }),
+        buildExecutionOptions(
+          harness.deps,
+          { model: "gpt-5.4", reasoningLevel: "ultracode" },
+          { threadId: thread.id },
+        ),
       ).rejects.toThrow(
         "Provider codex does not support ultracode reasoning level. Supported reasoning levels: low, medium, high, xhigh, max, ultra.",
       );
@@ -755,7 +782,7 @@ describe("thread runtime config", () => {
         name: "release-notes",
         rootPath: path.join(harness.config.dataDir, "skills"),
       });
-      const builtinSourceRootPath = await writeRuntimeSkill({
+      await writeRuntimeSkill({
         name: "bb-cli",
         rootPath: harness.config.builtinSkillsRootPath,
       });
@@ -783,13 +810,11 @@ describe("thread runtime config", () => {
         environmentId: environment.id,
         providerId: "codex",
       });
-      const execution = await resolveExecutionOptions(harness.deps, {
-        threadId: thread.id,
-        requestedExecution: {
-          model: "gpt-5",
-          source: "client/turn/requested",
-        },
-      });
+      const execution = await buildExecutionOptions(
+        harness.deps,
+        { model: "gpt-5" },
+        { threadId: thread.id },
+      );
 
       const command = await buildThreadStartCommand(harness.deps, {
         environment,
@@ -805,14 +830,6 @@ describe("thread runtime config", () => {
       });
 
       expect(command.injectedSkillSources).toEqual([
-        {
-          kind: "tree",
-          sourceType: "builtin",
-          name: "bb-cli",
-          description: "Use bb-cli when server runtime tests run.",
-          treeHash: readSkillTreeManifest(builtinSourceRootPath).treeHash,
-          entryPath: "SKILL.md",
-        },
         {
           kind: "workspace-path",
           sourceType: "project",
@@ -852,18 +869,18 @@ describe("thread runtime config", () => {
           environmentId: environment.id,
           providerId,
         });
-        const execution = await resolveExecutionOptions(harness.deps, {
-          threadId: thread.id,
-          requestedExecution: {
+        const execution = await buildExecutionOptions(
+          harness.deps,
+          {
             model:
               providerId === "codex"
                 ? "gpt-5"
                 : providerId === "pi"
                   ? "pi-model"
                   : "claude-sonnet-4-6",
-            source: "client/turn/requested",
           },
-        });
+          { threadId: thread.id },
+        );
         return buildThreadStartCommand(harness.deps, {
           environment,
           execution,
@@ -878,8 +895,6 @@ describe("thread runtime config", () => {
         });
       }
 
-      // The default knobs each bridge receives when the user changed nothing.
-      // A wrong default here silently turns a provider feature off.
       const codex = await build("codex");
       expect(codex.options.providerOptions).toEqual({
         memoryEnabled: true,
@@ -891,12 +906,12 @@ describe("thread runtime config", () => {
 
       const claudeCode = await build("claude-code");
       expect(claudeCode.options.providerOptions).toEqual({
+        chromeEnabled: false,
         memoryEnabled: true,
         providerSubagentsEnabled: true,
         workflowsEnabled: true,
       });
 
-      // A provider that derives nothing still carries an explicit empty bag.
       const pi = await build("pi");
       expect(pi.options.providerOptions).toEqual({});
     });
@@ -906,6 +921,7 @@ describe("thread runtime config", () => {
     await withTestHarness(async (harness) => {
       const pluginId = "provider-hooked";
       const registration = buildPluginProviderRegistration({
+        iconHash: null,
         available: true,
         pluginId,
         declaration: validatePluginProviderDeclaration({
@@ -941,7 +957,10 @@ describe("thread runtime config", () => {
         pluginId,
         iconNames: new Set<string>(),
       });
-      harness.deps.pluginHostArtifacts.set(pluginId, stubHostArtifact(pluginId));
+      harness.deps.pluginHostArtifacts.set(
+        pluginId,
+        stubHostArtifact(pluginId),
+      );
 
       const { host } = seedHostSession(harness.deps, {
         id: "host-provider-hook",
@@ -1049,15 +1068,11 @@ describe("thread runtime config", () => {
       });
 
       expect(command.input).toEqual(input);
-      // The shared contract carries the BB prompt mode; the Claude plugin's
-      // hook maps it onto its own native flag inside the opaque bag.
       expect(command.options.promptMode).toBe("plan");
       expect(command.options.providerOptions).toMatchObject({
         claudeCodePermissionMode: "plan",
       });
 
-      // A provider that declares no plan action never sees the mode: the
-      // `/plan` text stays an ordinary mention.
       const piThread = seedThread(harness.deps, {
         projectId: project.id,
         environmentId: environment.id,
@@ -1109,31 +1124,22 @@ describe("thread runtime config", () => {
         reasoningLevelOverride: "high",
       });
 
-      // No model/reasoning in the request: the override sticks for this turn.
-      const execution = await resolveExecutionOptions(harness.deps, {
-        threadId: thread.id,
-        requestedExecution: { source: "client/turn/requested" },
-      });
+      const execution = await buildExecutionOptions(
+        harness.deps,
+        {},
+        { threadId: thread.id },
+      );
       expect(execution.model).toBe("claude-opus-4-8");
       expect(execution.reasoningLevel).toBe("high");
 
-      // An explicit per-turn request still wins over the sticky override.
-      const oneOff = await resolveExecutionOptions(harness.deps, {
-        threadId: thread.id,
-        requestedExecution: {
-          model: "claude-sonnet-4-6",
-          reasoningLevel: "low",
-          source: "client/turn/requested",
-        },
-      });
+      const oneOff = await buildExecutionOptions(
+        harness.deps,
+        { model: "claude-sonnet-4-6", reasoningLevel: "low" },
+        { threadId: thread.id },
+      );
       expect(oneOff.model).toBe("claude-sonnet-4-6");
       expect(oneOff.reasoningLevel).toBe("low");
     });
-  });
-
-  it("derives ask escalation only for user-initiated work", () => {
-    expect(resolvePermissionEscalation({ initiator: "user" })).toBe("ask");
-    expect(resolvePermissionEscalation({ initiator: "system" })).toBe("deny");
   });
 
   it("resolves the workspace, storage path, and environment directory dynamic tool", async () => {
@@ -1148,12 +1154,35 @@ describe("thread runtime config", () => {
         hostId,
         projectId: project.id,
         path: "/tmp/runtime-project-root",
+        environmentProviderId: "project-checkout",
       });
       const thread = seedThread(harness.deps, {
         projectId: project.id,
         environmentId: environment.id,
       });
 
+      const pluginContexts: Array<
+        Omit<PluginAgentConfigurationContext, "pluginMetadata">
+      > = [];
+      setPluginAgentContributions({
+        listSkillRootContributions: () => [],
+        listAgentTools: () => [],
+        listInstructionContributions: () => [],
+        findAgentTool: () => undefined,
+        invokeAgentTool: async () => ({
+          success: false,
+          contentItems: [{ type: "inputText", text: "unused" }],
+        }),
+        resolveMention: async () => ({ ok: false, error: "unused" }),
+        resolveAgentConfiguration: async (args) => {
+          pluginContexts.push(args.context);
+          return {
+            tools: [],
+            selectedSkillIdsByPlugin: new Map(),
+            dynamicInstructions: [],
+          };
+        },
+      });
       const runtimeConfig = await resolveThreadRuntimeCommandConfig(
         harness.deps,
         {
@@ -1164,16 +1193,15 @@ describe("thread runtime config", () => {
             id: environment.id,
             path: environment.path,
             status: environment.status,
-            workspaceProvisionType: environment.workspaceProvisionType,
           },
         },
       );
+      setPluginAgentContributions(undefined);
 
       expect(runtimeConfig.workspacePath).toBe("/tmp/runtime-project-root");
       expect(runtimeConfig.threadStoragePath).toBe(
         `/tmp/bb-host-data/${hostId}/thread-storage/${thread.id}`,
       );
-      expect(runtimeConfig.workspaceProvisionType).toBe("unmanaged");
       expect(runtimeConfig.dynamicTools).toEqual([
         expect.objectContaining({
           name: "update_environment_directory",
@@ -1182,14 +1210,17 @@ describe("thread runtime config", () => {
           }),
         }),
       ]);
-      expect(runtimeConfig.instructions).toContain(
+      expect(runtimeConfig.instructions).not.toContain(
         "You are working inside bb, an agentic IDE",
       );
-      expect(runtimeConfig.instructions).toContain("bb status");
-      expect(runtimeConfig.instructions).toContain("bb guide");
-      expect(runtimeConfig.instructions).toContain("Markdown links");
+      expect(runtimeConfig.instructions).not.toContain("bb status");
+      expect(runtimeConfig.instructions).not.toContain("bb guide");
+      expect(runtimeConfig.instructions).not.toContain("Markdown links");
       expect(runtimeConfig.instructions).toContain(
         "update_environment_directory",
+      );
+      expect(pluginContexts[0]?.environment.workspaceProvisionType).toBe(
+        "unmanaged",
       );
     });
   });
@@ -1233,13 +1264,12 @@ describe("thread runtime config", () => {
             id: environment.id,
             path: environment.path,
             status: environment.status,
-            workspaceProvisionType: environment.workspaceProvisionType,
           },
         },
       );
 
       expect(runtimeConfig.instructionMode).toBe("append");
-      expect(runtimeConfig.instructions).toContain(
+      expect(runtimeConfig.instructions).not.toContain(
         "You are working inside bb, an agentic IDE",
       );
       expect(runtimeConfig.instructions).toContain(
@@ -1555,7 +1585,6 @@ describe("thread runtime config", () => {
             id: environment.id,
             path: environment.path,
             status: environment.status,
-            workspaceProvisionType: environment.workspaceProvisionType,
           },
         },
       );
@@ -1580,8 +1609,6 @@ describe("thread runtime config", () => {
 
   describe("plugin contributeInstructions assembly", () => {
     afterEach(() => {
-      // withTestHarness rebinds this on each createApp; clear so a later
-      // isolated test doesn't see a leftover stub if harness cleanup races.
       setPluginAgentContributions(undefined);
     });
 
@@ -1669,7 +1696,6 @@ describe("thread runtime config", () => {
               id: environment.id,
               path: environment.path,
               status: environment.status,
-              workspaceProvisionType: environment.workspaceProvisionType,
             },
           },
         );
@@ -1753,7 +1779,6 @@ describe("thread runtime config", () => {
               id: environment.id,
               path: environment.path,
               status: environment.status,
-              workspaceProvisionType: environment.workspaceProvisionType,
             },
           },
         );
@@ -1775,7 +1800,6 @@ describe("thread runtime config", () => {
           'The following instructions come from the BB plugin "ok":',
         );
         expect(instructions).toContain("still contributes");
-        // Truncated to 4096 chars — the full 5000-x body must not appear.
         expect(instructions).not.toContain(longBody);
         expect(instructions).toContain("x".repeat(4096));
         expect(instructions).not.toContain("x".repeat(4097));

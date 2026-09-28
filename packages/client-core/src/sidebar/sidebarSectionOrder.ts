@@ -1,8 +1,4 @@
 import type { SidebarSectionId } from "./sidebarSectionId.js";
-import {
-  applyNeighborReorder,
-  buildNeighborReorderRequest,
-} from "./neighbor-reorder.js";
 
 type SidebarEntitySectionKind = "project" | "section" | "machine";
 export type LegacySidebarEntityAnchor = "projects" | "sections" | "machines";
@@ -24,28 +20,6 @@ function isSidebarSectionId(value: string): value is SidebarSectionId {
   );
 }
 
-interface ReorderSidebarSectionOrderArgs {
-  activeId: string;
-  overId: string;
-  order: readonly SidebarSectionId[];
-}
-
-export function reorderSidebarSectionOrder({
-  activeId,
-  overId,
-  order,
-}: ReorderSidebarSectionOrderArgs): SidebarSectionId[] | null {
-  if (!isSidebarSectionId(activeId) || !isSidebarSectionId(overId)) {
-    return null;
-  }
-  const items = order.map((id) => ({ id }));
-  const request = buildNeighborReorderRequest({ activeId, overId, items });
-  if (!request) return null;
-  return applyNeighborReorder({ items, request })
-    .map((item) => item.id)
-    .filter(isSidebarSectionId);
-}
-
 interface NormalizeSidebarSectionOrderArgs {
   storedOrder: readonly string[];
   entitySectionIds: readonly SidebarSectionId[];
@@ -54,13 +28,6 @@ interface NormalizeSidebarSectionOrderArgs {
   hasThreadsSection?: boolean;
 }
 
-/**
- * Reconciles locally persisted order with the live entity set. The old
- * aggregate section token is expanded in place, so existing users keep their
- * Pinned/primary/Threads layout when projects and sections become first-level
- * sections. New entities join after the last entity without disturbing a
- * user's explicit placement of built-in sections.
- */
 export function normalizeSidebarSectionOrder({
   storedOrder,
   entitySectionIds,

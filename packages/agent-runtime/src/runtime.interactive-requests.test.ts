@@ -1,3 +1,4 @@
+import { RuntimeToolCalls } from "./runtime-provider-requests.js";
 import { spawn, type ChildProcess } from "node:child_process";
 import { mkdtempSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
@@ -37,7 +38,6 @@ function readChildStdoutLine(child: ChildProcess): Promise<string> {
   });
 }
 
-/** A canonical command-approval `interaction/request`, as a bridge sends it. */
 function commandApprovalRequest(
   id: number,
   overrides: { turnId?: string | null } = {},
@@ -75,11 +75,6 @@ const deniedEscalationOptions = {
   permissionEscalation: "deny",
 } as const;
 
-/**
- * Drive `handleRuntimeProviderRequest` directly: the real bridge-protocol
- * adapter decodes the request and a pipe child echoes the runtime's answer
- * back so the test can read exactly what the bridge would receive.
- */
 async function answerDirectRequest(args: {
   rawRequest: JsonRpcMessage;
   handshake?: Record<string, unknown>;
@@ -99,7 +94,6 @@ async function answerDirectRequest(args: {
     additionalWorkspaceWriteRoots: [],
     bridgeLaunch: createScriptedEchoLaunch(),
   });
-  // The handshake decides where approval policy is enforced.
   const [initialize] = adapter.buildPostInitializeRequests();
   initialize?.onResult({
     protocolVersion: 2,
@@ -111,6 +105,7 @@ async function answerDirectRequest(args: {
   }
   try {
     handleRuntimeProviderRequest({
+      toolCalls: new RuntimeToolCalls(),
       getActiveTurnId: args.getActiveTurnId ?? (() => "bb-turn-1"),
       getThreadExecutionOptions:
         args.getThreadExecutionOptions ?? (() => undefined),
@@ -179,8 +174,6 @@ describe("createAgentRuntime interactive requests", () => {
       runtime,
       threadId: "t1",
     });
-    // The allow reached the bridge as the canonical resolution: the scripted
-    // turn resumes with its answer instead of "Denied".
     await waitForThreadAgentMessageText({
       events,
       providerId: "fake",
@@ -190,6 +183,7 @@ describe("createAgentRuntime interactive requests", () => {
     });
 
     expect(requests).toHaveLength(1);
+    expect(turnId).not.toBe("turn-1");
     expect(requests[0]).toMatchObject({
       threadId: "t1",
       turnId,
@@ -197,9 +191,71 @@ describe("createAgentRuntime interactive requests", () => {
       providerThreadId,
       payload: {
         kind: "approval",
-        subject: { kind: "command", command: "echo hi" },
+        subject: { kind: "command", command: "echo hi", sessionGrant: null },
+        reason: null,
+        availableDecisions: ["allow_once", "allow_for_session", "deny"],
       },
     });
+    expect(events).not.toContainEqual(
+      expect.objectContaining({
+        type: "item/completed",
+        item: expect.objectContaining({ type: "agentMessage", text: "Denied" }),
+      }),
+    );
+    await runtime.shutdown();
+  });
+
+  it("completes the turn with Denied when the user denies the approval", async () => {
+    const requests: PendingInteractionCreate[] = [];
+    const events: ThreadEvent[] = [];
+    const runtime = createScriptedEchoRuntime({
+      runtime: {
+        workspacePath: tmpDir,
+        onEvent: (event) => events.push(event),
+        onInteractiveRequest: async (request) => {
+          requests.push(request);
+          return { decision: "deny" };
+        },
+      },
+    });
+
+    await runtime.startThread({
+      environmentId: "env-1",
+      threadId: "t1",
+      projectId: "p1",
+      providerId: "fake",
+      options: fullRuntimeOptions,
+    });
+    await runtime.runTurn({
+      clientRequestId: "creq_222222224i",
+      threadId: "t1",
+      input: [promptTextInput({ text: "approve:command hello" })],
+      options: fullRuntimeOptions,
+    });
+    await waitForThreadTurnCompleted({
+      events,
+      providerId: "fake",
+      runtime,
+      threadId: "t1",
+    });
+    await waitForThreadAgentMessageText({
+      events,
+      providerId: "fake",
+      runtime,
+      text: "Denied",
+      threadId: "t1",
+    });
+
+    expect(requests).toHaveLength(1);
+    expect(events).not.toContainEqual(
+      expect.objectContaining({
+        type: "item/completed",
+        item: expect.objectContaining({
+          type: "agentMessage",
+          text: "Response to: approve:command hello",
+        }),
+      }),
+    );
     await runtime.shutdown();
   });
 
@@ -253,8 +309,6 @@ describe("createAgentRuntime interactive requests", () => {
       input: [promptTextInput({ text: "approve:command denied" })],
       options: deniedEscalationOptions,
     });
-    // The runtime answered the bridge with a denial itself; the handler
-    // never saw the request and the scripted turn resumed denied.
     await waitForThreadAgentMessageText({
       events,
       providerId: "fake",
@@ -274,9 +328,6 @@ describe("createAgentRuntime interactive requests", () => {
         grantedPermissions: null,
       }),
     );
-    // The bridge's handshake says the provider already enforced the policy
-    // before forwarding: the runtime must hand the request to the user even
-    // though the thread's current settings would auto-deny it.
     const answer = await answerDirectRequest({
       rawRequest: commandApprovalRequest(78),
       handshake: { approvalEnforcedBy: "provider" },
@@ -289,6 +340,23 @@ describe("createAgentRuntime interactive requests", () => {
       result: { decision: "allow_once" },
     });
     expect(onInteractiveRequest).toHaveBeenCalledTimes(1);
+    expect(onInteractiveRequest).toHaveBeenCalledWith(
+      expect.objectContaining({
+        payload: {
+          kind: "approval",
+          subject: {
+            kind: "command",
+            itemId: "item-1",
+            command: "git push",
+            cwd: "/tmp/project",
+            actions: [],
+            sessionGrant: null,
+          },
+          reason: "Needs approval",
+          availableDecisions: ["allow_once", "allow_for_session", "deny"],
+        },
+      }),
+    );
   });
 
   it("reaches the user through a provider-enforcing bridge end to end", async () => {
@@ -362,8 +430,6 @@ describe("createAgentRuntime interactive requests", () => {
       providerId: "fake",
       options: deniedEscalationOptions,
     });
-    // Escalation policy governs approvals only: a question is never
-    // auto-denied, it always reaches the user.
     await runtime.runTurn({
       clientRequestId: "creq_222222224m",
       threadId: "t1",
@@ -455,7 +521,6 @@ describe("createAgentRuntime interactive requests", () => {
       runtime,
       threadId: "t1",
     });
-    // The bridge received the error answer and surfaced it as a failed turn.
     expect(events).toContainEqual(
       expect.objectContaining({
         type: "provider/error",
@@ -474,8 +539,6 @@ describe("createAgentRuntime interactive requests", () => {
   });
 
   it("forwards a plugin-defined request even under a deny escalation and returns its answer", async () => {
-    // A request is open: no policy auto-answers it, so a deny escalation that
-    // would auto-deny an approval still reaches the handler.
     const onInteractiveRequest = vi.fn(
       async (): Promise<PendingInteractionResolution> => ({
         kind: "request_answer",
@@ -548,7 +611,6 @@ describe("createAgentRuntime interactive requests", () => {
   });
 
   it("responds to unsupported interactive requests with a JSON-RPC error instead of dropping them", async () => {
-    // A request method outside the bridge protocol's inbound vocabulary.
     const answer = await answerDirectRequest({
       rawRequest: {
         jsonrpc: "2.0",
@@ -565,7 +627,6 @@ describe("createAgentRuntime interactive requests", () => {
   });
 
   it("responds to invalid interactive request params with a JSON-RPC invalid params error", async () => {
-    // The right method, a payload the canonical schema refuses.
     const answer = await answerDirectRequest({
       rawRequest: {
         jsonrpc: "2.0",

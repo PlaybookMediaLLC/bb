@@ -1,21 +1,18 @@
-// Providers and models the demo offers in its pickers. Typed against
-// @bb/domain, the same types the real server fills at its boundary.
-//
-// The three built-in providers and a short Codex model list are enough for
-// the composer and the settings screens to render; nothing here runs.
-
 import type { AvailableModel, ProviderInfo } from "@bb/domain";
 import type { SystemExecutionOptionsResponse } from "@bb/server-contract";
 
 function provider(
   info: Pick<
     ProviderInfo,
-    "id" | "displayName" | "capabilities" | "composerActions"
+    | "id"
+    | "displayName"
+    | "capabilities"
+    | "composerActions"
+    | "completedTurnDisplay"
   >,
 ): ProviderInfo {
   return {
     ...info,
-    // Demo fixtures: the first-party plugin ids follow `provider-<id>`.
     pluginId: `provider-${info.id}`,
     available: true,
     logoUrl: `/api/v1/system/providers/${info.id}/logo`,
@@ -51,6 +48,7 @@ export const PROVIDERS: readonly ProviderInfo[] = [
         command: { trigger: "/", name: "goal", trailingText: " " },
       },
     ],
+    completedTurnDisplay: "collapse",
   }),
   provider({
     id: "claude-code",
@@ -66,6 +64,7 @@ export const PROVIDERS: readonly ProviderInfo[] = [
       modelCatalogScope: "workspace",
     },
     composerActions: [SKILLS_ACTION, PLAN_ACTION],
+    completedTurnDisplay: "flat",
   }),
   provider({
     id: "pi",
@@ -81,6 +80,7 @@ export const PROVIDERS: readonly ProviderInfo[] = [
       modelCatalogScope: "workspace",
     },
     composerActions: [SKILLS_ACTION],
+    completedTurnDisplay: "collapse",
   }),
 ];
 

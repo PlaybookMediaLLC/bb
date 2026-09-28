@@ -1,7 +1,11 @@
 import { createHash } from "node:crypto";
 import { createFakePluginHost } from "@get-bb/plugin-sdk/testing";
 import { describe, expect, it } from "vitest";
-import { createTasksStore, TasksPageCursorError } from "./db";
+import {
+  createTasksStore,
+  type CreatePresetInput,
+  TasksPageCursorError,
+} from "./db";
 
 function setup() {
   const { bb, harness } = createFakePluginHost({ pluginId: "tasks-db-test" });
@@ -54,10 +58,9 @@ describe("tasks storage", () => {
       createTasksStore(db);
       expect(
         db
-          .prepare<
-            [],
-            { count: number }
-          >("SELECT COUNT(*) AS count FROM schema_version")
+          .prepare<[], { count: number }>(
+            "SELECT COUNT(*) AS count FROM schema_version",
+          )
           .get()?.count,
       ).toBe(6);
     } finally {
@@ -204,14 +207,11 @@ describe("tasks storage", () => {
         movedProjectIds: [filed.id],
         movedFolderIds: [child.id],
       });
-      // ON DELETE SET NULL re-parents rather than cascades.
       expect(store.getFolder(child.id)?.parentFolderId).toBeNull();
       expect(store.getProject(filed.id)?.folderId).toBeNull();
       expect(store.getProject(elsewhere.id)?.folderId).toBe(other.id);
       expect(store.getTask(task.id)?.projectId).toBe(filed.id);
 
-      // A second delete finds no row and must not claim to have moved the
-      // children the first delete already unfiled.
       expect(store.deleteFolder(parent.id)).toEqual({
         deleted: false,
         movedProjectIds: [],
@@ -324,6 +324,35 @@ describe("tasks storage", () => {
           activeOnly: true,
         }),
       ).toEqual([active]);
+    } finally {
+      await harness.dispose();
+    }
+  });
+
+  it("finds all search terms without requiring their input order", async () => {
+    const { harness, store } = setup();
+    try {
+      const project = createProject(store, "SRC");
+      const matching = store.createTask({
+        projectId: project.id,
+        title: "Deployment readiness review",
+      });
+      store.createTask({
+        projectId: project.id,
+        title: "Deployment schedule",
+      });
+      store.createTask({
+        projectId: project.id,
+        title: "Readiness checklist",
+      });
+
+      const matchingKeys = (search: string) =>
+        store
+          .listTasks({ projectId: project.id, search })
+          .map((task) => task.key);
+
+      expect(matchingKeys("deployment readiness")).toEqual([matching.key]);
+      expect(matchingKeys("readiness deployment")).toEqual([matching.key]);
     } finally {
       await harness.dispose();
     }
@@ -671,8 +700,6 @@ describe("tasks storage", () => {
         });
         setAttachedAt.run(attachedAt, row.id);
       };
-      // An orchestrator respawns workers: the dead predecessors are the
-      // oldest rows, the live replacement is the newest.
       attach("thr_dead_first", "failed", "2026-07-15T09:00:00.000Z");
       attach("thr_live_old", "idle", "2026-07-15T10:00:00.000Z");
       attach("thr_dead_later", "completed", "2026-07-15T11:00:00.000Z");
@@ -687,7 +714,6 @@ describe("tasks storage", () => {
         "thr_dead_first",
       ]);
 
-      // Detaching removes exactly that (task, thread) row.
       const detached = store.getTaskThreadByThreadId(task.id, "thr_dead_first");
       expect(store.deleteTaskThread(detached!.id)).toBe(true);
       expect(
@@ -752,7 +778,6 @@ describe("tasks storage", () => {
         body: "Earlier reply",
       });
       const later = store.createComment({
-        // Deliberately lexicographically smaller than the earlier ID.
         id: "01H00000000000000000000001",
         taskId: task.id,
         kind: "agent",
@@ -783,14 +808,14 @@ describe("tasks storage", () => {
   it("rejects duplicate preset names", async () => {
     const { harness, store } = setup();
     try {
-      const preset = {
+      const preset: CreatePresetInput = {
         name: "Default",
         providerId: "openai",
         modelId: "gpt-5",
         reasoningLevel: "high",
         serviceTier: null,
         permissionMode: "accept-edits",
-        environmentKind: "project-default" as const,
+        environmentKind: "project-default",
         baseBranch: null,
         machineId: null,
         instructions: "Work the task.",

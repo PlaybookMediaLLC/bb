@@ -3,8 +3,8 @@ import { cleanup, fireEvent, waitFor } from "@testing-library/react";
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
 import { loadPluginApp, renderSlot } from "@get-bb/plugin-sdk/testing/app";
 import type { Task } from "../../shared/contract.js";
+import { makeTask, rpcInput } from "../../test-fixtures.js";
 
-// jsdom lacks ResizeObserver; cmdk's list observes its size on mount.
 if (!globalThis.ResizeObserver) {
   globalThis.ResizeObserver = class {
     observe() {}
@@ -13,12 +13,10 @@ if (!globalThis.ResizeObserver) {
   };
 }
 
-// jsdom lacks scrollIntoView; cmdk calls it to keep the active item in view.
 if (!Element.prototype.scrollIntoView) {
   Element.prototype.scrollIntoView = () => {};
 }
 
-// jsdom lacks matchMedia; the vendored Dialog's responsive root needs it.
 if (!window.matchMedia) {
   window.matchMedia = (query: string) => ({
     matches: false,
@@ -32,8 +30,6 @@ if (!window.matchMedia) {
   });
 }
 
-// loadPluginApp installs the fake SDK runtime; nothing SDK-touching may be
-// imported before it runs.
 const app = await loadPluginApp(() => import("../../app"));
 const { derivePrefix } = await import("./shared.js");
 const { describePresetEnvironment, savePresetDraft } =
@@ -56,7 +52,7 @@ const project = {
 };
 
 function createdTask(input: Record<string, unknown>): Task {
-  return {
+  return makeTask({
     id: TASK_ID,
     projectId: PROJECT_ID,
     number: 5,
@@ -68,10 +64,8 @@ function createdTask(input: Record<string, unknown>): Task {
     dueDate: (input.dueDate as string | null) ?? null,
     parentTaskId: (input.parentTaskId as string | null) ?? null,
     position: 1,
-    createdAt: "2026-07-15T00:00:00.000Z",
-    updatedAt: "2026-07-15T00:00:00.000Z",
     labelIds: (input.labelIds as string[]) ?? [],
-  };
+  });
 }
 
 describe("derivePrefix", () => {
@@ -79,7 +73,6 @@ describe("derivePrefix", () => {
     expect(derivePrefix("Tasks Plugin")).toBe("TP");
     expect(derivePrefix("Connect")).toBe("CON");
     expect(derivePrefix("home-lab v2")).toBe("HLV");
-    // Prefixes must start with a letter and stay within 10 chars.
     expect(derivePrefix("2fa Rollout")).toBe("R");
     expect(derivePrefix("123")).toBe("");
     expect(derivePrefix("a b c d e f g h i j k l")).toHaveLength(10);
@@ -87,6 +80,66 @@ describe("derivePrefix", () => {
 });
 
 describe("NewTaskDialog", () => {
+  it.each([
+    {
+      name: "Ctrl+Enter in title",
+      field: "Task title",
+      ctrlKey: true,
+      metaKey: false,
+    },
+    {
+      name: "Meta+Enter in title",
+      field: "Task title",
+      ctrlKey: false,
+      metaKey: true,
+    },
+    {
+      name: "Enter in title",
+      field: "Task title",
+      ctrlKey: false,
+      metaKey: false,
+    },
+    {
+      name: "Ctrl+Enter in due date",
+      field: "Due date",
+      ctrlKey: true,
+      metaKey: false,
+    },
+  ])("submits exactly once for $name", async ({ field, ctrlKey, metaKey }) => {
+    const createCalls: Array<Record<string, unknown>> = [];
+    const slot = renderSlot(
+      app.navPanels[0]!,
+      { subPath: PROJECT_ID },
+      {
+        rpc: {
+          listProjects: () => ({ projects: [project] }),
+          listFolders: () => ({ folders: [] }),
+          listPresets: () => ({ presets: [] }),
+          sidebarSummary: () => ({ projects: [] }),
+          listTasks: () => ({ tasks: [] }),
+          listLabels: () => ({ labels: [] }),
+          createTask: (raw: unknown) => {
+            const input = rpcInput(raw);
+            createCalls.push(input);
+            return { ok: true, task: createdTask(input) };
+          },
+        },
+      },
+    );
+    fireEvent.click(await slot.findByRole("button", { name: /New task/ }));
+    fireEvent.change(await slot.findByLabelText("Task title"), {
+      target: { value: "Keyboard submission" },
+    });
+    fireEvent.keyDown(slot.getByLabelText(field), {
+      key: "Enter",
+      ctrlKey,
+      metaKey,
+    });
+    await waitFor(() => expect(slot.navigateCalls).not.toHaveLength(0));
+    expect(createCalls).toHaveLength(1);
+    expect(createCalls[0]).toMatchObject({ title: "Keyboard submission" });
+  });
+
   it("creates a task in the route's project with column defaults and navigates to it", async () => {
     const createCalls: Array<Record<string, unknown>> = [];
     const slot = renderSlot(
@@ -100,7 +153,8 @@ describe("NewTaskDialog", () => {
           sidebarSummary: () => ({ projects: [] }),
           listTasks: () => ({ tasks: [] }),
           listLabels: () => ({ labels: [] }),
-          createTask: (input: Record<string, unknown>) => {
+          createTask: (raw: unknown) => {
+            const input = rpcInput(raw);
             createCalls.push(input);
             return { ok: true, task: createdTask(input) };
           },
@@ -144,7 +198,8 @@ describe("NewTaskDialog", () => {
           sidebarSummary: () => ({ projects: [] }),
           listTasks: () => ({ tasks: [] }),
           listLabels: () => ({ labels: [] }),
-          createTask: (input: Record<string, unknown>) => {
+          createTask: (raw: unknown) => {
+            const input = rpcInput(raw);
             createCalls.push(input);
             return { ok: true, task: createdTask(input) };
           },
@@ -157,7 +212,6 @@ describe("NewTaskDialog", () => {
     fireEvent.change(title, { target: { value: "First" } });
     fireEvent.click(slot.getByRole("button", { name: "Create task" }));
     await waitFor(() => expect(createCalls).toHaveLength(1));
-    // Still open, title cleared, no navigation away.
     expect((slot.getByLabelText("Task title") as HTMLInputElement).value).toBe(
       "",
     );
@@ -192,7 +246,6 @@ describe("NewTaskDialog", () => {
     });
     fireEvent.click(slot.getByRole("button", { name: "Create task" }));
     await slot.findByText("Sub-tasks cannot have their own sub-tasks");
-    // Dialog stays open for correction.
     expect(slot.getByLabelText("Task title")).toBeDefined();
   });
 
@@ -208,8 +261,6 @@ describe("NewTaskDialog", () => {
           listPresets: () => ({ presets: [] }),
           sidebarSummary: () => ({ projects: [] }),
           listTasks: () => ({ tasks: [] }),
-          // An existing label so cmdk renders its empty state (not the
-          // no-labels-at-all fallback) when the query matches nothing.
           listLabels: () => ({
             labels: [
               {
@@ -220,7 +271,8 @@ describe("NewTaskDialog", () => {
               },
             ],
           }),
-          createLabel: (input: Record<string, unknown>) => {
+          createLabel: (raw: unknown) => {
+            const input = rpcInput(raw);
             createLabelCalls.push(input);
             return {
               label: {
@@ -242,8 +294,6 @@ describe("NewTaskDialog", () => {
     const createBtn = await slot.findByRole("button", {
       name: /Create .*dank/,
     });
-    // Regression guard (BB-11): the actionable create row must not inherit the
-    // empty-state's tall centered padding — that produced the "insane" gap.
     const emptyContainer = createBtn.closest("[cmdk-empty]");
     expect(emptyContainer).not.toBeNull();
 
@@ -259,7 +309,6 @@ describe("NewTaskDialog", () => {
 describe("NewTaskDialog attachments", () => {
   const fetchCalls: string[] = [];
   const failFileNames = new Set<string>();
-  /** When set, uploads of this fileName stall until the promise resolves. */
   let uploadGate: { fileName: string; promise: Promise<void> } | null = null;
   const originalFetch = globalThis.fetch;
 
@@ -306,9 +355,9 @@ describe("NewTaskDialog attachments", () => {
     sidebarSummary: () => ({ projects: [] }),
     listTasks: () => ({ tasks: [] }),
     listLabels: () => ({ labels: [] }),
-    createTask: (input: Record<string, unknown>) => ({
+    createTask: (input: unknown) => ({
       ok: true,
-      task: createdTask(input),
+      task: createdTask(rpcInput(input)),
     }),
   });
 
@@ -335,7 +384,6 @@ describe("NewTaskDialog attachments", () => {
     pasteFile(titleInput, new File(["png"], "shot.png", { type: "image/png" }));
     await slot.findByText("shot.png");
 
-    // Picker path: stage a second file, then remove it before creating.
     const picker =
       document.querySelector<HTMLInputElement>('input[type="file"]')!;
     fireEvent.change(picker, {
@@ -355,7 +403,6 @@ describe("NewTaskDialog attachments", () => {
         options: { subPath: "task/TSK-5" },
       }),
     );
-    // Only the still-staged file uploaded, to the freshly created task.
     expect(fetchCalls).toHaveLength(1);
     const query = new URL(fetchCalls[0]!, "http://bb.test").searchParams;
     expect(query.get("taskId")).toBe(TASK_ID);
@@ -382,8 +429,6 @@ describe("NewTaskDialog attachments", () => {
     expect(alert.textContent).toContain(
       "was created, but 1 attachment failed to upload",
     );
-    // The task exists but the dialog stays open; nothing navigated away and
-    // the successful chip left the tray.
     expect(slot.navigateCalls).toEqual([]);
     expect(slot.queryByText("good.png")).toBeNull();
 
@@ -419,7 +464,6 @@ describe("NewTaskDialog attachments", () => {
       chip.closest("span")?.parentElement?.getAttribute("title"),
     ).toContain("Over the 25 MB attachment limit");
 
-    // The rejected chip blocks creation instead of being silently dropped.
     await slot.findByText(/Remove attachments over the 25 MB limit/);
     const createButton = slot.getByRole("button", {
       name: "Create task",
@@ -458,7 +502,6 @@ describe("NewTaskDialog attachments", () => {
     fireEvent.click(slot.getByRole("button", { name: "Create task" }));
     await waitFor(() => expect(fetchCalls).toHaveLength(1));
 
-    // The submit pass snapshots the tray: staging and removal are locked.
     pasteFile(titleInput, new File(["y"], "late.txt", { type: "text/plain" }));
     expect(slot.queryByText("late.txt")).toBeNull();
     const removeButton = slot.getByRole("button", {
@@ -495,8 +538,6 @@ describe("NewTaskDialog attachments", () => {
     fireEvent.click(slot.getByRole("button", { name: "Create task" }));
     await slot.findByRole("alert");
 
-    // Escape (and any other onOpenChange-driven dismissal) is swallowed while
-    // failed chips remain; only the explicit skip action leaves.
     fireEvent.keyDown(document.body, { key: "Escape" });
     expect(slot.getByRole("alert")).toBeDefined();
     expect(slot.navigateCalls).toEqual([]);
@@ -586,7 +627,6 @@ describe("describePresetEnvironment", () => {
         MACHINES,
       ),
     ).toBe("Worktree · default · default");
-    // A machine deleted after the preset was created still identifies itself.
     expect(
       describePresetEnvironment(
         presetRow({ machineId: "mach_gone" }) as never,
@@ -641,8 +681,6 @@ describe("savePresetDraft", () => {
 
   it("nulls stale targets when the kind is project-default", async () => {
     const { calls, rpc } = captureRpc();
-    // Stale branch/machine left in the draft must never reach the contract,
-    // which rejects them for project-default presets.
     await savePresetDraft(rpc, presetRow() as never, {
       ...draft,
       environmentKind: "project-default",
@@ -697,7 +735,6 @@ describe("PresetDialog environment section", () => {
   it("shows the environment column and hydrates a worktree preset", async () => {
     const slot = renderManagePresets([presetRow({ reasoningLevel: "ultra" })]);
     fireEvent.mouseDown(await slot.findByRole("tab", { name: "Presets" }));
-    // Manage table resolves the machine name via listMachines.
     await slot.findByText("Worktree · main · Sawyer Air");
     fireEvent.click(
       slot.getByRole("button", { name: "Edit preset FB3 BE live worktree" }),
@@ -746,7 +783,8 @@ describe("PresetDialog environment section", () => {
   it("saves the host picker's provider, model, reasoning, and tier together", async () => {
     const updates: Array<Record<string, unknown>> = [];
     const slot = renderManagePresets([presetRow()], {
-      updatePreset: (input: Record<string, unknown>) => {
+      updatePreset: (raw: unknown) => {
+        const input = rpcInput(raw);
         updates.push(input);
         return { preset: { ...presetRow(), ...input } };
       },
@@ -836,7 +874,6 @@ describe("Manage folders", () => {
       await slot.findByRole("button", { name: "Delete folder bb" }),
     );
 
-    // Nothing is destroyed: the schema re-parents the folder's contents.
     await slot.findByText(
       "1 project and 1 subfolder move to the top level. No tasks are deleted.",
     );
@@ -870,14 +907,10 @@ describe("Manage folders", () => {
       await slot.findByRole("button", { name: "Delete folder bb" }),
     );
 
-    // Folders are in, projects are not: the dialog must not claim the folder
-    // is empty, and confirming is blocked until the impact is known.
     await slot.findByText("Checking what the folder contains…");
     expect(slot.queryByText(/The folder is empty/)).toBeNull();
-    const confirm = slot.getByRole<HTMLButtonElement>("button", {
-      name: "Delete folder",
-    });
-    expect(confirm.disabled).toBe(true);
+    const confirm = slot.getByRole("button", { name: "Delete folder" });
+    expect(confirm).toHaveProperty("disabled", true);
     fireEvent.click(confirm);
     expect(deleteCalls).toHaveLength(0);
 
@@ -887,9 +920,8 @@ describe("Manage folders", () => {
     );
     await waitFor(() =>
       expect(
-        slot.getByRole<HTMLButtonElement>("button", { name: "Delete folder" })
-          .disabled,
-      ).toBe(false),
+        slot.getByRole("button", { name: "Delete folder" }),
+      ).toHaveProperty("disabled", false),
     );
     fireEvent.click(slot.getByRole("button", { name: "Delete folder" }));
     await waitFor(() => expect(deleteCalls).toHaveLength(1));
@@ -908,15 +940,13 @@ describe("Manage folders", () => {
     await slot.findByText(
       "Could not load the folder's contents: projects unavailable",
     );
-    expect(
-      slot.getByRole<HTMLButtonElement>("button", { name: "Delete folder" })
-        .disabled,
-    ).toBe(true);
+    expect(slot.getByRole("button", { name: "Delete folder" })).toHaveProperty(
+      "disabled",
+      true,
+    );
   });
 
   it("blocks deleting on stale rows after a refresh fails", async () => {
-    // useTasksQuery keeps the rows it had when a same-scope refetch fails, so
-    // the dialog would otherwise count the cached (possibly stale) projects.
     let projectsUnavailable = false;
     const deleteCalls: Array<Record<string, unknown>> = [];
     const slot = renderFolders({
@@ -930,7 +960,6 @@ describe("Manage folders", () => {
       },
     });
     fireEvent.mouseDown(await slot.findByRole("tab", { name: "Folders" }));
-    // First load succeeds and the impact is known.
     fireEvent.click(
       await slot.findByRole("button", { name: "Delete folder bb" }),
     );
@@ -939,7 +968,6 @@ describe("Manage folders", () => {
     );
     fireEvent.click(slot.getByRole("button", { name: "Cancel" }));
 
-    // A later refresh fails; the cached rows stay but are no longer trusted.
     projectsUnavailable = true;
     await slot.behavior.emitRealtime("projects:changed", {
       projectId: PROJECT_ID,
@@ -951,10 +979,8 @@ describe("Manage folders", () => {
       "Could not load the folder's contents: projects unavailable",
     );
     expect(slot.queryByText(/move to the top level/)).toBeNull();
-    const confirm = slot.getByRole<HTMLButtonElement>("button", {
-      name: "Delete folder",
-    });
-    expect(confirm.disabled).toBe(true);
+    const confirm = slot.getByRole("button", { name: "Delete folder" });
+    expect(confirm).toHaveProperty("disabled", true);
     fireEvent.click(confirm);
     expect(deleteCalls).toHaveLength(0);
   });
@@ -996,8 +1022,6 @@ describe("Manage folders", () => {
     fireEvent.click(slot.getByRole("button", { name: "Delete folder" }));
     const alert = await slot.findByRole("alert");
     expect(alert.textContent).toBe("Folder “archive” was already deleted.");
-    // The server publishes nothing for a no-op delete, so the panel refetches
-    // on its own to drop the row another client removed.
     await waitFor(() => expect(folderCalls).toBeGreaterThan(callsBeforeDelete));
   });
 });
@@ -1057,12 +1081,10 @@ describe("NewProjectDialog", () => {
     fireEvent.click(await slot.findByRole("button", { name: /New project/ }));
     const prefix = slot.getByPlaceholderText("TSK");
     fireEvent.change(prefix, { target: { value: "9x" } });
-    // Input is uppercased; leading digit violates the prefix rule.
     expect((prefix as HTMLInputElement).value).toBe("9X");
     await slot.findByText(
       "Use 1–10 uppercase letters and digits, starting with a letter.",
     );
-    // Create stays disabled while invalid.
     expect(
       (
         slot.getByRole("button", {

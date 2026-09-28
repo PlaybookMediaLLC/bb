@@ -2,7 +2,10 @@ import { useMemo } from "react";
 import { useQueries } from "@tanstack/react-query";
 import type { Host } from "@bb/domain";
 import type { ProviderCliStatusResponse } from "@bb/host-daemon-contract";
-import type { SystemVersionResponse } from "@bb/server-contract";
+import type {
+  SystemAppUpdateStatus,
+  SystemVersionResponse,
+} from "@bb/server-contract";
 import type { BbDesktopInfo } from "@bb/desktop-contract";
 import {
   buildProviderCliIssue,
@@ -11,6 +14,8 @@ import {
   providerCliEntries,
   type ProviderCliIssue,
 } from "@/components/provider-cli/provider-cli-install";
+import { hasActionableNpmAppUpdate } from "@/components/app-update/app-update-presentation";
+import { useAppUpdateStatus } from "@/hooks/queries/app-update-queries";
 import { useDesktopUpdateInfo } from "@/hooks/useDesktopUpdateInfo";
 import { usePluginList } from "@/hooks/queries/plugin-settings-queries";
 import { pluginsNeedingAttention } from "@/hooks/usePluginAttention";
@@ -27,18 +32,11 @@ import { sdk } from "@/lib/sdk";
 export interface UpdateInventoryMachine {
   host: Host;
   isPrimary: boolean;
-  /** Null while the host is offline or its status is still loading. */
   providerStatus: ProviderCliStatusResponse | null;
   statusPending: boolean;
   statusError: boolean;
-  /**
-   * A re-check is in flight. Distinct from `statusPending`: a query that has
-   * already errored stays in the error status while it refetches, so the row's
-   * Retry needs this to show it is working.
-   */
   statusFetching: boolean;
   issues: ProviderCliIssue[];
-  /** Daemon stuck on an old protocol version; the server can force a retry. */
   canRetryDaemonUpdate: boolean;
 }
 
@@ -46,22 +44,12 @@ export interface UpdateInventory {
   isLoading: boolean;
   systemVersion: SystemVersionResponse | undefined;
   desktopInfo: BbDesktopInfo | null;
-  /** bb-app (web/npm) has a newer release on the registry. */
   appUpdateAvailable: boolean;
-  /** Desktop shell downloaded an update; a relaunch applies it. */
   desktopUpdateReady: boolean;
   machines: UpdateInventoryMachine[];
-  /** Enabled plugins that are not running (incompatible, error, missing). */
   pluginAttentionCount: number;
-  /** Count of things a user can act on right now. */
   actionableCount: number;
   hasAttention: boolean;
-  /**
-   * Epoch ms when the oldest source in the current inventory was last checked.
-   * Null until the app and every connected machine have returned a result.
-   * Using the oldest source prevents one fresh response from making stale
-   * machine data look current.
-   */
   lastCheckedAt: number | null;
 }
 
@@ -69,7 +57,6 @@ interface UseUpdateInventoryOptions {
   enabled?: boolean;
 }
 
-/** Build the per-machine provider inventory once at the query boundary. */
 export function buildUpdateInventoryProviderIssues(
   providerStatus: ProviderCliStatusResponse,
 ): ProviderCliIssue[] {
@@ -78,18 +65,30 @@ export function buildUpdateInventoryProviderIssues(
     .filter(isProviderCliIssue);
 }
 
-/**
- * One consolidated view of every update bb knows about: the bb app itself
- * (npm registry / desktop feed) plus provider CLIs on every connected
- * machine. Remote daemons follow the server version automatically via
- * protocol self-update. Per-machine bb rows show that automatic handoff while
- * it is running, then offer manual recovery only if the update stalls.
- */
+export function resolveAppUpdateAvailable(args: {
+  appUpdate: SystemAppUpdateStatus | undefined;
+  isDesktop: boolean;
+  systemVersion: SystemVersionResponse | undefined;
+}): boolean {
+  if (hasActionableNpmAppUpdate(args.appUpdate)) return true;
+  return (
+    !args.isDesktop &&
+    args.systemVersion !== undefined &&
+    !args.systemVersion.isDevelopment &&
+    args.systemVersion.updateAvailable
+  );
+}
+
+export function updateInventoryHosts(hosts: readonly Host[]): Host[] {
+  return hosts.filter((host) => host.type !== "ephemeral");
+}
+
 export function useUpdateInventory(
   options?: UseUpdateInventoryOptions,
 ): UpdateInventory {
   const enabled = options?.enabled ?? true;
   const systemVersionQuery = useSystemVersion({ enabled });
+  const appUpdateStatusQuery = useAppUpdateStatus({ enabled });
   const systemConfigQuery = useSystemConfig({ enabled });
   const hostsQuery = useHosts({ enabled });
   const { desktopInfo, isDesktop } = useDesktopUpdateInfo();
@@ -98,9 +97,9 @@ export function useUpdateInventory(
   ).length;
 
   const hosts = useMemo(() => hostsQuery.data ?? [], [hostsQuery.data]);
-  const connectedHosts = useMemo(
-    () => hosts.filter((host) => host.status === "connected"),
-    [hosts],
+  const updateHosts = updateInventoryHosts(hosts);
+  const connectedHosts = updateHosts.filter(
+    (host) => host.status === "connected",
   );
   const primaryHostId =
     selectPrimaryHost(hosts, systemConfigQuery.data?.primaryHostId ?? null)
@@ -126,7 +125,7 @@ export function useUpdateInventory(
     }
   });
 
-  const machines: UpdateInventoryMachine[] = hosts.map((host) => {
+  const machines: UpdateInventoryMachine[] = updateHosts.map((host) => {
     const statusQuery = providerStatusByHostId.get(host.id);
     const providerStatus = statusQuery?.data ?? null;
     const issues =
@@ -146,18 +145,12 @@ export function useUpdateInventory(
   });
 
   const systemVersion = systemVersionQuery.data;
-  // Gate on `isDesktop`, not on `desktopInfo`: the desktop shell answers
-  // `getInfo()` a render or two after mount, and treating that gap as "web"
-  // flashes an npm-upgrade prompt the desktop build never uses.
-  const appUpdateAvailable =
-    !isDesktop &&
-    systemVersion !== undefined &&
-    !systemVersion.isDevelopment &&
-    systemVersion.updateAvailable;
+  const appUpdateAvailable = resolveAppUpdateAvailable({
+    appUpdate: appUpdateStatusQuery.data,
+    isDesktop,
+    systemVersion,
+  });
   const desktopUpdateReady = desktopInfo?.updateDownloaded === true;
-  // Counts what Settings → Updates actually lists. A never-installed CLI is an
-  // install prompt, not an update, and inflating this made a fresh single-agent
-  // setup read as permanently behind.
   const actionableCount =
     machines.reduce(
       (count, machine) =>

@@ -19,35 +19,28 @@ interface SplitLayoutStore {
 
 interface OpenThreadInSplitArgs {
   store: SplitLayoutStore;
-  navigate: (route: string, options?: { replace?: boolean }) => void;
+  navigate: (
+    route: string,
+    options?: { replace?: boolean; state?: Record<string, unknown> },
+  ) => void;
   projectId: string;
   threadId: string;
-  /** Splits are off on compact viewports. */
   isCompact: boolean;
+  state?: Record<string, unknown>;
 }
 
-/**
- * Open a thread in the split area with the same placement rules a drag uses:
- * a right split by default, focus the pane when the thread is already open,
- * and coerce to a replace at the pane cap. Falls back to plain navigation
- * where there is no split to grow.
- *
- * Shared by the sidebar row's cmd-click/menu entry point and by the plugin
- * `open(id, { split: true })` action, so the two can never diverge.
- */
 export function openThreadInSplit({
   store,
   navigate,
   projectId,
   threadId,
   isCompact,
+  state,
 }: OpenThreadInSplitArgs): void {
   const route = getThreadRoutePath({ projectId, threadId });
   const layout = store.get(splitLayoutAtom);
-  // No split to grow (compact viewport, or a non-thread route with no layout):
-  // behave like an ordinary open.
   if (isCompact || layout === null) {
-    navigate(route);
+    navigate(route, state === undefined ? undefined : { state });
     return;
   }
   const existing = findPaneByThread(layout.root, projectId, threadId);
@@ -56,10 +49,12 @@ export function openThreadInSplit({
     if (next !== layout) {
       store.set(splitLayoutAtom, next);
     }
-    navigate(route, { replace: true });
+    navigate(route, {
+      replace: true,
+      ...(state === undefined ? {} : { state }),
+    });
     return;
   }
-  // Same decision as a drag with a default right-edge target.
   const decision = decideThreadDrop({
     zone: "right",
     threadAlreadyOpen: false,
@@ -73,5 +68,5 @@ export function openThreadInSplit({
   if (next !== layout) {
     store.set(splitLayoutAtom, next);
   }
-  navigate(route);
+  navigate(route, state === undefined ? undefined : { state });
 }

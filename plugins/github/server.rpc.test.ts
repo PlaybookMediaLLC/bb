@@ -24,32 +24,43 @@ function ghCalls(): string[] {
 beforeEach(() => {
   binDir = mkdtempSync(join(tmpdir(), "bb-github-rpc-"));
   callLog = join(binDir, "gh-calls.log");
-  const openIssue = JSON.stringify([
+  const openIssue = [
     {
       number: 7,
       title: "Cache mutations",
       state: "OPEN",
-      author: { login: "alice" },
-      labels: [{ name: "bug" }, { name: "old" }],
-      assignees: [{ login: "octocat" }],
+      author: { login: "alice", id: "user-alice" },
+      labels: { nodes: [{ name: "bug" }, { name: "old" }] },
+      assignees: { nodes: [{ login: "octocat" }] },
       url: "https://github.com/acme/widgets/issues/7",
       body: "Keep the cache synchronized.",
       updatedAt: "2026-08-19T12:00:00Z",
     },
-  ]);
-  const openPull = JSON.stringify([
+  ];
+  const openPull = [
     {
       number: 42,
       title: "Normalize pull details",
       state: "OPEN",
-      author: { login: "bob" },
-      labels: [{ name: "enhancement" }],
-      assignees: [],
+      author: { login: "bob", id: "user-bob" },
+      labels: { nodes: [{ name: "enhancement" }] },
+      assignees: { nodes: [] },
       url: "https://github.com/acme/widgets/pull/42",
       body: "Normalize every GitHub shape.",
       updatedAt: "2026-08-19T13:00:00Z",
     },
-  ]);
+  ];
+  const lists = JSON.stringify({
+    data: {
+      repository: {
+        hasIssuesEnabled: true,
+        openIssues: { nodes: openIssue },
+        closedIssues: { nodes: [] },
+        openPrs: { nodes: openPull },
+        closedPrs: { nodes: [] },
+      },
+    },
+  });
   const issueDetail = JSON.stringify({
     number: 7,
     title: "Cache mutations",
@@ -172,10 +183,7 @@ case "$*" in
   "api user") printf '%s\n' '{"login":"octocat"}';;
   "api repos/acme/widgets/assignees?per_page=100") printf '%s\n' '[{"login":"zoe"},{"login":"alice"},{"login":""}]';;
   "api repos/acme/widgets/labels?per_page=100") printf '%s\n' '[{"name":"triage"},{"name":" bug "},{"name":""}]';;
-  "issue list -R acme/widgets --state open"*) printf '%s\n' '${openIssue}';;
-  "issue list -R acme/widgets --state closed"*) printf '%s\n' '[]';;
-  "pr list -R acme/widgets --state open"*) printf '%s\n' '${openPull}';;
-  "pr list -R acme/widgets --state closed"*) printf '%s\n' '[]';;
+  "api graphql "*) printf '%s\n' '${lists}';;
   "issue view 7 -R acme/widgets --json labels") printf '%s\n' '{"labels":[{"name":"bug"},{"name":"old"}]}';;
   "issue view 7 -R acme/widgets --json"*) printf '%s\n' '${issueDetail}';;
   "pr view 42 -R acme/widgets --json"*) printf '%s\n' '${pullDetail}';;
@@ -195,16 +203,136 @@ afterEach(() => {
   rmSync(binDir, { recursive: true, force: true });
 });
 
-async function loadPlugin() {
+async function loadPlugin(extraRepos = "acme/widgets") {
   const host = createFakePluginHost({
     pluginId: "github",
-    settings: { extraRepos: "acme/widgets" },
+    settings: { extraRepos },
   });
   await plugin(host.bb);
   return host;
 }
 
 describe("github plugin RPC behavior", () => {
+  it("reports extraRepos entries it cannot honor instead of dropping them", async () => {
+    const { harness } = await loadPlugin("acme/widgets, ACME-ORG/*, nonsense");
+
+    await expect(harness.runCli(["repos"])).resolves.toEqual({
+      exitCode: 0,
+      stdout: "acme/widgets",
+      stderr:
+        'ignoring 2 extraRepos entries that are not "owner/repo": ACME-ORG/*, nonsense\n',
+    });
+    expect(harness.logEntries).toEqual(
+      expect.arrayContaining([
+        expect.objectContaining({
+          level: "warn",
+          message:
+            'ignoring 2 extraRepos entries that are not "owner/repo": ACME-ORG/*, nonsense',
+        }),
+      ]),
+    );
+
+    await harness.runCli(["repos"]);
+    expect(
+      harness.logEntries.filter(
+        (entry) =>
+          entry.level === "warn" && entry.message.includes("extraRepos"),
+      ),
+    ).toHaveLength(1);
+  });
+
+  it("says nothing about extraRepos when every entry is usable", async () => {
+    const { harness } = await loadPlugin("acme/widgets");
+
+    await expect(harness.runCli(["repos"])).resolves.toEqual({
+      exitCode: 0,
+      stdout: "acme/widgets",
+      stderr: "",
+    });
+    expect(
+      harness.logEntries.filter((entry) =>
+        entry.message.includes("extraRepos"),
+      ),
+    ).toEqual([]);
+  });
+
+  it("rejects malformed repositories as text and JSON and lists its commands in help", async () => {
+    const { harness } = await loadPlugin();
+
+    await expect(
+      harness.runCli(["issues", "bad/repo/shape"]),
+    ).resolves.toMatchObject({
+      exitCode: 1,
+      stderr: 'Invalid repository "bad/repo/shape"; expected owner/repo.\n',
+    });
+
+    const failure = await harness.runCli([
+      "issues",
+      "bad/repo/shape",
+      "--json",
+    ]);
+    expect(failure.exitCode).toBe(1);
+    expect(JSON.parse(failure.stdout)).toEqual({
+      ok: false,
+      error: {
+        code: "invalid_repository",
+        message: 'Invalid repository "bad/repo/shape"; expected owner/repo.',
+      },
+    });
+
+    const help = await harness.runCli(["--help"]);
+    expect(help.exitCode).toBe(0);
+    expect(help.stdout).toContain("bb github issues");
+    expect(help.stdout).toContain("bb github sync");
+  });
+
+  it("rejects a malformed repository or item number when starting work", async () => {
+    const { harness } = await loadPlugin();
+
+    for (const input of [
+      { repo: "not-a-repository", number: 1 },
+      { repo: "acme/widgets", number: 0 },
+    ]) {
+      await expect(harness.callRpc("startWork", input)).rejects.toMatchObject({
+        code: "invalid_input",
+      });
+    }
+  });
+
+  it("reports repositories, cached rows, and sync counts as JSON", async () => {
+    const { harness } = await loadPlugin();
+
+    const repos = await harness.runCli(["repos", "--json"]);
+    expect(repos.exitCode).toBe(0);
+    expect(JSON.parse(repos.stdout)).toEqual({
+      ok: true,
+      repos: [{ repo: "acme/widgets", projectId: null }],
+      ignoredExtraRepos: [],
+    });
+
+    const sync = await harness.runCli(["sync", "--json"]);
+    expect(sync.exitCode).toBe(0);
+    expect(JSON.parse(sync.stdout)).toEqual({ ok: true, repos: 1, items: 2 });
+
+    const issues = await harness.runCli(["issues", "acme/widgets", "--json"]);
+    expect(issues.exitCode).toBe(0);
+    const payload = JSON.parse(issues.stdout);
+    expect(payload).toMatchObject({
+      ok: true,
+      items: [
+        {
+          repo: "acme/widgets",
+          number: 7,
+          kind: "issue",
+          state: "OPEN",
+          title: "Cache mutations",
+          labels: ["bug", "old"],
+        },
+      ],
+    });
+    expect(payload.items[0]).not.toHaveProperty("body");
+  });
+
   it("syncs, filters, mutates, and exposes the same cached issue across surfaces", async () => {
     const { harness } = await loadPlugin();
 

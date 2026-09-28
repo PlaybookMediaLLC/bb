@@ -1,5 +1,6 @@
 import { readFileSync } from "node:fs";
 import { join } from "node:path";
+import { BRIDGE_JSON_RPC_ERRORS } from "@get-bb/plugin-sdk/provider-bridge";
 import { afterEach, beforeEach, expect, it, vi } from "vitest";
 import { PI_BRIDGE_ARGS_ENV, PI_BRIDGE_COMMAND_ENV } from "./rpc-child.js";
 import {
@@ -8,17 +9,7 @@ import {
   startFakePiBridge,
 } from "./test-support.js";
 
-/**
- * Pi is user-installed (L6): before the bridge talks to pi, `provider/health`
- * and `model/list` gate on the executable being on the launch path and on
- * `pi --version` >= 0.84.0, then `provider/health` runs the `get_state`
- * smoke probe through the catalog child. The fake answers `--version` from
- * FAKE_PI_VERSION.
- */
-
 let harness: FakePiBridgeHarness;
-// Vitest does not cancel a timed-out body. Keep ids unique across the file so
-// a late response cannot satisfy the next scenario's fresh stdout harness.
 let requestId = 0;
 
 function nextRequestId(): number {
@@ -68,6 +59,7 @@ it("refuses a pi older than the supported minimum before spawning it", async () 
     cwd: harness.workspaceDir,
   });
   expect(models.error).toMatchObject({
+    code: BRIDGE_JSON_RPC_ERRORS.BRIDGE_ERROR,
     message: expect.stringContaining(
       "0.83.2 is older than the supported minimum 0.84.0",
     ),
@@ -88,13 +80,12 @@ it("reports not_installed when the launch command is missing", async () => {
     cwd: harness.workspaceDir,
   });
   expect(models.error).toMatchObject({
+    code: BRIDGE_JSON_RPC_ERRORS.MISSING_EXECUTABLE,
     message: expect.stringContaining("Could not find the pi CLI"),
   });
 });
 
 it("fails closed when pi cannot report its version, with install guidance", async () => {
-  // The crash prints "pi 0.84.0" on stderr and exits 1: a gate that read
-  // stderr or treated a failed probe as "no version, pass" would say ready.
   vi.stubEnv("FAKE_PI_VERSION", "crash");
   const health = await harness.request(nextRequestId(), "provider/health", {
     providerId: "pi",
@@ -135,7 +126,6 @@ it("memoizes the install gate per launch path across health polls", async () => 
     .split("\n")
     .filter((line) => line.startsWith("version:"));
   expect(versionSpawns).toHaveLength(1);
-  // A different launch path is a different install: it probes again.
   vi.stubEnv(
     PI_BRIDGE_ARGS_ENV,
     JSON.stringify([fakePiPath, "--other-launch"]),

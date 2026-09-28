@@ -65,15 +65,12 @@ const sleep: Sleep = (durationMs) =>
   });
 
 async function settleAsyncWatchWork(): Promise<void> {
-  // Let watcher startup/retry microtasks finish before restoring shared spies.
   await Promise.resolve();
   await sleep(0);
   await Promise.resolve();
 }
 
-function ignoreWatchError(): void {
-  // Ignore watcher warnings in tests that assert only change callbacks.
-}
+function ignoreWatchError(): void {}
 
 async function runGit(
   args: RunGitArgs,
@@ -392,7 +389,6 @@ afterEach(async () => {
   );
 });
 
-// These tests mutate shared module spies, so keep them out of Vitest parallelism.
 describe.sequential("watchWorkspaceStatus", () => {
   it("starts watching before git init and promotes the repository watch", async () => {
     const workspacePath = await makeTempDir("bb-workspace-plain-");
@@ -1061,7 +1057,7 @@ describe.sequential("watchWorkspaceStatus", () => {
     }
   });
 
-  it("waits for late workspace subscription unsubscribe when stopped during startup", async () => {
+  it("settles stop and cleans up a late workspace subscription", async () => {
     const repoPath = await initRepo();
     const rootPaths: string[] = [];
     const subscriptionDeferred =
@@ -1090,8 +1086,8 @@ describe.sequential("watchWorkspaceStatus", () => {
     const stopPromise = stopWatching().then(() => {
       stopResolved = true;
     });
-    await Promise.resolve();
-    expect(stopResolved).toBe(false);
+    await stopPromise;
+    expect(stopResolved).toBe(true);
 
     subscriptionDeferred.resolve({ unsubscribe });
     await waitForCallCount(
@@ -1099,13 +1095,10 @@ describe.sequential("watchWorkspaceStatus", () => {
       1,
       WATCH_TEST_TIMEOUT_MS,
     );
-    expect(stopResolved).toBe(false);
 
     unsubscribeDeferred.resolve(undefined);
-    await stopPromise;
 
     expect(unsubscribe).toHaveBeenCalledTimes(1);
-    expect(stopResolved).toBe(true);
   });
 
   it("ignores shared common-dir index updates for detached worktree environments", async () => {

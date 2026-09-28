@@ -3,11 +3,25 @@ import {
   applyAppKeybindingOverrides,
   type AppKeybindingOverrides,
 } from "@bb/domain";
-import type { SystemConfigResponse } from "@bb/server-contract";
-import { systemConfigQueryKey } from "../queries/query-keys";
+import type {
+  SystemAiServicesResponse,
+  SystemConfigResponse,
+} from "@bb/server-contract";
+import {
+  systemAiServicesQueryKey,
+  systemConfigQueryKey,
+} from "../queries/query-keys";
 
 interface KeyboardSettingsCacheTransaction {
   previous: SystemConfigResponse | undefined;
+}
+
+export function markSystemConfigStale(queryClient: QueryClient): void {
+  void queryClient.invalidateQueries({
+    exact: true,
+    queryKey: systemConfigQueryKey(),
+    refetchType: "none",
+  });
 }
 
 interface BeginKeyboardSettingsCacheTransactionArgs {
@@ -48,10 +62,6 @@ export function rollbackKeyboardSettingsCacheTransaction({
   queryClient.setQueryData(systemConfigQueryKey(), transaction.previous);
 }
 
-/**
- * The streamer mode value the cache last saw from the server, or undefined
- * when `/system/config` has not resolved in this window.
- */
 export function readCachedStreamerMode(
   queryClient: QueryClient,
 ): boolean | undefined {
@@ -59,13 +69,16 @@ export function readCachedStreamerMode(
     ?.generalSettings.streamerMode;
 }
 
-/**
- * The provider order the cache last saw from the server, or undefined when
- * `/system/config` has not resolved in this window.
- */
 export function readCachedProviderOrder(
   queryClient: QueryClient,
 ): readonly string[] | undefined {
   return queryClient.getQueryData<SystemConfigResponse>(systemConfigQueryKey())
     ?.generalSettings.providerOrder;
+}
+
+export function writeCachedAiServices(
+  queryClient: QueryClient,
+  view: SystemAiServicesResponse,
+): void {
+  queryClient.setQueryData(systemAiServicesQueryKey(), view);
 }

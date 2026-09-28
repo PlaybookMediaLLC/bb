@@ -1,4 +1,8 @@
 const MARKDOWN_FENCE_START_PATTERN = /^(?: {0,3})(`{3,}|~{3,})/u;
+const MARKDOWN_ANY_INDENT_FENCE_PATTERN = /^\s*(`{3,}|~{3,})/u;
+export const MARKDOWN_LIST_MARKER_PATTERN =
+  /^\s{0,3}(?:[-*+]|\d{1,9}[.)])(?:\s|$)/u;
+export const MARKDOWN_INDENTED_CONTINUATION_PATTERN = /^(?: {2,}|\t)/u;
 
 export interface MarkdownFence {
   character: string;
@@ -44,12 +48,39 @@ export function isMarkdownFenceClose(
   );
 }
 
-/**
- * Older authored prompt bodies could store a quote immediately followed by an
- * unprefixed reply line. CommonMark treats that as a lazy blockquote
- * continuation, so make the legacy block boundary explicit before parsing
- * prompt markdown.
- */
+export function parseAnyIndentMarkdownFenceStart(
+  line: string,
+): MarkdownFence | null {
+  const marker = MARKDOWN_ANY_INDENT_FENCE_PATTERN.exec(line)?.[1];
+  if (marker === undefined) {
+    return null;
+  }
+  return { character: marker[0]!, length: marker.length };
+}
+
+export function closesAnyIndentMarkdownFence(
+  line: string,
+  fence: MarkdownFence,
+): boolean {
+  const match = MARKDOWN_ANY_INDENT_FENCE_PATTERN.exec(line);
+  const marker = match?.[1];
+  if (match === null || marker === undefined) {
+    return false;
+  }
+  return (
+    marker[0] === fence.character &&
+    marker.length >= fence.length &&
+    line.slice(match[0].length).trim().length === 0
+  );
+}
+
+export function isMarkdownListLikeLine(line: string): boolean {
+  return (
+    MARKDOWN_LIST_MARKER_PATTERN.test(line) ||
+    MARKDOWN_INDENTED_CONTINUATION_PATTERN.test(line)
+  );
+}
+
 export function normalizePromptBlockquoteBoundaries(markdown: string): string {
   const lines = markdown.split("\n");
   if (lines.length < 2) {

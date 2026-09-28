@@ -1,9 +1,17 @@
-import { useEffect, useRef } from "react";
+import {
+  createContext,
+  createElement,
+  useCallback,
+  useContext,
+  useEffect,
+  useLayoutEffect,
+  useMemo,
+  useRef,
+  type ReactNode,
+} from "react";
 import { useLocation } from "react-router-dom";
 import { useBottomAnchoredScroll } from "@/components/ui/bottom-anchored-scroll-body.js";
 
-// Structural subset of a timeline view row — every row carries an event-sequence
-// range, which is how we map a searched message's sequence to its rendered row.
 interface SeqAnchoredRow {
   id: string;
   sourceSeqStart: number;
@@ -15,6 +23,20 @@ interface SeqAnchoredRow {
 interface SearchMessageTarget {
   seq: number;
   threadId: string | null;
+}
+
+export interface SearchMessageLocationTarget extends SearchMessageTarget {
+  locationKey: string;
+}
+
+interface SearchMessageLocation {
+  target: SearchMessageLocationTarget | null;
+  readLocationKey: () => string;
+}
+
+interface SearchMessageLocationProviderProps {
+  threadId: string | undefined;
+  children: ReactNode;
 }
 
 interface SearchMessagePaginationOptions {
@@ -157,8 +179,6 @@ export function collectSearchedMessageAncestorRowIds(
   return ancestorIds;
 }
 
-// Sidebar search hands the matched message's event sequence to the thread route
-// via `navigate(path, { state: { searchMessageSeq, searchThreadId } })`.
 export function readSearchMessageTarget(
   state: unknown,
 ): SearchMessageTarget | null {
@@ -181,14 +201,67 @@ export function readSearchMessageTarget(
   return null;
 }
 
-/**
- * When the thread was opened from a sidebar search result whose match was in a
- * message body, scroll that message into view and briefly highlight it.
- *
- * Keyed off `location.key` so it fires once per navigation (not on every render
- * or row update). The effect also depends on `rows`, so if the timeline hasn't
- * hydrated the target row yet it simply retries once the rows arrive.
- */
+const SearchMessageLocationContext =
+  createContext<SearchMessageLocation | null>(null);
+
+function searchTargetAppliesToThread(
+  target: SearchMessageTarget,
+  threadId: string | undefined,
+): boolean {
+  return (
+    threadId === undefined ||
+    target.threadId === null ||
+    target.threadId === threadId
+  );
+}
+
+export function SearchMessageLocationProvider({
+  threadId,
+  children,
+}: SearchMessageLocationProviderProps) {
+  const location = useLocation();
+  const locationKeyRef = useRef(location.key);
+  useLayoutEffect(() => {
+    locationKeyRef.current = location.key;
+  }, [location.key]);
+  const readLocationKey = useCallback(() => locationKeyRef.current, []);
+  const target = readSearchMessageTarget(location.state);
+  const applies =
+    target !== null && searchTargetAppliesToThread(target, threadId);
+  const targetLocationKey = applies ? location.key : null;
+  const targetSeq = applies ? target.seq : null;
+  const targetThreadId = applies ? target.threadId : null;
+  const value = useMemo<SearchMessageLocation>(
+    () => ({
+      target:
+        targetLocationKey === null || targetSeq === null
+          ? null
+          : {
+              locationKey: targetLocationKey,
+              seq: targetSeq,
+              threadId: targetThreadId,
+            },
+      readLocationKey,
+    }),
+    [readLocationKey, targetLocationKey, targetSeq, targetThreadId],
+  );
+  return createElement(
+    SearchMessageLocationContext.Provider,
+    { value },
+    children,
+  );
+}
+
+export function useSearchMessageLocation(): SearchMessageLocation {
+  const value = useContext(SearchMessageLocationContext);
+  if (value === null) {
+    throw new Error(
+      "useSearchMessageLocation: no <SearchMessageLocationProvider> above the caller",
+    );
+  }
+  return value;
+}
+
 export function useScrollToSearchedMessage(
   rows: readonly SeqAnchoredRow[],
   threadId: string | undefined,
@@ -198,16 +271,10 @@ export function useScrollToSearchedMessage(
     onLoadOlderRows,
   }: SearchMessagePaginationOptions = {},
 ): void {
-  const location = useLocation();
+  const { target, readLocationKey } = useSearchMessageLocation();
   const bottomAnchor = useBottomAnchoredScroll();
   const handledKeyRef = useRef<string | null>(null);
   const olderLoadAttemptKeyRef = useRef<string | null>(null);
-  const locationKeyRef = useRef(location.key);
-  locationKeyRef.current = location.key;
-  // The follow-up reveal timers outlive the effect run that scheduled them on
-  // purpose (a rows change inside the settle window must not cancel them), but
-  // not the component: a reveal firing after unmount has nothing to reveal and
-  // touches a document the owner may already have torn down.
   const pendingRevealTimersRef = useRef<Set<number>>(new Set());
   useEffect(() => {
     const pendingRevealTimers = pendingRevealTimersRef.current;
@@ -216,17 +283,19 @@ export function useScrollToSearchedMessage(
         window.clearTimeout(timer);
       }
       pendingRevealTimers.clear();
-      // A StrictMode remount re-runs the reveal effect; let it handle the
-      // location key again instead of finding the key already handled.
       handledKeyRef.current = null;
     };
   }, []);
-  const target = readSearchMessageTarget(location.state);
+  const targetLocationKey = target?.locationKey ?? null;
   const targetSeq = target?.seq ?? null;
   const targetThreadId = target?.threadId ?? null;
 
   useEffect(() => {
-    if (targetSeq === null || handledKeyRef.current === location.key) {
+    if (
+      targetLocationKey === null ||
+      targetSeq === null ||
+      handledKeyRef.current === targetLocationKey
+    ) {
       return;
     }
     if (threadId !== undefined && targetThreadId !== null) {
@@ -236,8 +305,6 @@ export function useScrollToSearchedMessage(
     }
     const targetLeafRow = findDeepestSeqAnchoredRow(rows, targetSeq);
     if (targetLeafRow === null) {
-      // Target row not rendered yet (still loading, or inside a collapsed
-      // group). Leave the key unhandled so a later rows change can retry.
       const loadedRange = getRowsSeqRange(rows);
       const targetIsOlderThanLoadedRows =
         loadedRange !== null && targetSeq < loadedRange.max;
@@ -245,7 +312,7 @@ export function useScrollToSearchedMessage(
         loadedRange === null
           ? null
           : [
-              location.key,
+              targetLocationKey,
               targetThreadId ?? "",
               targetSeq,
               loadedRange.min,
@@ -274,11 +341,11 @@ export function useScrollToSearchedMessage(
     ) {
       return;
     }
-    handledKeyRef.current = location.key;
+    handledKeyRef.current = targetLocationKey;
 
     let flashed = false;
     const revealTarget = () => {
-      if (locationKeyRef.current !== location.key) {
+      if (readLocationKey() !== targetLocationKey) {
         return;
       }
       const element = document.querySelector<HTMLElement>(selector);
@@ -286,8 +353,6 @@ export function useScrollToSearchedMessage(
         return;
       }
       if (bottomAnchor !== null) {
-        // scrollElementIntoView suppresses stick-to-bottom so this wins over the
-        // default open-at-bottom behavior.
         bottomAnchor.scrollElementIntoView({
           element,
           options: { block: "center" },
@@ -312,7 +377,6 @@ export function useScrollToSearchedMessage(
       pendingRevealTimersRef.current.add(timer);
     };
 
-    // Reveal after initial layout and again after idle placeholder correction.
     const frame = requestAnimationFrame(revealTarget);
     scheduleReveal(320);
     scheduleReveal(POST_WINDOW_SETTLE_REVEAL_MS);
@@ -323,9 +387,10 @@ export function useScrollToSearchedMessage(
     bottomAnchor,
     hasOlderRows,
     isLoadingOlderRows,
-    location.key,
     onLoadOlderRows,
+    readLocationKey,
     rows,
+    targetLocationKey,
     targetSeq,
     targetThreadId,
     threadId,

@@ -28,7 +28,6 @@ function buildTimeline(
   events: ThreadEventWithMeta[],
   options: {
     includeNestedRows?: boolean;
-    turnMessageDetail?: "summary" | "full";
   } = {},
 ): ThreadTimelineFromEventsResult {
   return buildThreadTimelineFromEvents({
@@ -36,12 +35,12 @@ function buildTimeline(
     contextWindowEvents: [],
     events,
     options: {
+      completedTurnDisplay: "collapse",
       includeNestedRows: options.includeNestedRows ?? true,
-      includeProviderUnhandledOperations: false,
+      includeDiagnosticOperations: false,
       isLatestPage: true,
       threadStatus: "idle",
       threadName: "",
-      turnMessageDetail: options.turnMessageDetail ?? "full",
       workspaceRoot: null,
     },
   });
@@ -391,10 +390,6 @@ describe("background task timeline projection", () => {
       ),
     ]);
 
-    // The late thread-scoped completion (seq 6) must not stretch turn-1's
-    // source range past turn-2's rows: the server validates turn-summary
-    // expansion against that range and rejects ranges containing other
-    // turns' rows, which would permanently break expanding turn-1.
     const spawningTurnRow = rows.find(
       (row) => row.kind === "turn" && row.turnId === "turn-1",
     );
@@ -403,8 +398,6 @@ describe("background task timeline projection", () => {
       sourceSeqEnd: 3,
     });
 
-    // The workflow row itself stays anchored at its item/started event while
-    // still folding the late terminal payload.
     const workflowRows = findWorkflowRows(rows);
     expect(workflowRows).toHaveLength(1);
     expect(workflowRows[0]).toMatchObject({
@@ -470,7 +463,7 @@ describe("background task timeline projection", () => {
           4,
         ),
       ],
-      { includeNestedRows: false, turnMessageDetail: "summary" },
+      { includeNestedRows: false },
     );
 
     expect(findWorkflowRows(timeline.rows)).toHaveLength(0);
@@ -555,11 +548,9 @@ describe("background task timeline projection", () => {
           4,
         ),
       ],
-      { includeNestedRows: false, turnMessageDetail: "summary" },
+      { includeNestedRows: false },
     );
 
-    // A running shell command never hijacks the workflow banner, but it does
-    // drive the independent background-activity card.
     expect(timeline.activeWorkflows).toHaveLength(0);
     expect(timeline.activeBackgroundCommands).toHaveLength(1);
     expect(timeline.activeBackgroundCommands[0]).toMatchObject({
@@ -605,11 +596,9 @@ describe("background task timeline projection", () => {
         ),
         turnCompleted("turn-1", 4),
       ],
-      { includeNestedRows: false, turnMessageDetail: "summary" },
+      { includeNestedRows: false },
     );
 
-    // A thread can drive several workflows at once; the banner must surface all
-    // of them rather than collapsing to the most recently started one.
     expect(timeline.activeWorkflows.map((row) => row.workflowName)).toEqual([
       "rfn-visual-identity",
       "rfn-pass-a-balance",
@@ -667,11 +656,9 @@ describe("background task timeline projection", () => {
         ),
         turnCompleted("turn-1", 5),
       ],
-      { includeNestedRows: false, turnMessageDetail: "summary" },
+      { includeNestedRows: false },
     );
 
-    // The settled workflow hands off to its timeline row; the still-running
-    // sibling keeps its banner card.
     expect(timeline.activeWorkflows.map((row) => row.workflowName)).toEqual([
       "rfn-pass-a-balance",
     ]);
@@ -738,11 +725,9 @@ describe("background task timeline projection", () => {
         ),
         turnCompleted("turn-1", 6),
       ],
-      { includeNestedRows: false, turnMessageDetail: "summary" },
+      { includeNestedRows: false },
     );
 
-    // The workflow drives the workflow banner; non-workflow background tasks
-    // drive the background-activity card, ordered most recently started first.
     expect(timeline.activeWorkflows[0]).toMatchObject({
       taskType: "local_workflow",
     });
@@ -794,12 +779,9 @@ describe("background task timeline projection", () => {
           3,
         ),
       ],
-      { includeNestedRows: false, turnMessageDetail: "summary" },
+      { includeNestedRows: false },
     );
 
-    // The requested model lived in the spawning Agent call's arguments, which
-    // core no longer reads by tool name; the v3 delegation carries it in its
-    // presentation detail, so the structured field stays null either way.
     expect(timeline.activeBackgroundCommands).toMatchObject([
       {
         description: "Inspect the mobile banner",
@@ -844,7 +826,7 @@ describe("background task timeline projection", () => {
           5,
         ),
       ],
-      { includeNestedRows: false, turnMessageDetail: "summary" },
+      { includeNestedRows: false },
     );
 
     expect(timeline.activeBackgroundCommands).toMatchObject([
@@ -858,8 +840,6 @@ describe("background task timeline projection", () => {
   });
 
   it("correlates restarted generations through the explicit familyId under assembler-minted item ids", () => {
-    // Assembler-minted ids (`<entropy>-iN`) carry no `#N` generation suffix:
-    // the family identity travels only as the item's explicit `familyId`.
     const timeline = buildTimeline(
       [
         turnStarted("turn-1", 1),
@@ -886,8 +866,6 @@ describe("background task timeline projection", () => {
           }),
           4,
         ),
-        // The restart mints a fresh item id and omits its spawning call; the
-        // shared familyId is what carries the earlier generation's model.
         agentTaskStarted(
           agentTaskItem({
             status: "pending",
@@ -899,7 +877,7 @@ describe("background task timeline projection", () => {
           5,
         ),
       ],
-      { includeNestedRows: false, turnMessageDetail: "summary" },
+      { includeNestedRows: false },
     );
 
     expect(timeline.activeBackgroundCommands).toMatchObject([
@@ -1043,7 +1021,7 @@ describe("background task timeline projection", () => {
         ),
         turnCompleted("turn-1", 6),
       ],
-      { includeNestedRows: false, turnMessageDetail: "summary" },
+      { includeNestedRows: false },
     );
 
     expect(timeline.activeBackgroundCommands.map((row) => row.itemId)).toEqual([
@@ -1138,7 +1116,7 @@ describe("background task timeline projection", () => {
         ),
         turnCompleted("turn-1", 7),
       ],
-      { includeNestedRows: false, turnMessageDetail: "summary" },
+      { includeNestedRows: false },
     );
 
     expect(timeline.activeBackgroundCommands.map((row) => row.itemId)).toEqual([

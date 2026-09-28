@@ -33,11 +33,12 @@ import type {
   UrlTransform,
 } from "react-markdown";
 import rehypeRaw from "rehype-raw";
-import rehypeSanitize from "rehype-sanitize";
+import rehypeSanitize, { defaultSchema } from "rehype-sanitize";
 import remarkBreaks from "remark-breaks";
 import remarkGfm from "remark-gfm";
 import remarkMath from "remark-math";
-import { ImageLightbox } from "./image-lightbox.js";
+import { ImageLightbox, getWrappedImageIndex } from "./image-lightbox.js";
+import { InlineImageGalleryContext } from "./inline-image-gallery-context.js";
 import { normalizeMathFences } from "./markdown-math-fences.js";
 import {
   markdownMayContainMath,
@@ -83,10 +84,19 @@ import {
 } from "./markdown-prompt-mentions.js";
 import {
   buildMessageDirectiveComponent,
+  EMPTY_MOUNTED_MESSAGE_DIRECTIVES,
+  MESSAGE_DIRECTIVE_MOUNT_LIMIT,
+  MessageDirectiveMountsContext,
   remarkMessageDirectives,
+  type BuildMessageDirectiveComponentArgs,
   type MarkdownMessageDirectives,
   type MountedMessageDirective,
 } from "./markdown-message-directives.js";
+import {
+  createMarkdownPieceCache,
+  resolveMarkdownPieces,
+  type MarkdownPieceRenderConfig,
+} from "./markdown-incremental-pieces.js";
 import { normalizePromptBlockquoteBoundaries } from "./markdown-prompt-blockquote-boundaries.js";
 import { MarkdownMermaidDiagram } from "./markdown-mermaid-diagram.js";
 import type { PromptTextMention } from "@bb/domain";
@@ -110,42 +120,12 @@ interface MarkdownPreviewProps {
   allowHtml?: boolean;
   className?: string;
   content: string;
-  /**
-   * Controls whether Markdown image nodes mount browser image subresources.
-   * Use `"alt-text"` for untrusted generated previews that should retain a
-   * readable placeholder without issuing a request to the image URL.
-   */
+  sourcePrefix?: string;
   imagePolicy?: MarkdownImagePolicy;
+  incrementalBlocks?: boolean;
   linkRouting?: MarkdownLinkRouting;
-  /**
-   * When supplied, serialized `@thread:<id>` tokens and exact raw persisted
-   * thread ids in markdown prose render as canonical thread-mention pills. An
-   * inline-code span also renders as a pill when the entire span is one exact
-   * raw id; mixed inline code and fenced code remain literal. Raw ids remain
-   * text unless the live thread lookup or `mentions` resolves them. Raw-id pills
-   * always use the resolved thread resource's project route; `resolveLinkHref`
-   * continues to route serialized and offset-based mentions.
-   */
   threadMentions?: MarkdownThreadMentions;
-  /**
-   * Authored-prompt mentions (user messages): unlike {@link threadMentions},
-   * which recognizes thread references in markdown prose, this carries the
-   * editor's offset-based `mentions` array (offsets into `content`) and renders
-   * every kind — thread, file/path, and slash command — as its canonical pill.
-   * Activates the offset-substitution pipeline in `markdown-prompt-mentions`.
-   * User messages may also supply {@link threadMentions} so raw serialized
-   * thread tokens without offset metadata still render consistently. Structured
-   * spans are substituted before Markdown parsing, so the two pipelines do not
-   * double-render the same mention. Generated conversation bodies also use
-   * this transport when they carry authoritative offset metadata.
-   */
   promptMentions?: MarkdownPromptMentions;
-  /**
-   * Plugin assistant-message directives (`::inline-vis{...}`). Only supplied
-   * for assistant conversation bodies (and nested agent output); user messages
-   * and generic Markdown/file previews omit this so directives stay literal.
-   * Parsing is `remark-directive`; recognized ids mount via PluginSlotMount.
-   */
   messageDirectives?: MarkdownMessageDirectives;
   urlTransform?: UrlTransform;
 }
@@ -170,30 +150,16 @@ interface IsMarkdownAppRouteHrefArgs {
 
 interface BuildMarkdownComponentsArgs {
   imagePolicy: MarkdownImagePolicy;
+  imageSourceOffset: number;
   linkRouting?: MarkdownLinkRouting;
   preferredTheme: Theme;
   rewriteLocalhostLinks: boolean;
-  setExpandedImageUrl: ExpandedImageUrlSetter;
+  setExpandedImage: ExpandedMarkdownImageSetter;
   threadMentions?: MarkdownThreadMentions;
   promptMentions?: ResolvedPromptMentions;
-  messageDirectives?: ResolvedMessageDirectiveRender;
+  messageDirectives?: BuildMessageDirectiveComponentArgs;
 }
 
-/**
- * Message-directive props after the remark transform has filled the mount table
- * for this render (indices match `data-directive-index` on the custom element).
- */
-interface ResolvedMessageDirectiveRender {
-  mounts: readonly MountedMessageDirective[];
-  message: MarkdownMessageDirectives["message"];
-  openWorkspaceFile: MarkdownMessageDirectives["openWorkspaceFile"];
-  openThreadPanel: MarkdownMessageDirectives["openThreadPanel"];
-}
-
-/**
- * {@link MarkdownPromptMentions} after sentinel substitution: the mention array
- * is now indexed to match the sentinels embedded in the parsed content.
- */
 interface ResolvedPromptMentions {
   mentions: readonly IndexedPromptMention[];
   resolveLinkHref?: TimelineTitleLinkResolver;
@@ -206,10 +172,17 @@ interface BuildLocalAwareUrlTransformArgs {
   localImageRouting: MarkdownLocalImageRouting | undefined;
 }
 
+interface ResolvedMarkdownLocalFileTarget {
+  href: string;
+  link: MarkdownPreviewLocalFileLink;
+  sourceKind: "absolute" | "relative";
+}
+
 interface MarkdownImageRendererArgs {
   alt: ComponentPropsWithoutRef<"img">["alt"];
+  sourceOffset: number | undefined;
   imageAttributes: MarkdownImageRenderAttributes;
-  setExpandedImageUrl: ExpandedImageUrlSetter;
+  setExpandedImage: ExpandedMarkdownImageSetter;
   src: ComponentPropsWithoutRef<"img">["src"];
 }
 
@@ -258,7 +231,15 @@ interface AreMarkdownMessageDirectivesEqualArgs {
   previous: MarkdownMessageDirectives | undefined;
 }
 
-type ExpandedImageUrlSetter = Dispatch<SetStateAction<string | null>>;
+interface ExpandedMarkdownImage {
+  imageSources: readonly string[];
+  index: number;
+  url: string;
+}
+
+type ExpandedMarkdownImageSetter = Dispatch<
+  SetStateAction<ExpandedMarkdownImage | null>
+>;
 
 interface SetMarkdownContentWidthVariableArgs {
   element: HTMLElement;
@@ -281,7 +262,10 @@ interface MarkdownCodeRendererProps extends MarkdownCodeProps {
 }
 type MarkdownHeadingProps = ComponentPropsWithoutRef<"h1"> & ExtraProps;
 type MarkdownHrProps = ComponentPropsWithoutRef<"hr"> & ExtraProps;
-type MarkdownImageProps = ComponentPropsWithoutRef<"img"> & ExtraProps;
+type MarkdownImageProps = ComponentPropsWithoutRef<"img"> &
+  ExtraProps & {
+    "data-markdown-image-offset"?: number;
+  };
 type MarkdownImageRenderAttributes = Omit<
   MarkdownImageProps,
   "alt" | "children" | "className" | "node" | "src"
@@ -298,38 +282,60 @@ type MarkdownTableHeadProps = ComponentPropsWithoutRef<"thead"> & ExtraProps;
 type MarkdownTableHeaderProps = ComponentPropsWithoutRef<"th"> & ExtraProps;
 type MarkdownUnorderedListProps = ComponentPropsWithoutRef<"ul"> & ExtraProps;
 type MarkdownRehypePlugins = NonNullable<ReactMarkdownOptions["rehypePlugins"]>;
+type MarkdownRemarkPlugins = NonNullable<ReactMarkdownOptions["remarkPlugins"]>;
 
-// A table may grow past its text column up to the container width, but never
-// past the nearest ancestor that clips or scrolls horizontally. The limit
-// variable is measured in `useMarkdownTableContentWidthVariable`; without it a
-// negative `marginInline` moves the table left of the scroll origin, where no
-// scroll can reach it (plan approval cards, message bubbles, side chat).
 const MARKDOWN_TABLE_BREAKOUT_LIMIT_VARIABLE = "--md-table-breakout-max";
 const MARKDOWN_TABLE_BREAKOUT_WIDTH = `max(100%, min(1100px, 100cqw - 2rem, var(${MARKDOWN_TABLE_BREAKOUT_LIMIT_VARIABLE}, 100cqw)))`;
 const MARKDOWN_CONTENT_WIDTH_VARIABLE = "--md-content-w";
 const MARKDOWN_SOURCE_COLOR_SCHEME_MEDIA_PATTERN =
   /^\(\s*prefers-color-scheme\s*:\s*(dark|light)\s*\)$/iu;
-// `remark-math` emits math as `<code class="language-math">` (inline) and
-// `<pre><code class="language-math">` (display) holding the raw TeX, and
-// `rehype-katex` renders any element carrying that class. The default sanitize
-// schema already keeps `language-*` classes on `<code>`, so the wrappers survive
-// sanitization untouched — and `rehype-katex` runs LAST, after sanitize, so KaTeX
-// (which uses `trust: false` and self-escapes its TeX input) emits its rendered
-// output without it being re-sanitized.
-//
-// Security-critical order: raw HTML must become nodes (rehypeRaw) before
-// sanitization can strip unsafe elements, attributes, and URLs.
 const MARKDOWN_HTML_REHYPE_PLUGINS: MarkdownRehypePlugins = [
   rehypeRaw,
-  rehypeSanitize,
+  [
+    rehypeSanitize,
+    {
+      ...defaultSchema,
+      tagNames: [
+        ...(defaultSchema.tagNames ?? []),
+        "video",
+        "bb-thread-mention",
+        "bb-prompt-mention",
+        "bb-message-directive",
+      ],
+      protocols: { ...defaultSchema.protocols, poster: ["http", "https"] },
+      attributes: {
+        ...defaultSchema.attributes,
+        source: [
+          ...(defaultSchema.attributes?.source ?? []),
+          "src",
+          "type",
+          "media",
+        ],
+        video: [
+          "src",
+          "controls",
+          "playsInline",
+          "preload",
+          "poster",
+          "width",
+          "height",
+          "title",
+          "ariaLabel",
+        ],
+        "bb-thread-mention": [
+          "dataThreadId",
+          "dataRawThreadId",
+          "dataRawThreadInlineCode",
+        ],
+        "bb-prompt-mention": ["dataMentionIndex"],
+        "bb-message-directive": ["dataDirectiveIndex"],
+      },
+    },
+  ],
 ];
 
-// No raw HTML means nothing untrusted to sanitize, so KaTeX renders straight
-// from the `remark-math` wrappers.
 const MARKDOWN_PLAIN_REHYPE_PLUGINS: MarkdownRehypePlugins = [];
 
-// KaTeX loads on demand (`markdown-katex-loader`): until the chunk resolves,
-// math stays as the `remark-math` code wrappers.
 function resolveRehypePlugins({
   allowHtml,
   rehypeKatex,
@@ -474,7 +480,9 @@ const areMarkdownPreviewPropsEqual: MarkdownPreviewPropsEqual = (
   (previous.allowHtml ?? false) === (next.allowHtml ?? false) &&
   previous.className === next.className &&
   previous.content === next.content &&
+  (previous.sourcePrefix ?? "") === (next.sourcePrefix ?? "") &&
   (previous.imagePolicy ?? "render") === (next.imagePolicy ?? "render") &&
+  (previous.incrementalBlocks ?? false) === (next.incrementalBlocks ?? false) &&
   previous.urlTransform === next.urlTransform &&
   areMarkdownThreadMentionsEqual({
     next: next.threadMentions,
@@ -506,29 +514,44 @@ function isMarkdownAppRouteHref({ href }: IsMarkdownAppRouteHrefArgs): boolean {
   );
 }
 
-function resolveMarkdownLocalPath(
+function resolveMarkdownLocalFileTarget(
   value: string,
-  absolutePaths: MarkdownAbsoluteLocalFileLinkRouting,
-  relativePaths: MarkdownRelativeLocalFileLinkRouting | undefined,
-): MarkdownPreviewLocalFileLink | null {
-  const absolutePath = parseLocalFileHref({
-    absoluteLinks: absolutePaths,
+  absolute: MarkdownAbsoluteLocalFileLinkRouting,
+  relative: MarkdownRelativeLocalFileLinkRouting | undefined,
+): ResolvedMarkdownLocalFileTarget | null {
+  const absoluteLink = parseLocalFileHref({
+    absoluteLinks: absolute,
     href: value,
   });
-  if (absolutePath !== null || relativePaths === undefined) {
-    return absolutePath;
+  if (absoluteLink !== null) {
+    return {
+      href: value,
+      link: absoluteLink,
+      sourceKind: "absolute",
+    };
+  }
+  if (relative === undefined) {
+    return null;
   }
 
   const resolvedHref = resolveRelativeLocalFileHref({
     href: value,
-    ...relativePaths,
+    ...relative,
   });
-  return resolvedHref === null
+  if (resolvedHref === null) {
+    return null;
+  }
+  const relativeLink = parseLocalFileHref({
+    absoluteLinks: absolute,
+    href: resolvedHref,
+  });
+  return relativeLink === null
     ? null
-    : parseLocalFileHref({
-        absoluteLinks: absolutePaths,
+    : {
         href: resolvedHref,
-      });
+        link: relativeLink,
+        sourceKind: "relative",
+      };
 }
 
 function buildLocalAwareUrlTransform({
@@ -538,40 +561,30 @@ function buildLocalAwareUrlTransform({
 }: BuildLocalAwareUrlTransformArgs): UrlTransform {
   return (value, key, node) => {
     if (key === "href" && localFileRouting !== undefined) {
-      if (
-        parseLocalFileHref({
-          absoluteLinks: localFileRouting.absoluteLinks,
-          href: value,
-        })
-      ) {
-        return value;
-      }
-
-      if (localFileRouting.relativeLinks !== undefined) {
-        const resolvedHref = resolveRelativeLocalFileHref({
-          href: value,
-          ...localFileRouting.relativeLinks,
-        });
-        if (
-          resolvedHref !== null &&
-          parseLocalFileHref({
-            absoluteLinks: localFileRouting.absoluteLinks,
-            href: resolvedHref,
-          })
-        ) {
-          return resolvedHref;
-        }
+      const localFile = resolveMarkdownLocalFileTarget(
+        value,
+        localFileRouting.absoluteLinks,
+        localFileRouting.relativeLinks,
+      );
+      if (localFile !== null) {
+        return localFile.href;
       }
     }
 
-    if (key === "src" && localImageRouting !== undefined) {
-      const localImage = resolveMarkdownLocalPath(
+    if (
+      (key === "src" || (key === "poster" && node.tagName === "video")) &&
+      localImageRouting !== undefined
+    ) {
+      const localImage = resolveMarkdownLocalFileTarget(
         value,
         localImageRouting.absolutePaths,
         localImageRouting.relativePaths,
       );
       if (localImage !== null) {
-        return localImageRouting.resolveSrc(localImage);
+        return localImageRouting.resolveSrc(
+          localImage.link,
+          localImage.sourceKind,
+        );
       }
     }
 
@@ -600,32 +613,13 @@ function resolveInlineCodeMarkdownFileHref({
     return null;
   }
 
-  const absoluteLink = parseLocalFileHref({
-    absoluteLinks: localFileRouting.absoluteLinks,
-    href: codeText,
-  });
-  if (absoluteLink !== null) {
-    return hasMarkdownFileExtension(absoluteLink.path) ? codeText : null;
-  }
-
-  if (localFileRouting.relativeLinks === undefined) {
-    return null;
-  }
-
-  const resolvedHref = resolveRelativeLocalFileHref({
-    href: codeText,
-    ...localFileRouting.relativeLinks,
-  });
-  if (resolvedHref === null) {
-    return null;
-  }
-
-  const resolvedLink = parseLocalFileHref({
-    absoluteLinks: localFileRouting.absoluteLinks,
-    href: resolvedHref,
-  });
-  return resolvedLink !== null && hasMarkdownFileExtension(resolvedLink.path)
-    ? resolvedHref
+  const target = resolveMarkdownLocalFileTarget(
+    codeText,
+    localFileRouting.absoluteLinks,
+    localFileRouting.relativeLinks,
+  );
+  return target !== null && hasMarkdownFileExtension(target.link.path)
+    ? target.href
     : null;
 }
 
@@ -666,13 +660,10 @@ function MarkdownAnchor({
       return;
     }
 
-    // Internal BB destinations belong to RouteAnchor so they participate in
-    // SPA history. URL preference routing only sees non-route destinations.
     if (isAppRouteHref) {
       return;
     }
 
-    // Let timeline/terminal/navigation hosts claim ordinary web links.
     if (
       linkRouting?.onOpenLink &&
       rewrittenHref &&
@@ -754,14 +745,16 @@ function MarkdownCode({
   const language = getMarkdownCodeLanguage({ className: codeClassName });
   const isBlock = isMarkdownCodeBlock({ codeText, language });
   const [softWrap, setSoftWrap] = useState(false);
-  // Highlight only fenced blocks (mermaid renders as a diagram, inline code stays
-  // plain). The HTML is escaped by sugar-high, so dangerouslySetInnerHTML is safe.
   const highlightedHtml = useMemo(
     () =>
       isBlock && language !== "mermaid"
         ? highlightMarkdownCode({ code: codeText, language })
         : null,
     [isBlock, language, codeText],
+  );
+  const highlightedMarkup = useMemo(
+    () => (highlightedHtml === null ? null : { __html: highlightedHtml }),
+    [highlightedHtml],
   );
   if (isBlock) {
     if (language === "mermaid" && imagePolicy === "render") {
@@ -802,7 +795,7 @@ function MarkdownCode({
               : "overflow-x-auto",
           )}
         >
-          {highlightedHtml === null ? (
+          {highlightedMarkup === null ? (
             <code className="font-mono text-xs" {...props}>
               {codeText}
             </code>
@@ -812,7 +805,7 @@ function MarkdownCode({
                 "font-mono text-xs",
                 language ? `language-${language}` : "",
               )}
-              dangerouslySetInnerHTML={{ __html: highlightedHtml }}
+              dangerouslySetInnerHTML={highlightedMarkup}
               {...props}
             />
           )}
@@ -916,9 +909,6 @@ function MarkdownUnorderedList({ children }: MarkdownUnorderedListProps) {
   return <ul className="mb-2 list-disc pl-5 text-foreground">{children}</ul>;
 }
 
-// `start` carries the list's first number (`3.` renders as "3."), so it has to
-// reach the DOM: the marker comes from a CSS counter that otherwise restarts
-// at 1.
 function MarkdownOrderedList({
   children,
   className: _className,
@@ -959,14 +949,7 @@ function MarkdownTable({ children }: MarkdownTableProps) {
         marginInline: `calc((100% - ${MARKDOWN_TABLE_BREAKOUT_WIDTH}) / 2)`,
       }}
     >
-      {/*
-        Inner wrapper anchors narrow tables, centers mid-width tables, and
-        scrolls overflow for very wide tables. The min-width is clamped by
-        100% so it never forces the wrapper wider than the breakout
-        container — without that clamp, when the viewport shrinks below
-        `--md-content-w` the wrapper extends past the container and the
-        scrollbar gets clipped.
-      */}
+      {}
       <div
         className="w-max max-w-full overflow-x-auto"
         style={{
@@ -995,12 +978,14 @@ function MarkdownTableCell({ children }: MarkdownTableCellProps) {
   return <td className="border border-border px-2 py-1">{children}</td>;
 }
 
-function renderMarkdownImage({
+function MarkdownRenderedImage({
   alt,
+  sourceOffset,
   imageAttributes,
-  setExpandedImageUrl,
+  setExpandedImage,
   src,
 }: MarkdownImageRendererArgs) {
+  const openGallery = useContext(InlineImageGalleryContext);
   const imageUrl = typeof src === "string" ? src : "";
   if (!imageUrl) return null;
   return (
@@ -1008,9 +993,31 @@ function renderMarkdownImage({
       {...imageAttributes}
       src={imageUrl}
       alt={typeof alt === "string" ? alt : "Image"}
-      className="my-2 max-h-96 max-w-full cursor-zoom-in object-contain"
+      className="my-2 max-h-[max(384px,50vh)] max-w-full cursor-zoom-in object-contain"
       loading="lazy"
-      onClick={() => setExpandedImageUrl(imageUrl)}
+      data-markdown-image=""
+      data-markdown-image-offset={sourceOffset}
+      onClick={(event) => {
+        if (openGallery) {
+          openGallery(event.currentTarget);
+          return;
+        }
+        const markdownElement = event.currentTarget.closest(
+          "[data-markdown-preview]",
+        );
+        const images = Array.from(
+          markdownElement?.querySelectorAll("img") ?? [],
+        );
+        const imageIndex = images.indexOf(event.currentTarget);
+        const imageSources = images.map(
+          (image) => image.getAttribute("src") ?? image.src,
+        );
+        setExpandedImage({
+          imageSources,
+          index: imageIndex,
+          url: event.currentTarget.getAttribute("src") ?? imageUrl,
+        });
+      }}
     />
   );
 }
@@ -1040,12 +1047,15 @@ function resolveMarkdownSourceMedia({
   return colorScheme === preferredTheme ? "all" : "not all";
 }
 
+const EMPTY_THREAD_IDS: readonly string[] = [];
+
 function buildMarkdownComponents({
   imagePolicy,
+  imageSourceOffset,
   linkRouting,
   preferredTheme,
   rewriteLocalhostLinks,
-  setExpandedImageUrl,
+  setExpandedImage,
   threadMentions,
   promptMentions,
   messageDirectives,
@@ -1223,7 +1233,10 @@ function buildMarkdownComponents({
       [children],
     );
     const candidateThreadIds = useMemo(
-      () => [...new Set(candidates.map((candidate) => candidate.threadId))],
+      () =>
+        candidates.length === 0
+          ? EMPTY_THREAD_IDS
+          : [...new Set(candidates.map((candidate) => candidate.threadId))],
       [candidates],
     );
     const resourceById = useRawThreadMentionResources(candidateThreadIds);
@@ -1270,7 +1283,8 @@ function buildMarkdownComponents({
     src,
     alt,
     className: _className,
-    node: _node,
+    node,
+    "data-markdown-image-offset": pieceOffset,
     ...imageAttributes
   }: MarkdownImageProps) {
     if (imagePolicy === "alt-text") {
@@ -1280,12 +1294,53 @@ function buildMarkdownComponents({
         </span>
       );
     }
-    return renderMarkdownImage({
-      alt,
-      imageAttributes,
-      setExpandedImageUrl,
-      src,
-    });
+    const sourceOffset = pieceOffset ?? node?.position?.start.offset;
+    return (
+      <MarkdownRenderedImage
+        alt={alt}
+        sourceOffset={
+          sourceOffset === undefined
+            ? undefined
+            : imageSourceOffset + sourceOffset
+        }
+        imageAttributes={imageAttributes}
+        setExpandedImage={setExpandedImage}
+        src={src}
+      />
+    );
+  }
+
+  function MarkdownVideo({
+    node: _node,
+    children,
+    src,
+    poster,
+    controls = true,
+    playsInline = true,
+    preload = "metadata",
+    width,
+    height,
+    title,
+    "aria-label": label,
+  }: ComponentPropsWithoutRef<"video"> & ExtraProps) {
+    if (imagePolicy === "alt-text") {
+      return <span>[Video: {label || title || "video"}]</span>;
+    }
+    return (
+      <video
+        src={src}
+        poster={poster}
+        aria-label={label || title || "Video"}
+        controls={controls}
+        playsInline={playsInline}
+        preload={preload}
+        width={width}
+        height={height}
+        className="my-2 max-h-[max(384px,50vh)] max-w-full"
+      >
+        {children}
+      </video>
+    );
   }
 
   function MarkdownSource({
@@ -1321,6 +1376,7 @@ function buildMarkdownComponents({
     p: MarkdownParagraph,
     pre: MarkdownPre,
     source: MarkdownSource,
+    video: MarkdownVideo,
     table: MarkdownTable,
     td: MarkdownTableCell,
     th: MarkdownTableHeader,
@@ -1344,12 +1400,8 @@ function buildMarkdownComponents({
   }
 
   if (messageDirectives !== undefined) {
-    components["bb-message-directive"] = buildMessageDirectiveComponent({
-      mounts: messageDirectives.mounts,
-      message: messageDirectives.message,
-      openWorkspaceFile: messageDirectives.openWorkspaceFile,
-      openThreadPanel: messageDirectives.openThreadPanel,
-    });
+    components["bb-message-directive"] =
+      buildMessageDirectiveComponent(messageDirectives);
   }
 
   return components;
@@ -1393,9 +1445,6 @@ let sharedMarkdownTableResizeObserver: ResizeObserver | null = null;
 function measureMarkdownTableGeometry(
   registrations: Iterable<MarkdownTableGeometryRegistration>,
 ): void {
-  // Complete every geometry read before writing either CSS variable. Writing
-  // one table's variables first would make the next table's read recalculate
-  // layout while a long timeline's initial observer delivery is in progress.
   const measurements: MarkdownTableGeometryMeasurement[] = [];
   for (const registration of registrations) {
     const { breakout, clip, content } = registration;
@@ -1498,8 +1547,6 @@ function useMarkdownTableContentWidthVariable() {
       return;
     }
 
-    // The initial observer delivery gives us the geometry before paint without
-    // a synchronous layout read for every table while a long timeline mounts.
     return observeMarkdownTableGeometry(registration);
   }, []);
 
@@ -1513,13 +1560,6 @@ const HORIZONTAL_CLIP_OVERFLOW_VALUES = new Set([
   "scroll",
 ]);
 
-/**
- * The nearest element, starting at `element` itself, whose horizontal overflow
- * is clipped or scrolled. A table breakout that extends past this element's
- * padding box is lost: the clipped side is invisible and a scroll container
- * cannot scroll to a negative offset. The preview root counts because callers
- * can clip it through `className`.
- */
 function findHorizontalClipAncestor(element: HTMLElement): HTMLElement | null {
   let current: HTMLElement | null = element;
   while (current && current !== document.body) {
@@ -1533,11 +1573,6 @@ function findHorizontalClipAncestor(element: HTMLElement): HTMLElement | null {
   return null;
 }
 
-/**
- * Reads the widest breakout that keeps the table inside `clip`. The breakout
- * is centered on its containing block (the breakout's parent), so the usable
- * width is the parent content width plus twice the smaller side gap.
- */
 function readMarkdownTableBreakoutLimit({
   breakout,
   clip,
@@ -1549,8 +1584,6 @@ function readMarkdownTableBreakoutLimit({
   if (!clip || !parent) {
     return { kind: "remove" };
   }
-  // Positions are taken at scroll offset 0 of `clip`, so a horizontally
-  // scrolled container does not change the result.
   const parentStyle = getComputedStyle(parent);
   const parentPaddingLeft =
     parent.getBoundingClientRect().left + parent.clientLeft + clip.scrollLeft;
@@ -1597,12 +1630,6 @@ function cssPixels(value: string): number {
 const FRONTMATTER_PATTERN =
   /^---[ \t]*\r?\n([\s\S]*?)\r?\n---[ \t]*(?:\r?\n|$)/;
 
-/**
- * Splits a leading YAML frontmatter block (`---` … `---` at the very start of
- * the document) from the markdown body. Without this, react-markdown renders
- * the fences as two thematic breaks with the raw YAML as a paragraph between
- * them. Returns the inner frontmatter text (or null) and the remaining body.
- */
 function splitMarkdownFrontmatter(markdown: string): {
   frontmatter: string | null;
   body: string;
@@ -1614,12 +1641,6 @@ function splitMarkdownFrontmatter(markdown: string): {
   return { frontmatter: match[1], body: markdown.slice(match[0].length) };
 }
 
-/**
- * Renders frontmatter subtly: a muted, small key/value list set off by a thin
- * left rule, so it reads as document metadata instead of competing with the
- * body. Flat `key: value` lines get an aligned key; anything else (nested keys,
- * list items) is shown verbatim but still muted.
- */
 function MarkdownFrontmatter({ source }: { source: string }) {
   const lines = source.split("\n").filter((line) => line.trim().length > 0);
   if (lines.length === 0) {
@@ -1632,8 +1653,6 @@ function MarkdownFrontmatter({ source }: { source: string }) {
         if (separator > 0 && !/^[\s-]/.test(line)) {
           const key = line.slice(0, separator).trim();
           const value = line.slice(separator + 1).trim();
-          // `contents` lets the key/value spans participate in the parent grid,
-          // so every value lines up in a single column regardless of key width.
           return (
             <div key={index} className="contents">
               <span className="font-medium text-muted-foreground/70">
@@ -1660,7 +1679,9 @@ function MarkdownPreviewComponent({
   allowHtml = false,
   className,
   content,
+  sourcePrefix = "",
   imagePolicy = "render",
+  incrementalBlocks = false,
   linkRouting,
   threadMentions,
   promptMentions,
@@ -1669,15 +1690,22 @@ function MarkdownPreviewComponent({
 }: MarkdownPreviewProps) {
   const preferredTheme = usePreferredTheme();
   const [rewriteLocalhostLinks] = useRewriteLocalhostLinksPreference();
-  const [expandedImageUrl, setExpandedImageUrl] = useState<string | null>(null);
+  const [expandedImage, setExpandedImage] =
+    useState<ExpandedMarkdownImage | null>(null);
+  const [markdownPieceCache] = useState(createMarkdownPieceCache);
+  const rendersHtml = allowHtml && content.includes("<");
+  const usesIncrementalBlocks =
+    incrementalBlocks && !rendersHtml && promptMentions === undefined;
   const localFileRouting = linkRouting?.localFile;
   const localImageRouting = linkRouting?.localImage;
   const normalizeLocalFileLinks =
     localFileRouting !== undefined || localImageRouting !== undefined;
-  // Substitute prompt-mention spans for inert sentinels first (offsets index
-  // into the raw `content`), so the sentinels are present before frontmatter
-  // splitting and link normalization run. `resolvedPromptMentions` carries the
-  // index-aligned mention list the `bb-prompt-mention` renderer reads back.
+  const imageSourceOffset = useMemo(() => {
+    const prefix = normalizeLocalFileLinks
+      ? normalizeLocalFileMarkdownLinks(sourcePrefix)
+      : sourcePrefix;
+    return normalizeMathFences(splitMarkdownFrontmatter(prefix).body).length;
+  }, [sourcePrefix, normalizeLocalFileLinks]);
   const promptMentionSubstitution = useMemo(
     () =>
       promptMentions
@@ -1718,10 +1746,6 @@ function MarkdownPreviewComponent({
       body: normalizeMathFences(split.body),
     };
   }, [promptMarkdownContent]);
-  // The remark transform fills this shared mount table on every parse. Keep it
-  // stable while assistant text streams so the custom React component type
-  // also stays stable and an already-complete directive does not remount when
-  // later prose arrives.
   const messageDirectiveMounts = useMemo(() => {
     if (messageDirectives === undefined) {
       return null;
@@ -1739,25 +1763,19 @@ function MarkdownPreviewComponent({
     () =>
       buildMarkdownComponents({
         imagePolicy,
+        imageSourceOffset,
         linkRouting,
         preferredTheme,
         rewriteLocalhostLinks,
-        setExpandedImageUrl,
+        setExpandedImage,
         threadMentions,
         promptMentions: resolvedPromptMentions,
-        messageDirectives:
-          messageDirectiveMounts === null
-            ? undefined
-            : {
-                mounts: messageDirectiveMounts.mounts,
-                message: messageDirectiveMounts.message,
-                openWorkspaceFile: messageDirectiveMounts.openWorkspaceFile,
-                openThreadPanel: messageDirectiveMounts.openThreadPanel,
-              },
+        messageDirectives: messageDirectiveMounts ?? undefined,
       }),
     [
       linkRouting,
       imagePolicy,
+      imageSourceOffset,
       preferredTheme,
       rewriteLocalhostLinks,
       threadMentions,
@@ -1765,25 +1783,10 @@ function MarkdownPreviewComponent({
       messageDirectiveMounts,
     ],
   );
-  // A mention pipeline activates only when its prop is set. Generated thread
-  // bodies opt into `remark-breaks` so a single `\n` stays a line break;
-  // assistant thread mentions keep ordinary CommonMark soft breaks. Authored
-  // prompt mentions also preserve breaks to retain the editor's prior
-  // `whitespace-pre-wrap` behavior. User messages may enable both pipelines:
-  // offset substitution removes structured mentions before the raw-token pass,
-  // leaving only unstructured `@thread:<id>` tokens for that fallback.
-  //
-  // Message directives (assistant only) add `remark-directive` + a host
-  // transformer that rewrites recognized leaf directives into plugin mounts.
-  const remarkPlugins = useMemo((): NonNullable<
-    ReactMarkdownOptions["remarkPlugins"]
-  > => {
-    const plugins: NonNullable<ReactMarkdownOptions["remarkPlugins"]> = [
+  const hasMessageDirectives = messageDirectiveMounts !== null;
+  const baseRemarkPlugins = useMemo((): MarkdownRemarkPlugins => {
+    const plugins: MarkdownRemarkPlugins = [
       remarkGfm,
-      // `remark-math` with single-dollar math OFF: micromark pairs any two
-      // unescaped `$` on a line, so "$5 to $10" or "$HOME and $PATH" render the
-      // span between them as math — and literal dollars dominate chat (#511).
-      // Inline math needs `$$x$$`; `$$` on its own lines is still a block.
       [remarkMath, { singleDollarTextMath: false }],
     ];
     if (
@@ -1798,20 +1801,29 @@ function MarkdownPreviewComponent({
     if (promptMentions !== undefined) {
       plugins.push(remarkPromptMentions);
     }
-    if (messageDirectiveMounts !== null) {
+    if (hasMessageDirectives) {
       plugins.push(remarkDirective);
-      // Attacher + options: shared mount table is cleared/refilled each parse
-      // so indices stay aligned with the custom elements below.
-      plugins.push([
-        remarkMessageDirectives,
-        {
-          mounts: messageDirectiveMounts.mounts,
-          registry: messageDirectiveMounts.registry,
-        },
-      ]);
     }
     return plugins;
-  }, [threadMentions, promptMentions, messageDirectiveMounts]);
+  }, [threadMentions, promptMentions, hasMessageDirectives]);
+  const remarkPlugins = useMemo(
+    (): MarkdownRemarkPlugins =>
+      messageDirectiveMounts === null
+        ? baseRemarkPlugins
+        : [
+            ...baseRemarkPlugins,
+            [
+              remarkMessageDirectives,
+              {
+                indexBase: 0,
+                limit: MESSAGE_DIRECTIVE_MOUNT_LIMIT,
+                mounts: messageDirectiveMounts.mounts,
+                registry: messageDirectiveMounts.registry,
+              },
+            ],
+          ],
+    [baseRemarkPlugins, messageDirectiveMounts],
+  );
   const resolvedUrlTransform = useMemo(
     () =>
       localFileRouting || localImageRouting
@@ -1826,20 +1838,62 @@ function MarkdownPreviewComponent({
 
   const rehypeKatex = useRehypeKatex(markdownMayContainMath(body));
   const rehypePlugins = useMemo(
-    () => resolveRehypePlugins({ allowHtml, rehypeKatex }),
-    [allowHtml, rehypeKatex],
+    () => resolveRehypePlugins({ allowHtml: rendersHtml, rehypeKatex }),
+    [rendersHtml, rehypeKatex],
   );
 
-  const renderedMarkdown = (
-    <ReactMarkdown
-      rehypePlugins={rehypePlugins}
-      remarkPlugins={remarkPlugins}
-      components={markdownComponents}
-      urlTransform={resolvedUrlTransform}
-    >
-      {body}
-    </ReactMarkdown>
+  const markdownPieceRenderConfig = useMemo(
+    (): MarkdownPieceRenderConfig => ({
+      components: markdownComponents,
+      messageDirectiveRegistry: messageDirectiveMounts?.registry ?? null,
+      rehypePlugins,
+      remarkPlugins: baseRemarkPlugins,
+      urlTransform: resolvedUrlTransform,
+    }),
+    [
+      markdownComponents,
+      messageDirectiveMounts,
+      rehypePlugins,
+      baseRemarkPlugins,
+      resolvedUrlTransform,
+    ],
   );
+  const markdownPieces = usesIncrementalBlocks
+    ? resolveMarkdownPieces(markdownPieceCache, markdownPieceRenderConfig, body)
+    : null;
+
+  const renderedMarkdown =
+    markdownPieces === null ? (
+      <ReactMarkdown
+        rehypePlugins={rehypePlugins}
+        remarkPlugins={remarkPlugins}
+        components={markdownComponents}
+        urlTransform={resolvedUrlTransform}
+      >
+        {body}
+      </ReactMarkdown>
+    ) : (
+      markdownPieces.children
+    );
+
+  const imageSources = expandedImage?.imageSources ?? [];
+  const expandedImageIndex = expandedImage?.index ?? -1;
+  const hasImageNavigation =
+    expandedImageIndex !== -1 && imageSources.length > 1;
+  const stepExpandedImage = (direction: "previous" | "next") => {
+    if (expandedImageIndex === -1) return;
+    const nextIndex = getWrappedImageIndex({
+      currentIndex: expandedImageIndex,
+      direction,
+      itemCount: imageSources.length,
+    });
+    const nextImageSource = imageSources[nextIndex];
+    setExpandedImage(
+      nextImageSource === undefined
+        ? null
+        : { imageSources, index: nextIndex, url: nextImageSource },
+    );
+  };
 
   return (
     <>
@@ -1853,20 +1907,31 @@ function MarkdownPreviewComponent({
         {frontmatter !== null ? (
           <MarkdownFrontmatter source={frontmatter} />
         ) : null}
-        {threadMentions === undefined ? (
-          renderedMarkdown
-        ) : (
-          <RawThreadMentionBatchProvider>
-            {renderedMarkdown}
-          </RawThreadMentionBatchProvider>
-        )}
+        <MessageDirectiveMountsContext.Provider
+          value={
+            markdownPieces?.mounts ??
+            messageDirectiveMounts?.mounts ??
+            EMPTY_MOUNTED_MESSAGE_DIRECTIVES
+          }
+        >
+          {threadMentions === undefined ? (
+            renderedMarkdown
+          ) : (
+            <RawThreadMentionBatchProvider>
+              {renderedMarkdown}
+            </RawThreadMentionBatchProvider>
+          )}
+        </MessageDirectiveMountsContext.Provider>
       </div>
 
       <ImageLightbox
-        imageSrc={expandedImageUrl}
+        imageSrc={expandedImage?.url ?? null}
         imageAlt="Expanded image"
         title="Expanded image preview"
-        onClose={() => setExpandedImageUrl(null)}
+        hasMultipleImages={hasImageNavigation}
+        onPrevious={() => stepExpandedImage("previous")}
+        onNext={() => stepExpandedImage("next")}
+        onClose={() => setExpandedImage(null)}
       />
     </>
   );

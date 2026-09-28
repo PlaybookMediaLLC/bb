@@ -17,8 +17,8 @@ Every member below ships with the `experimental_` prefix and an entry in
 | Region                                     | Owner today                | After this change |
 | ------------------------------------------ | -------------------------- | ----------------- |
 | Top reserve / window drag row              | host                       | host, always      |
-| Primary actions (New thread, search)       | `ProjectListActionButtons` | host, always      |
-| Plugin nav rows (Tools, Docs, Tasks)       | `PluginNavSidebarItems`    | host, always      |
+| Primary actions (New thread, search)       | Navigation plugin          | navigation slot   |
+| Plugin nav rows (Tools, Docs, Tasks)       | Navigation plugin          | navigation slot   |
 | **Scrolling thread list**                  | `ProjectList`              | **the plugin**    |
 | Footer (Settings, plugin actions, updates) | host                       | host, always      |
 
@@ -26,15 +26,16 @@ The plugin replaces the scroll area only. The host keeps the chrome, so
 every sidebar looks like bb, resizes like bb, and collapses like bb.
 
 Two reasons the host keeps the rest. The nav rows and footer are other
-plugins' surfaces — Docs, Tasks, and every `sidebarFooterAction` live there —
+plugins' surfaces — Docs, Tasks, and every sidebar footer item live there —
 and one plugin must not be able to remove another's. The drag row and resize
 handle carry desktop window behavior that is not a plugin concern.
 
 An earlier revision let a list claim the New-thread and search row too. That
 is gone: the row is shared chrome, and passing it down as a prop would mean a
 plugin could silently drop it. A list that wants its own controls puts them at
-the top of its own scroll area, and filters by the `searchQuery` prop rather
-than shipping a second search field.
+the top of its own scroll area. Thread search stays host-owned in the quick
+palette; the required `searchQuery` prop remains only for compatibility and is
+always `""`.
 
 ---
 
@@ -65,21 +66,16 @@ interface PluginThreadListProps {
   /** True on phone-width viewports and coarse pointers. */
   isCompactViewport: boolean;
   /**
-   * Call after the user opens a thread. It closes the mobile sidebar, and it
-   * clears the host search field on every viewport. Always call it, or the
-   * sidebar stays in search mode after the thread opens.
+   * Call after the user opens a thread. It closes the mobile sidebar drawer.
    */
   onNavigate: () => void;
   /**
-   * The host search field's text, or "" when the field is closed. The host
-   * owns that field, so filter by this rather than shipping a second one.
+   * Compatibility value for the former sidebar search field. BB now searches
+   * threads in the quick palette, so the host always supplies "".
+   *
+   * @deprecated The quick palette owns thread search. Ignore this value.
    */
   searchQuery: string;
-  /**
-   * BB's thread list bound to this sidebar instance. Render it to delegate
-   * conditionally without re-entering plugin replacement resolution.
-   */
-  Original: ComponentType;
 }
 ```
 
@@ -88,20 +84,24 @@ interface PluginThreadListProps {
 Every other `app.slots.*` member is additive. This one is not: two thread
 lists cannot share one scroll area. The rules:
 
-1. Automatic is the default. It activates the first registered provider in
-   deterministic slot order; disabling or removing it reveals the next.
-2. The user can choose Automatic, pin the built-in list, or pin a provider in
-   **Settings → Appearance → Sidebar**.
-3. The choice is client-local, in `localStorage` under
-   `bb.sidebar.threadListProvider`, next to the other sidebar layout
-   preferences. A device with a plugin disabled falls back cleanly.
+1. Automatic is the default. bb ships its own list as the bundled
+   `thread-list` plugin, and Automatic activates the first other registered
+   provider in deterministic slot order, falling back to the bundled plugin.
+   Disabling or removing the active provider reveals the next.
+2. The user can choose Automatic or pin a provider, including the bundled
+   one, in **Settings → Appearance → Sidebar**. There is no separate built-in
+   list; a stored `__builtin__` preference selects the bundled plugin.
+3. The choice is the synced `sidebar.threadListProvider` UI preference,
+   shared by every client.
 4. If an explicitly chosen provider disappears — the plugin is uninstalled,
-   disabled, or fails to interpret — the host renders the built-in list and
-   keeps the preference. If the plugin comes back, so does its list.
+   disabled, or fails to interpret — the host shows the "No thread list
+   plugin is enabled" placeholder (with a link to Plugins) and keeps the
+   preference. If the plugin comes back, so does its list. While plugin
+   frontends are still booting, the placeholder shows skeleton rows instead.
 5. If the component throws, the host does **not** show the usual "plugin
    crashed" chip. A chip in place of the whole sidebar leaves the user
-   stranded. The host renders the built-in list instead, plus one toast that
-   names the plugin. `PluginSlotMount` gains this fallback mode.
+   stranded. The host shows a "stopped working" placeholder with a Reload
+   button that remounts the list, plus one toast that names the plugin.
 
 ---
 
@@ -171,7 +171,6 @@ interface PluginSidebarThread {
     id: string;
     name: string | null;
     branchName: string | null;
-    workspaceDisplayKind: PluginSidebarWorkspaceKind;
   } | null;
 
   /** Epoch milliseconds. */
@@ -515,7 +514,9 @@ import {
   type PluginSidebarThread,
   type PluginThreadListProps,
 } from "@get-bb/plugin-sdk/app";
-import { Loader2Icon, MessageCircleQuestionIcon } from "lucide-react";
+import { HugeiconsIcon } from "@hugeicons/react";
+import HelpCircleIcon from "@hugeicons/core-free-icons/HelpCircleIcon";
+import Loading03Icon from "@hugeicons/core-free-icons/Loading03Icon";
 
 function Row({
   thread,
@@ -556,9 +557,12 @@ function Row({
         </span>
         {/* Your icons, your rules — `indicator` is just a string. */}
         {thread.indicator === "runtime" ? (
-          <Loader2Icon className="size-3.5 animate-spin" />
+          <HugeiconsIcon
+            icon={Loading03Icon}
+            className="size-3.5 animate-spin"
+          />
         ) : thread.indicator === "waiting-for-input" ? (
-          <MessageCircleQuestionIcon className="size-3.5" />
+          <HugeiconsIcon icon={HelpCircleIcon} className="size-3.5" />
         ) : null}
       </a>
     </li>
@@ -602,6 +606,30 @@ That is a working sidebar in about eighty lines. It stays live, it draws its
 own status icons, its rows drag out to split panes, they answer the numbered
 thread shortcuts, and right-click still opens bb's full menu.
 
+### Starting from bb's own list instead
+
+bb's list is itself a plugin, [`plugins/thread-list`](../plugins/thread-list),
+and it is kept forkable: it imports only `@get-bb/plugin-sdk`, npm packages,
+its own files, and component registry items through the scaffold's `@/`
+alias (`@/components/ui/button`, `@/lib/utils`). In this repository its
+tsconfig maps `@/*` onto `packages/shared-ui/src`, the source the registry is
+generated from, and `@/components/ui/icon` onto the registry's host-backed
+icon. To diverge from it freely, copy the directory and give the package a new
+name. Then add the registry items it imports (`npx shadcn add @bb/button …`)
+and point `@/*` at `./*`. Install `@get-bb/plugin-sdk` from npm in place of
+`workspace:*`, and replace `@bb/shared-ui` with the items' packages. Drop the
+`@bb/plugin-build` dev dependency and the `prepare:bundled` script, which only
+the monorepo uses. The copy's CLI command, preferences mirror, and log
+prefixes follow its new plugin id.
+
+Inside this repository, `scripts/forkable-plugins.json` lists the built-ins
+held to that rule ([forkable-plugins.md](forkable-plugins.md)). The
+`bb/forkable-plugin-imports` lint rule rejects workspace-package imports in
+them and `@/` imports that no registry item provides.
+`pnpm check:plugin-forks` makes that copy in a temporary directory, with the
+same rewrite `scripts/lib/plugin-fork.mjs` implements, and runs its install,
+typecheck, tests, and `bb plugin build` there.
+
 ---
 
 ## 10. What this API does not give you
@@ -631,22 +659,25 @@ Add these when the API lands.
 ### `app.slots.experimental_threadList` (`@get-bb/plugin-sdk/app`)
 
 **What it does.** Replaces the sidebar's scrolling thread list with a plugin
-component. Exclusive: Automatic activates the first available provider, while
-the user can pin BB or one provider in client-local Settings. A crash or a
-missing explicitly selected plugin falls back to the built-in list.
+component. Exclusive: Automatic activates the first available provider other
+than the bundled `thread-list` plugin, falling back to it, while the user can
+pin one provider in the synced sidebar setting. A missing explicitly selected plugin shows
+the "No thread list plugin is enabled" placeholder; a crash shows a "stopped
+working" placeholder with a Reload button.
 
 **Audit before stabilizing.**
 
 1. **Arbitration.** Confirm a client-local single choice is right, versus a
    per-project or per-workspace choice, and what a synced setting would mean.
-2. **Fallback.** Confirm the silent fallback to the built-in list is
-   discoverable enough, and that one toast is the right signal.
+2. **Fallback.** Confirm the placeholder plus one toast is discoverable
+   enough when the list crashes.
 3. **Region boundary.** The plugin claims the scroll area and nothing else.
    Confirm no real sidebar needs more, and that handing the shared regions
    down as props — letting a plugin place them, at the risk of dropping them —
    stays the wrong trade.
-4. **Search ownership.** Confirm passing `searchQuery` down is right, versus
-   a callback that lets the plugin own the field.
+4. **Search compatibility.** Confirm released plugins no longer need the
+   required deprecated `searchQuery` field before removing it in a deliberate
+   breaking change. Until then, the host supplies `""`.
 5. **Accessibility.** Confirm the host can still guarantee list semantics,
    focus order, and the mobile close behavior when a plugin owns the markup.
 

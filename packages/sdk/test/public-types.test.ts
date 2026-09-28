@@ -221,6 +221,8 @@ interface NodeSurface {
 }
 
 type ExpectedBbSdkKey =
+  | "experimental_desktopBrowsers"
+  | "experimental_server"
   | "environments"
   | "files"
   | "guide"
@@ -242,6 +244,9 @@ type ExpectedRealtimeKey = "subscribe";
 type ExpectedEnvironmentsKey =
   | "archiveThreads"
   | "commit"
+  | "delete"
+  | "list"
+  | "listProviders"
   | "diff"
   | "diffBranches"
   | "diffFile"
@@ -253,7 +258,6 @@ type ExpectedEnvironmentsKey =
   | "mergePullRequest"
   | "paths"
   | "pullRequest"
-  | "squashMerge"
   | "status"
   | "update";
 
@@ -271,19 +275,31 @@ type ExpectedGuideKey = "render";
 
 type ExpectedHostsKey =
   | "cloneDefaultPath"
+  | "experimental_create"
+  | "experimental_getEnrollmentCommand"
+  | "experimental_reconnect"
   | "createJoinCode"
   | "delete"
+  | "experimental_deleteOldServerCopy"
   | "directory"
   | "get"
   | "installProviderCli"
   | "list"
+  | "experimental_listProviders"
   | "pathsExist"
   | "pickFolder"
   | "providerCliStatus"
+  | "experimental_resume"
+  | "experimental_retryCleanup"
   | "retryUpdate"
+  | "experimental_suspend"
+  | "experimental_reconcile"
   | "update";
 
 type ExpectedPluginsKey =
+  | "experimental_discoverRpc"
+  | "experimental_getSafeMode"
+  | "experimental_setSafeMode"
   | "applyUpdate"
   | "callRpc"
   | "catalog"
@@ -306,6 +322,10 @@ type ExpectedPluginCatalogKey = "install" | "installPlan" | "search" | "status";
 type ExpectedPluginMarketplacesKey = "add" | "list" | "refresh" | "remove";
 
 type ExpectedProjectsKey =
+  | "machineEnvironment"
+  | "replaceMachineEnvironment"
+  | "setMachineEnvironmentVariable"
+  | "deleteMachineEnvironmentVariable"
   | "attachments"
   | "branches"
   | "commands"
@@ -331,13 +351,24 @@ type ExpectedProvidersKey = "list" | "models";
 type ExpectedStatusKey = "get";
 
 type ExpectedSystemKey =
+  | "acknowledgeAppUpdate"
+  | "appUpdate"
+  | "applyAppUpdate"
+  | "setMachineEnvironmentVariable"
+  | "deleteMachineEnvironmentVariable"
+  | "machineEnvironment"
+  | "replaceMachineEnvironment"
+  | "aiServices"
   | "attention"
   | "cliSkillsStatus"
   | "config"
   | "executionOptions"
   | "installCliSkills"
   | "reloadConfig"
+  | "setAiServiceSelection"
+  | "testAiService"
   | "transcribeVoice"
+  | "uiPreferences"
   | "updateExperiments"
   | "updateGeneralSettings"
   | "updateKeyboardSettings"
@@ -345,18 +376,25 @@ type ExpectedSystemKey =
   | "usageLimits"
   | "version";
 
-type ExpectedThemeKey = "catalog" | "get" | "set";
+type ExpectedSystemUiPreferencesKey = "list" | "reset" | "set";
+
+type ExpectedThemeKey = "catalog" | "get" | "resolve" | "set";
 
 type ExpectedThreadSectionsKey = "create" | "delete" | "list" | "update";
 
 type ExpectedThreadsKey =
+  | "getPluginMetadata"
+  | "updatePluginMetadata"
+  | "context"
   | "archive"
   | "archiveAll"
   | "cancelPlan"
   | "childSummary"
+  | "clearContext"
   | "clearGoal"
   | "compact"
   | "conversationOutline"
+  | "count"
   | "defaultExecutionOptions"
   | "delete"
   | "editMessage"
@@ -365,6 +403,7 @@ type ExpectedThreadsKey =
   | "get"
   | "interactions"
   | "list"
+  | "listRunning"
   | "markRead"
   | "markUnread"
   | "open"
@@ -372,9 +411,12 @@ type ExpectedThreadsKey =
   | "paneAction"
   | "pin"
   | "promptHistory"
+  | "queue"
   | "queuedMessages"
   | "reorderPinned"
   | "resolveMentions"
+  | "restoreEnvironment"
+  | "retry"
   | "search"
   | "send"
   | "spawn"
@@ -391,6 +433,12 @@ type ExpectedThreadsKey =
   | "wait";
 
 type ExpectedThreadEventsKey = "list" | "wait";
+/**
+ * The cross-thread queue area answers exactly one question — what is queued
+ * right now — so it has exactly one method. A row's own operations (send-now,
+ * edit, reorder, delete) live on `queuedMessages`.
+ */
+type ExpectedThreadQueueKey = "list";
 type ExpectedThreadInteractionsKey =
   | "cancel"
   | "get"
@@ -432,8 +480,6 @@ describe("SDK public type entrypoints", () => {
   });
 
   it("keeps the local guide area off the browser SDK instance", () => {
-    // The guide bundles the generated templates; the browser factory must not
-    // attach it so those bytes stay out of the web app's boot chunk.
     expectTypeOf<keyof BrowserRuntimeBbSdk>().toEqualTypeOf<
       Exclude<ExpectedBbSdkKey, "guide">
     >();
@@ -530,6 +576,9 @@ describe("SDK public type entrypoints", () => {
       keyof RootBbSdk["system"]
     >().toEqualTypeOf<ExpectedSystemKey>();
     expectTypeOf<
+      keyof RootBbSdk["system"]["uiPreferences"]
+    >().toEqualTypeOf<ExpectedSystemUiPreferencesKey>();
+    expectTypeOf<
       keyof RootBbSdk["terminals"]
     >().toEqualTypeOf<ExpectedTerminalsKey>();
     expectTypeOf<keyof RootBbSdk["theme"]>().toEqualTypeOf<ExpectedThemeKey>();
@@ -542,6 +591,9 @@ describe("SDK public type entrypoints", () => {
     expectTypeOf<
       keyof RootBbSdk["threads"]["events"]
     >().toEqualTypeOf<ExpectedThreadEventsKey>();
+    expectTypeOf<
+      keyof RootBbSdk["threads"]["queue"]
+    >().toEqualTypeOf<ExpectedThreadQueueKey>();
     expectTypeOf<
       keyof RootBbSdk["threads"]["interactions"]
     >().toEqualTypeOf<ExpectedThreadInteractionsKey>();

@@ -4,6 +4,7 @@ import type { FeatureFlags, ProviderNativeSkillRoots } from "@bb/domain";
 import type { Logger } from "@bb/logger";
 import type { PendingInteractionLifecycle } from "./services/interactions/pending-interactions.js";
 import type { MachineAuthService } from "./services/machine-auth.js";
+import type { AppUpdateService } from "./services/system/app-update.js";
 import type { AppVersionService } from "./services/system/app-version.js";
 import type { BbAppManagedConfigReloader } from "./services/system/bb-app-managed-config.js";
 import type { TelemetryService } from "./services/system/telemetry.js";
@@ -29,29 +30,12 @@ export interface ServerRuntimeConfig {
   featureFlags: FeatureFlags;
   hostDaemonPort: number;
   inheritedSkillsRootPaths: string[];
-  inferenceFallbackModel: string;
-  inferenceModel: string;
   isDevelopment: boolean;
-  /**
-   * Grace window (ms) after the last live thread in a managed environment is
-   * archived before its worktree is destroyed, during which an accidental
-   * archive can be undone losslessly. Defaults to
-   * {@link MANAGED_ENVIRONMENT_RETIRE_GRACE_MS}; set to 0 to destroy immediately.
-   */
-  managedEnvironmentRetireGraceMs: number;
-  /** Manifest URL of the reserved `bb-community` plugin marketplace. */
   marketplaceUrl: string;
-  openAiApiKey: string;
   serverPort: number;
   sharedSkillRoots: ProviderNativeSkillRoots;
-  transcriptionModel: string;
   appUrl?: string;
   devAppPort?: number;
-  /**
-   * Per-spawn identity from the bb-app launcher, echoed on /health so the
-   * launcher can tell this server from another one that owns the same port.
-   * Absent when the server was not started by the launcher.
-   */
   launchId?: string;
 }
 
@@ -65,7 +49,6 @@ export interface AppDeps {
   pendingInteractions: PendingInteractionLifecycle;
   providerRegistry: ProviderRegistryService;
   pluginHostArtifacts: PluginHostArtifactRegistry;
-  /** Plugin-resolved native roots per (plugin, provider, host, cwd). */
   providerNativeRoots: ProviderNativeRootsCache;
   aiServices: AiServiceRegistry;
   skillTreeRegistry: SkillTreeRegistry;
@@ -77,6 +60,7 @@ export interface AppDeps {
 }
 
 export interface ServerAppDeps extends AppDeps {
+  appUpdate: AppUpdateService;
   appVersion: AppVersionService;
   bbAppManagedConfig: BbAppManagedConfigReloader;
 }
@@ -86,6 +70,7 @@ export type WorkSessionDeps = Pick<
   | "config"
   | "db"
   | "hub"
+  | "logger"
   | "lifecycleDedupers"
   | "machineAuth"
   | "providerRegistry"

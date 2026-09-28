@@ -5,6 +5,7 @@ import {
 import { describe, expect, it } from "vitest";
 import { createStore } from "../api";
 import type { Comment, Project, Task } from "../db";
+import { displayWidth } from "../shared/text-measure";
 import { delegationRpcContract } from "./contract";
 import { buildSeedPrompt, registerDelegation } from ".";
 
@@ -166,6 +167,45 @@ describe("task delegation", () => {
         liveStatus: "working",
       }),
     ]);
+
+    await harness.dispose();
+  });
+
+  it("bounds delegated thread titles by display width", async () => {
+    const { bb, harness } = createFakePluginHost({
+      pluginId: "tasks",
+      sdk: {
+        threads: {
+          spawn: async () => ({ id: "thr_wide_title" }),
+          get: async () =>
+            makeThreadResponse({ id: "thr_wide_title", status: "starting" }),
+        },
+      },
+    });
+    const store = createStore(bb);
+    const project = store.tasks.createProject({
+      name: "Tasks plugin",
+      prefix: "TASK",
+      color: "blue",
+      linkedBbProjectId: "proj_bb",
+    });
+    const task = store.tasks.createTask({
+      projectId: project.id,
+      title: "调".repeat(100),
+    });
+    registerDelegation(bb, store);
+    const preset = createTestPreset(store);
+
+    await harness.callRpc("delegate", {
+      taskId: task.id,
+      presetId: preset.id,
+    });
+
+    const title = `TASK-1 · ${"调".repeat(55)}`;
+    expect(harness.sdk.callsTo("threads.spawn")).toEqual([
+      [expect.objectContaining({ title })],
+    ]);
+    expect(displayWidth(title)).toBeLessThanOrEqual(120);
 
     await harness.dispose();
   });
@@ -363,7 +403,7 @@ describe("task delegation", () => {
         threads: {
           get: async () => ({
             id: "thr_existing",
-            title: "Existing worker",
+            title: "𠮷".repeat(100),
             titleFallback: null,
             status: "active",
           }),
@@ -395,7 +435,7 @@ describe("task delegation", () => {
       expect.objectContaining({
         threadId: "thr_existing",
         presetName: "Attached",
-        title: "Existing worker",
+        title: "𠮷".repeat(60),
         liveStatus: "working",
       }),
     ]);
@@ -450,8 +490,6 @@ describe("task thread detach", () => {
       taskId: task.id,
       threadId: "thr_live",
     });
-    // The same thread attached to a second task must survive a detach from
-    // the first one.
     await harness.callRpc("taskThreadsAttach", {
       taskId: otherTask.id,
       threadId: "thr_dead",
@@ -481,7 +519,6 @@ describe("task thread detach", () => {
       },
     ]);
 
-    // Detaching a thread that is not attached is an error, not a no-op.
     await expect(
       harness.callRpc("taskThreadsDetach", {
         taskId: task.id,

@@ -14,7 +14,6 @@ interface TestHarness extends LoadRemoteServerPageArgs {
   warnings: string[];
 }
 
-// What `BrowserWindow.loadURL` rejects with when nothing answers at the target.
 function createElectronLoadError(url: string): Error {
   const error = new Error(`ERR_CONNECTION_REFUSED (-102) loading '${url}/'`);
   error.stack =
@@ -59,9 +58,13 @@ describe("loadRemoteServerPage", () => {
     expect(harness.shownErrors).toHaveLength(1);
     const view = harness.shownErrors[0];
     expect(view?.title).toBe("Could not reach this bb server");
-    expect(view?.details).toContain("http://bb-host.tailnet.ts.net:38886");
-    expect(view?.details).toContain("Window ▸ Server");
-    expect(view?.details).toContain("This Mac");
+    expect(view?.details).toBe(
+      "The bb server at http://bb-host.tailnet.ts.net:38886 did not answer. Check that the machine is awake and reachable.",
+    );
+    expect(view?.actions.map((action) => action.id)).toEqual([
+      "retry",
+      "choose-server",
+    ]);
     expect(view?.details).not.toContain("rejectAndCleanup");
     expect(view?.details).not.toContain("node:electron");
 

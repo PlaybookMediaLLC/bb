@@ -15,10 +15,12 @@ import { CompactLongPressMenu } from "./compact-long-press-menu";
 const LONG_PRESS_MS = 700;
 
 function renderRow({
+  disabled = false,
   onRowClick = vi.fn(),
   onOpenChange = vi.fn(),
   onRename = vi.fn(),
 }: {
+  disabled?: boolean;
   onRowClick?: () => void;
   onOpenChange?: (open: boolean) => void;
   onRename?: () => void;
@@ -29,6 +31,7 @@ function renderRow({
   const utils = render(
     <CompactViewportOverrideProvider isCompactViewport>
       <CompactLongPressMenu
+        disabled={disabled}
         label="Thread actions"
         onOpenChange={onOpenChange}
         items={<DropdownMenuItem onSelect={onRename}>Rename</DropdownMenuItem>}
@@ -66,11 +69,28 @@ afterEach(() => {
 });
 
 describe("CompactLongPressMenu", () => {
+  it("preserves touch selection and the native context menu while disabled", () => {
+    vi.useFakeTimers();
+    const { row, onOpenChange } = renderRow({ disabled: true });
+
+    touchPointerDown(row);
+    act(() => {
+      vi.advanceTimersByTime(LONG_PRESS_MS);
+    });
+    const event = new MouseEvent("contextmenu", {
+      bubbles: true,
+      cancelable: true,
+    });
+    fireEvent(row, event);
+
+    expect(onOpenChange).not.toHaveBeenCalled();
+    expect(event.defaultPrevented).toBe(false);
+  });
+
   it("mounts nothing for the menu until a long press, then opens the drawer without a modal takeover", () => {
     vi.useFakeTimers();
     const { row, onOpenChange } = renderRow();
 
-    // A row costs pointer handlers only: no menu, dialog, or drawer DOM.
     expect(screen.queryByRole("menuitem")).toBeNull();
     expect(document.querySelector("[role='dialog']")).toBeNull();
 
@@ -84,14 +104,11 @@ describe("CompactLongPressMenu", () => {
     });
     expect(onOpenChange).toHaveBeenCalledWith(true);
 
-    // Drawer content realizes after the shell's frame/timeout fallback.
     act(() => {
       vi.advanceTimersByTime(500);
     });
     expect(screen.getByRole("menuitem", { name: "Rename" })).toBeTruthy();
 
-    // The persistent drawer never marks the app root inert/hidden or flips
-    // document-wide pointer events (what the modal Radix ContextMenu did).
     const root = document.getElementById("root");
     expect(root?.getAttribute("aria-hidden")).toBeNull();
     expect(root?.hasAttribute("inert")).toBe(false);
@@ -110,9 +127,23 @@ describe("CompactLongPressMenu", () => {
     fireEvent.click(row);
     expect(onRowClick).not.toHaveBeenCalled();
 
-    // A later, ordinary tap still navigates.
     fireEvent.click(row);
     expect(onRowClick).toHaveBeenCalledTimes(1);
+  });
+
+  it("ignores the opening release on a menu item but allows a new tap", () => {
+    vi.useFakeTimers();
+    const { row, onRename } = renderRow();
+    touchPointerDown(row);
+    act(() => vi.advanceTimersByTime(LONG_PRESS_MS));
+    act(() => vi.advanceTimersByTime(500));
+    const item = screen.getByRole("menuitem", { name: "Rename" });
+    act(() => vi.advanceTimersByTime(2000));
+    fireEvent.click(item);
+    expect(onRename).not.toHaveBeenCalled();
+    touchPointerDown(item);
+    fireEvent.click(item);
+    expect(onRename).toHaveBeenCalledOnce();
   });
 
   it("cancels the press when the finger moves or lifts early, and ignores mouse pointers", () => {
@@ -149,7 +180,6 @@ describe("CompactLongPressMenu", () => {
     });
     expect(onOpenChange).not.toHaveBeenCalled();
 
-    // A plain tap still reaches the row.
     fireEvent.click(row);
     expect(onRowClick).toHaveBeenCalledTimes(1);
   });
@@ -182,8 +212,6 @@ describe("CompactLongPressMenu", () => {
     );
     const row = screen.getByTestId("row");
 
-    // Touch long press on the row: the bubbling pointerdown must not start
-    // the project section's timer as well.
     touchPointerDown(row);
     act(() => {
       vi.advanceTimersByTime(LONG_PRESS_MS);
@@ -191,13 +219,11 @@ describe("CompactLongPressMenu", () => {
     expect(onThreadOpenChange).toHaveBeenCalledWith(true);
     expect(onProjectOpenChange).not.toHaveBeenCalled();
 
-    // Right-click on the row: same, through defaultPrevented.
     onThreadOpenChange.mockClear();
     fireEvent.contextMenu(row);
     expect(onThreadOpenChange).toHaveBeenCalledWith(true);
     expect(onProjectOpenChange).not.toHaveBeenCalled();
 
-    // A press on the section itself (outside any row) still opens its menu.
     touchPointerDown(screen.getByText("Project"));
     act(() => {
       vi.advanceTimersByTime(LONG_PRESS_MS);

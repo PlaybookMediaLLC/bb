@@ -5,22 +5,15 @@ export const PALETTE_RESULT_LIMIT = 50;
 
 export interface RankedPaletteAction {
   action: PaletteAction;
-  /** Indices into `action.title` to emphasize; empty when nothing matched it. */
   positions: readonly number[];
 }
 
 export interface RankPaletteActionsArgs {
   actions: readonly PaletteAction[];
   query: string;
-  /** Action ids, most recently run first. */
   recentIds: readonly string[];
 }
 
-/**
- * Positions to emphasize in `title`. Recomputed here because a match may have
- * scored on the group label instead, whose positions would land on the wrong
- * characters; a group-only match emphasizes nothing.
- */
 function titleMatchPositions(title: string, query: string): number[] {
   const positions: number[] = [];
   const haystack = title.toLowerCase();
@@ -36,13 +29,13 @@ function titleMatchPositions(title: string, query: string): number[] {
   return positions;
 }
 
-/**
- * Recents first then build order with no query; fuzzy score with one, breaking
- * ties on recency then build order so repeated searches are stable.
- */
 export function rankPaletteActions(
   args: RankPaletteActionsArgs,
 ): RankedPaletteAction[] {
+  if (args.query.trim() === "") {
+    return args.actions.map((action) => ({ action, positions: [] }));
+  }
+
   const buildOrder = new Map(
     args.actions.map((action, index) => [action.id, index]),
   );
@@ -53,20 +46,11 @@ export function rankPaletteActions(
     recentRank.get(action.id) ?? Number.MAX_SAFE_INTEGER;
   const orderOf = (action: PaletteAction) => buildOrder.get(action.id) ?? 0;
 
-  if (args.query.trim() === "") {
-    return [...args.actions]
-      .sort(
-        (left, right) =>
-          rankOf(left) - rankOf(right) || orderOf(left) - orderOf(right),
-      )
-      .slice(0, PALETTE_RESULT_LIMIT)
-      .map((action) => ({ action, positions: [] }));
-  }
-
   const matches = fuzzyMatchText({
     items: args.actions,
     query: args.query,
-    getText: (action) => [action.title, action.group],
+    getText: (action) => action.title,
+    getAliases: (action) => [action.group],
     limit: PALETTE_RESULT_LIMIT,
   });
 

@@ -6,19 +6,11 @@ import {
 import { handleLine } from "./bridge.js";
 import { type FakePiBridgeHarness, startFakePiBridge } from "./test-support.js";
 
-/**
- * The pi bridge's conformance run: the canonical protocol suite against the
- * bridge with a scripted `pi --mode rpc` child underneath (fake-pi-rpc.mjs),
- * the same seam (`BB_PI_BRIDGE_COMMAND`/`_ARGS`) a live run uses to find pi.
- */
-
-/** A conformance wait may cold-start the real fork-helper process on CI. */
 const CONFORMANCE_WAIT_TIMEOUT_MS = 30_000;
 
 let harness: FakePiBridgeHarness;
 
 beforeEach(async () => {
-  // The conformance kit sends the initialize handshake itself.
   harness = await startFakePiBridge({
     prefix: "bb-pi-conformance-ws-",
     initialize: false,
@@ -53,6 +45,7 @@ it("passes the canonical protocol suite against a scripted pi rpc child", async 
     "rpc/response-not-request": "pass",
     "handshake/initialize": "pass",
     "session/start-identity": "pass",
+    "session/start-identity-announced": "pass",
     "turn/lifecycle": "pass",
     "events/schema-valid": "pass",
     "item/opens-before-delta": "pass",
@@ -60,6 +53,7 @@ it("passes the canonical protocol suite against a scripted pi rpc child", async 
     "session/resume-identity": "pass",
     "session/resume-id-uniqueness": "pass",
     "session/fork-identity": "pass",
+    "session/fork-identity-announced": "pass",
     "session/threads-independent": "pass",
     "stop/interrupt-settles-before-result": "pass",
   });

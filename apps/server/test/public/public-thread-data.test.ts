@@ -1,13 +1,15 @@
 import { and, eq } from "drizzle-orm";
 import {
-  claimQueuedThreadMessage,
+  claimQueuedThreadMessageGroup,
   createQueuedThreadMessageId,
   createThreadSection,
   deleteQueuedThreadMessage,
-  deleteHost,
   environments,
   events,
+  getEnvironment,
+  getPreparingEnvironment,
   getQueuedThreadMessage,
+  hosts,
   insertEvents,
   listQueuedThreadMessages,
   getThread,
@@ -15,6 +17,7 @@ import {
   reorderQueuedThreadMessage,
   setQueuedThreadMessageGroupBoundary,
   setThreadExecutionOverride,
+  threads as threadRows,
 } from "@bb/db";
 import {
   encodeClientTurnRequestIdNumber,
@@ -40,27 +43,32 @@ import { renderTemplate } from "@bb/templates";
 import { z } from "zod";
 import { describe, expect, it, vi } from "vitest";
 import type { TelemetryService } from "../../src/services/system/telemetry.js";
-import { loadActiveThreadProvisionContext } from "../../src/services/threads/thread-provisioning-environment.js";
 import {
+  reportNextEnvironmentAttachSuccess,
   reportQueuedCommandError,
   reportQueuedCommandSuccess,
   waitForQueuedCommand,
-  waitForQueuedCommandAfter,
 } from "../helpers/commands.js";
-import { registerHostRpcResponder } from "../helpers/host-rpc.js";
+import {
+  registerHostRpcResponder,
+  type HostRpcHandlerResult,
+} from "../helpers/host-rpc.js";
 import { readJson } from "../helpers/json.js";
 import { textInput } from "../helpers/prompt-input.js";
 import {
-  seedQueuedMessage,
   seedEnvironment,
   seedEvent,
+  seedHost,
   seedHostSession,
   seedProjectWithSource,
+  seedQueuedMessage,
   seedStoredEvent,
   seedThread,
   seedThreadFixture,
+  seedThreadIdentity,
   seedThreadRuntimeState,
 } from "../helpers/seed.js";
+import { installFakeEnvironmentProvider } from "../helpers/environment-provider.js";
 import { withTestHarness } from "../helpers/test-app.js";
 
 const queuedMessageIdResponseSchema = z.object({
@@ -87,6 +95,10 @@ type TimelineTurnRow = Extract<TimelineRow, { kind: "turn" }>;
 describe("public thread data routes", () => {
   it("manages sections through the canonical public route lifecycle", async () => {
     await withTestHarness(async (harness) => {
+      const initialList = await harness.app.request("/api/v1/thread-sections");
+      expect(initialList.status).toBe(200);
+      expect(await readJson(initialList)).toEqual([]);
+
       const { host } = seedHostSession(harness.deps);
       const { project } = seedProjectWithSource(harness.deps, {
         hostId: host.id,
@@ -160,6 +172,9 @@ describe("public thread data routes", () => {
       expect(bootstrap.sections).toContainEqual(
         expect.objectContaining({ id: section.id, name: "Ship room" }),
       );
+      const listResponse = await harness.app.request("/api/v1/thread-sections");
+      expect(listResponse.status).toBe(200);
+      expect(await readJson(listResponse)).toEqual(bootstrap.sections);
 
       const deleteResponse = await harness.app.request(
         "/api/v1/thread-sections",
@@ -180,6 +195,8 @@ describe("public thread data routes", () => {
         updatedThreadCount: 1,
       });
       expect(getThread(harness.db, thread.id)?.sectionId).toBeNull();
+      const emptyList = await harness.app.request("/api/v1/thread-sections");
+      expect(await readJson(emptyList)).toEqual([]);
 
       const missingResponse = await harness.app.request(
         "/api/v1/thread-sections",
@@ -259,6 +276,105 @@ describe("public thread data routes", () => {
     });
   });
 
+  it("lists only the threads on one environment", async () => {
+    await withTestHarness(async (harness) => {
+      const { host } = seedHostSession(harness.deps);
+      const { project } = seedProjectWithSource(harness.deps, {
+        hostId: host.id,
+      });
+      const environment = seedEnvironment(harness.deps, {
+        hostId: host.id,
+        path: "/tmp/thread-list-env",
+        projectId: project.id,
+      });
+      const other = seedEnvironment(harness.deps, {
+        hostId: host.id,
+        path: "/tmp/thread-list-env-other",
+        projectId: project.id,
+      });
+      const onEnvironment = seedThread(harness.deps, {
+        environmentId: environment.id,
+        projectId: project.id,
+        title: "On the environment",
+      });
+      seedThread(harness.deps, {
+        environmentId: other.id,
+        projectId: project.id,
+        title: "Somewhere else",
+      });
+      seedThread(harness.deps, {
+        projectId: project.id,
+        title: "No environment yet",
+      });
+
+      const response = await harness.app.request(
+        `/api/v1/threads?environmentId=${environment.id}`,
+      );
+      expect(response.status).toBe(200);
+      const listed = z.array(threadSchema).parse(await readJson(response));
+      expect(listed.map((thread) => thread.id)).toEqual([onEnvironment.id]);
+    });
+  });
+
+  it("lists only the unarchived threads whose environment is on one machine", async () => {
+    await withTestHarness(async (harness) => {
+      const { host } = seedHostSession(harness.deps);
+      const other = seedHost(harness.deps, {
+        id: "host_other",
+        name: "Other",
+      });
+      const { project } = seedProjectWithSource(harness.deps, {
+        hostId: host.id,
+      });
+      const first = seedEnvironment(harness.deps, {
+        hostId: host.id,
+        path: "/tmp/thread-list-host-a",
+        projectId: project.id,
+      });
+      const second = seedEnvironment(harness.deps, {
+        hostId: host.id,
+        path: "/tmp/thread-list-host-b",
+        projectId: project.id,
+      });
+      const elsewhere = seedEnvironment(harness.deps, {
+        hostId: other.id,
+        path: "/tmp/thread-list-host-other",
+        projectId: project.id,
+      });
+      const onFirst = seedThread(harness.deps, {
+        environmentId: first.id,
+        projectId: project.id,
+      });
+      const onSecond = seedThread(harness.deps, {
+        environmentId: second.id,
+        projectId: project.id,
+      });
+      const archived = seedThread(harness.deps, {
+        environmentId: second.id,
+        projectId: project.id,
+      });
+      harness.db
+        .update(threadRows)
+        .set({ archivedAt: 1 })
+        .where(eq(threadRows.id, archived.id))
+        .run();
+      seedThread(harness.deps, {
+        environmentId: elsewhere.id,
+        projectId: project.id,
+      });
+      seedThread(harness.deps, { projectId: project.id });
+
+      const response = await harness.app.request(
+        `/api/v1/threads?hostId=${host.id}&archived=false`,
+      );
+      expect(response.status).toBe(200);
+      const listed = z.array(threadSchema).parse(await readJson(response));
+      expect(listed.map((thread) => thread.id).sort()).toEqual(
+        [onFirst.id, onSecond.id].sort(),
+      );
+    });
+  });
+
   it("allows creating or assigning a hidden thread in a section", async () => {
     await withTestHarness(async (harness) => {
       const { host } = seedHostSession(harness.deps);
@@ -332,6 +448,7 @@ describe("public thread data routes", () => {
       const leanThread = await readJson(leanResponse);
       expect(leanThread).not.toHaveProperty("environment");
       expect(leanThread).not.toHaveProperty("host");
+      expect(leanThread).not.toHaveProperty("environmentHostName");
 
       const includeResponse = await harness.app.request(
         `/api/v1/threads/${thread.id}?include=environment,host`,
@@ -344,6 +461,32 @@ describe("public thread data routes", () => {
       expect(includedThread.environment?.id).toBe(environment.id);
       expect(includedThread.host?.id).toBe(host.id);
       expect(includedThread.host?.status).toBe("connected");
+      expect(includedThread.environmentHostName).toBe(host.name);
+    });
+  });
+
+  it("retains a removed machine name for thread history without exposing an active host", async () => {
+    await withTestHarness(async (harness) => {
+      const { host, environment, thread } = seedThreadFixture(harness, {
+        session: { id: "host-thread-removed-name" },
+      });
+      harness.deps.db
+        .update(hosts)
+        .set({ destroyedAt: Date.now() })
+        .where(eq(hosts.id, host.id))
+        .run();
+
+      const response = await harness.app.request(
+        `/api/v1/threads/${thread.id}?include=environment,host`,
+      );
+      expect(response.status).toBe(200);
+      const includedThread = threadWithIncludesResponseSchema.parse(
+        await readJson(response),
+      );
+      expect(includedThread.environment?.id).toBe(environment.id);
+      expect(includedThread.environment?.hostLifecycle).toBe("removed");
+      expect(includedThread.host).toBeNull();
+      expect(includedThread.environmentHostName).toBe(host.name);
     });
   });
 
@@ -367,7 +510,7 @@ describe("public thread data routes", () => {
         environmentId: environment.id,
         projectId: project.id,
       });
-      deleteHost(harness.deps.db, harness.deps.hub, host.id);
+      harness.deps.db.delete(hosts).where(eq(hosts.id, host.id)).run();
 
       const noEnvironmentResponse = await harness.app.request(
         `/api/v1/threads/${threadWithoutEnvironment.id}?include=environment,host`,
@@ -378,6 +521,7 @@ describe("public thread data routes", () => {
       );
       expect(noEnvironmentThread.environment).toBeNull();
       expect(noEnvironmentThread.host).toBeNull();
+      expect(noEnvironmentThread.environmentHostName).toBeNull();
 
       const missingHostResponse = await harness.app.request(
         `/api/v1/threads/${threadWithMissingHost.id}?include=host`,
@@ -388,6 +532,7 @@ describe("public thread data routes", () => {
       );
       expect(missingHostThread).not.toHaveProperty("environment");
       expect(missingHostThread.host).toBeNull();
+      expect(missingHostThread.environmentHostName).toBeNull();
     });
   });
 
@@ -506,10 +651,6 @@ describe("public thread data routes", () => {
     await withTestHarness(async (harness) => {
       const { environment, thread } = seedThreadFixture(harness);
 
-      // Three message turns, each: user request -> turn start -> assistant
-      // message -> turn complete. Segment anchors are the user-message rows, so
-      // a `segmentLimit=1` timeline page exposes only the last turn while the
-      // outline must still cover all three.
       const seedMessageTurn = (args: {
         requestId: number;
         startSequence: number;
@@ -596,7 +737,6 @@ describe("public thread data routes", () => {
         turnId: "turn-3",
       });
 
-      // A single-segment timeline page only holds the last turn.
       const timelineResponse = await harness.app.request(
         `/api/v1/threads/${thread.id}/timeline?segmentLimit=1`,
       );
@@ -617,7 +757,6 @@ describe("public thread data routes", () => {
         await readJson(outlineResponse),
       );
 
-      // The outline covers every message in the thread, not just the page.
       expect(outline.items.filter((item) => item.role === "user")).toHaveLength(
         3,
       );
@@ -637,8 +776,6 @@ describe("public thread data routes", () => {
         "Third question — answered.",
       ]);
 
-      // Ids must match the timeline exactly so the minimap can scroll-spy the
-      // loaded window and jump to any row once it is paginated in.
       const outlineIds = new Set(outline.items.map((item) => item.id));
       for (const id of windowedConversationIds) {
         expect(outlineIds.has(id)).toBe(true);
@@ -753,8 +890,6 @@ describe("public thread data routes", () => {
     await withTestHarness(async (harness) => {
       const { environment, thread } = seedThreadFixture(harness);
 
-      // A user message with no text but a file attachment: the outline should
-      // emit an empty preview plus attachment counts (and never leak the path).
       seedEvent(harness.deps, {
         threadId: thread.id,
         environmentId: environment.id,
@@ -802,7 +937,6 @@ describe("public thread data routes", () => {
         imageCount: 0,
         fileCount: 1,
       });
-      // The slim summary must not carry the on-disk path.
       expect(JSON.stringify(outline)).not.toContain("report.pdf");
     });
   });
@@ -1196,6 +1330,92 @@ describe("public thread data routes", () => {
       expect(workflowRow.taskStatus).toBe("completed");
       expect(workflowRow.summary).toBe("done");
       expect(workflowRow.completedAt).not.toBeNull();
+    });
+  });
+
+  it("hydrates a summary whose range reaches turn completion", async () => {
+    await withTestHarness(async (harness) => {
+      const { environment, thread } = seedThreadFixture(harness);
+      const base = {
+        threadId: thread.id,
+        environmentId: environment.id,
+        providerThreadId: "provider-thread-1",
+        scope: turnScope("turn-1"),
+      };
+      seedEvent(harness.deps, {
+        ...base,
+        sequence: 1,
+        type: "turn/started",
+        data: {},
+      });
+      seedEvent(harness.deps, {
+        ...base,
+        sequence: 2,
+        type: "item/started",
+        data: {
+          item: { type: "reasoning", id: "orphan", summary: [], content: [] },
+        },
+      });
+      seedEvent(harness.deps, {
+        ...base,
+        sequence: 3,
+        type: "item/reasoning/textDelta",
+        data: { itemId: "orphan", delta: "Thinking" },
+      });
+      seedEvent(harness.deps, {
+        ...base,
+        sequence: 4,
+        type: "item/completed",
+        data: {
+          item: { type: "agentMessage", id: "intermediate", text: "Checking." },
+        },
+      });
+      seedEvent(harness.deps, {
+        ...base,
+        sequence: 5,
+        type: "item/completed",
+        data: { item: { type: "agentMessage", id: "final", text: "Done." } },
+      });
+      seedEvent(harness.deps, {
+        ...base,
+        sequence: 6,
+        type: "turn/completed",
+        data: { status: "completed" },
+      });
+
+      const timelineResponse = await harness.app.request(
+        `/api/v1/threads/${thread.id}/timeline`,
+      );
+      expect(timelineResponse.status).toBe(200);
+      const timeline = threadTimelineResponseSchema.parse(
+        await readJson(timelineResponse),
+      );
+      const turnRow = timeline.rows.find(
+        (row): row is TimelineTurnRow => row.kind === "turn",
+      );
+      expect(turnRow).toMatchObject({
+        sourceSeqStart: 2,
+        sourceSeqEnd: 6,
+      });
+      if (!turnRow) throw new Error("Expected a turn row");
+
+      const detailsResponse = await harness.app.request(
+        `/api/v1/threads/${thread.id}/timeline/turn-summary-details?turnId=${turnRow.turnId}&sourceSeqStart=${turnRow.sourceSeqStart}&sourceSeqEnd=${turnRow.sourceSeqEnd}`,
+      );
+      expect(detailsResponse.status).toBe(200);
+      const details = timelineTurnSummaryDetailsResponseSchema.parse(
+        await readJson(detailsResponse),
+      );
+      expect(details.rows).toEqual(
+        expect.arrayContaining([
+          expect.objectContaining({
+            kind: "system",
+            operationKind: "reasoning",
+            sourceSeqStart: 2,
+            sourceSeqEnd: 6,
+          }),
+        ]),
+      );
     });
   });
 
@@ -1654,152 +1874,148 @@ describe("public thread data routes", () => {
     });
   });
 
-  it(
-    "expands the newest slice when a large delegation parent completes last",
-    async () => {
-      await withTestHarness(async (harness) => {
-        const { environment, thread } = seedThreadFixture(harness);
-        const providerThreadId = "provider-thread-1";
-        const turnId = "parent-turn";
-        const parentToolCallId = "agent-call";
-        type EventInput = Parameters<typeof insertEvents>[2][number];
-        const eventInputs: EventInput[] = [];
-        let sequence = 0;
-        const push = (
-          event: Omit<EventInput, "environmentId" | "sequence" | "threadId">,
-        ): void => {
-          sequence += 1;
-          eventInputs.push({
-            ...event,
-            environmentId: environment.id,
-            sequence,
-            threadId: thread.id,
-          });
-        };
-
-        push({
-          providerThreadId,
-          scope: turnScope(turnId),
-          type: "turn/started",
-          itemId: null,
-          itemKind: null,
-          parentToolCallId: null,
-          data: JSON.stringify({}),
+  it("expands the newest slice when a large delegation parent completes last", async () => {
+    await withTestHarness(async (harness) => {
+      const { environment, thread } = seedThreadFixture(harness);
+      const providerThreadId = "provider-thread-1";
+      const turnId = "parent-turn";
+      const parentToolCallId = "agent-call";
+      type EventInput = Parameters<typeof insertEvents>[2][number];
+      const eventInputs: EventInput[] = [];
+      let sequence = 0;
+      const push = (
+        event: Omit<EventInput, "environmentId" | "sequence" | "threadId">,
+      ): void => {
+        sequence += 1;
+        eventInputs.push({
+          ...event,
+          environmentId: environment.id,
+          sequence,
+          threadId: thread.id,
         });
+      };
+
+      push({
+        providerThreadId,
+        scope: turnScope(turnId),
+        type: "turn/started",
+        itemId: null,
+        itemKind: null,
+        parentToolCallId: null,
+        data: JSON.stringify({}),
+      });
+      push({
+        providerThreadId,
+        scope: turnScope(turnId),
+        type: "item/started",
+        itemId: parentToolCallId,
+        itemKind: "toolCall",
+        parentToolCallId: null,
+        data: JSON.stringify({
+          item: {
+            type: "toolCall",
+            id: parentToolCallId,
+            tool: "Agent",
+            arguments: { prompt: "Do the long task." },
+            status: "pending",
+          },
+        }),
+      });
+      for (let item = 0; item < 200; item += 1) {
+        const itemId = `command-${item}`;
+        const command = "x".repeat(25_000);
         push({
           providerThreadId,
           scope: turnScope(turnId),
           type: "item/started",
-          itemId: parentToolCallId,
-          itemKind: "toolCall",
-          parentToolCallId: null,
+          itemId,
+          itemKind: "commandExecution",
+          parentToolCallId,
           data: JSON.stringify({
             item: {
-              type: "toolCall",
-              id: parentToolCallId,
-              tool: "Agent",
-              arguments: { prompt: "Do the long task." },
+              type: "commandExecution",
+              id: itemId,
+              command,
+              cwd: "/tmp/test",
+              parentToolCallId,
               status: "pending",
+              approvalStatus: null,
             },
           }),
         });
-        for (let item = 0; item < 650; item += 1) {
-          const itemId = `command-${item}`;
-          const command = "x".repeat(25_000);
-          push({
-            providerThreadId,
-            scope: turnScope(turnId),
-            type: "item/started",
-            itemId,
-            itemKind: "commandExecution",
-            parentToolCallId,
-            data: JSON.stringify({
-              item: {
-                type: "commandExecution",
-                id: itemId,
-                command,
-                cwd: "/tmp/test",
-                parentToolCallId,
-                status: "pending",
-                approvalStatus: null,
-              },
-            }),
-          });
-          push({
-            providerThreadId,
-            scope: turnScope(turnId),
-            type: "item/completed",
-            itemId,
-            itemKind: "commandExecution",
-            parentToolCallId,
-            data: JSON.stringify({
-              item: {
-                type: "commandExecution",
-                id: itemId,
-                command,
-                cwd: "/tmp/test",
-                parentToolCallId,
-                status: "completed",
-                approvalStatus: null,
-                exitCode: 0,
-                aggregatedOutput: `output ${item}`,
-              },
-            }),
-          });
-        }
         push({
           providerThreadId,
           scope: turnScope(turnId),
           type: "item/completed",
-          itemId: parentToolCallId,
-          itemKind: "toolCall",
-          parentToolCallId: null,
+          itemId,
+          itemKind: "commandExecution",
+          parentToolCallId,
           data: JSON.stringify({
             item: {
-              type: "toolCall",
-              id: parentToolCallId,
-              tool: "Agent",
-              arguments: { prompt: "Do the long task." },
-              result: "",
+              type: "commandExecution",
+              id: itemId,
+              command,
+              cwd: "/tmp/test",
+              parentToolCallId,
               status: "completed",
+              approvalStatus: null,
+              exitCode: 0,
+              aggregatedOutput: `output ${item}`,
             },
           }),
         });
-        push({
-          providerThreadId,
-          scope: turnScope(turnId),
-          type: "turn/completed",
-          itemId: null,
-          itemKind: null,
-          parentToolCallId: null,
-          data: JSON.stringify({ status: "completed", providerThreadId }),
-        });
-        insertEvents(harness.deps.db, harness.deps.hub, eventInputs);
-
-        const timelineResponse = await harness.app.request(
-          `/api/v1/threads/${thread.id}/timeline`,
-        );
-        expect(timelineResponse.status).toBe(200);
-        const timeline = threadTimelineResponseSchema.parse(
-          await readJson(timelineResponse),
-        );
-        const turnRow = timeline.rows.find(
-          (row): row is TimelineTurnRow => row.kind === "turn",
-        );
-        expect(turnRow).toBeDefined();
-        if (!turnRow) {
-          throw new Error("Expected a turn row");
-        }
-        expect(turnRow.sourceSeqStart).toBeGreaterThan(2);
-
-        const detailsResponse = await harness.app.request(
-          `/api/v1/threads/${thread.id}/timeline/turn-summary-details?turnId=${turnRow.turnId}&sourceSeqStart=${turnRow.sourceSeqStart}&sourceSeqEnd=${turnRow.sourceSeqEnd}`,
-        );
-        expect(detailsResponse.status).toBe(200);
+      }
+      push({
+        providerThreadId,
+        scope: turnScope(turnId),
+        type: "item/completed",
+        itemId: parentToolCallId,
+        itemKind: "toolCall",
+        parentToolCallId: null,
+        data: JSON.stringify({
+          item: {
+            type: "toolCall",
+            id: parentToolCallId,
+            tool: "Agent",
+            arguments: { prompt: "Do the long task." },
+            result: "",
+            status: "completed",
+          },
+        }),
       });
-    },
-    10_000,
-  );
+      push({
+        providerThreadId,
+        scope: turnScope(turnId),
+        type: "turn/completed",
+        itemId: null,
+        itemKind: null,
+        parentToolCallId: null,
+        data: JSON.stringify({ status: "completed", providerThreadId }),
+      });
+      insertEvents(harness.deps.db, harness.deps.hub, eventInputs);
+
+      const timelineResponse = await harness.app.request(
+        `/api/v1/threads/${thread.id}/timeline`,
+      );
+      expect(timelineResponse.status).toBe(200);
+      const timeline = threadTimelineResponseSchema.parse(
+        await readJson(timelineResponse),
+      );
+      const turnRow = timeline.rows.find(
+        (row): row is TimelineTurnRow => row.kind === "turn",
+      );
+      expect(turnRow).toBeDefined();
+      if (!turnRow) {
+        throw new Error("Expected a turn row");
+      }
+      expect(turnRow.sourceSeqStart).toBe(1);
+
+      const detailsResponse = await harness.app.request(
+        `/api/v1/threads/${thread.id}/timeline/turn-summary-details?turnId=${turnRow.turnId}&sourceSeqStart=${turnRow.sourceSeqStart}&sourceSeqEnd=${turnRow.sourceSeqEnd}`,
+      );
+      expect(detailsResponse.status).toBe(200);
+    });
+  }, 10_000);
 
   it("hydrates turn-summary details with future accepted input context", async () => {
     await withTestHarness(async (harness) => {
@@ -2157,8 +2373,6 @@ describe("public thread data routes", () => {
           },
         },
       });
-      // Malformed: missing item.type, so the derived item_kind column is null.
-      // The row is filtered out at the DB level instead of turning into a 500.
       seedStoredEvent(harness.deps, {
         threadId: thread.id,
         environmentId: environment.id,
@@ -2459,7 +2673,7 @@ describe("public thread data routes", () => {
   it("creates and deletes thread queued messages", async () => {
     await withTestHarness(async (harness) => {
       const capture = vi.fn<TelemetryService["capture"]>();
-      harness.deps.telemetry = { capture };
+      harness.deps.telemetry = { ...harness.deps.telemetry, capture };
       const { environment, thread } = seedThreadFixture(harness);
       seedEvent(harness.deps, {
         threadId: thread.id,
@@ -2594,7 +2808,7 @@ describe("public thread data routes", () => {
   it("queues public send requests with sender context while the target thread is active", async () => {
     await withTestHarness(async (harness) => {
       const capture = vi.fn<TelemetryService["capture"]>();
-      harness.deps.telemetry = { capture };
+      harness.deps.telemetry = { ...harness.deps.telemetry, capture };
       const { project, thread } = seedThreadFixture(harness, {
         thread: {
           status: "active",
@@ -2624,9 +2838,14 @@ describe("public thread data routes", () => {
       );
 
       expect(response.status).toBe(200);
-      await expect(readJson(response)).resolves.toEqual({
+      await expect(readJson(response)).resolves.toMatchObject({
         ok: true,
         delivery: "queued",
+        queuedMessage: {
+          id: expect.any(String),
+          waitingOn: { kind: "thread-busy" },
+          sendAt: null,
+        },
       });
       const queuedRows = listQueuedThreadMessages(harness.db, thread.id);
       expect(queuedRows).toMatchObject([
@@ -2638,13 +2857,15 @@ describe("public thread data routes", () => {
       expect(JSON.parse(queuedRows[0]?.content ?? "null")).toEqual([
         { type: "text", text: "Queued active follow-up", mentions: [] },
       ]);
+      // Nothing was dispatched, and queueing writes no timeline event at all:
+      // the queue rows above the composer are the only narration of a wait.
       expect(
         harness.db
-          .select({ id: events.id })
+          .select({ type: events.type })
           .from(events)
           .where(eq(events.threadId, thread.id))
           .all(),
-      ).toHaveLength(0);
+      ).toEqual([]);
       expect(capture).not.toHaveBeenCalled();
     });
   });
@@ -2685,12 +2906,15 @@ describe("public thread data routes", () => {
         },
       );
 
-      // Sender attribution is allowed across projects, so the message queues
-      // with the cross-project sender preserved for the reply affordance.
       expect(response.status).toBe(200);
-      await expect(readJson(response)).resolves.toEqual({
+      await expect(readJson(response)).resolves.toMatchObject({
         ok: true,
         delivery: "queued",
+        queuedMessage: {
+          id: expect.any(String),
+          waitingOn: { kind: "thread-busy" },
+          sendAt: null,
+        },
       });
       expect(listQueuedThreadMessages(harness.db, thread.id)).toMatchObject([
         {
@@ -3099,11 +3323,12 @@ describe("public thread data routes", () => {
         message: "Queued message order changed",
       });
 
-      const claimedQueuedMessage = claimQueuedThreadMessage(
+      const claimedQueuedMessage = claimQueuedThreadMessageGroup(
         harness.db,
         harness.hub,
         secondQueuedMessage.id,
-      );
+        { kind: "explicit-send" },
+      )?.[0];
       expect(claimedQueuedMessage?.id).toBe(secondQueuedMessage.id);
       const claimedResponse = await harness.app.request(
         `/api/v1/threads/${thread.id}/queued-messages/${secondQueuedMessage.id}/order`,
@@ -3139,7 +3364,6 @@ describe("public thread data routes", () => {
         hostId: host.id,
         projectId: project.id,
         path: "/tmp/queued-message-create-idle-auto-send-environment",
-        workspaceProvisionType: "unmanaged",
       });
       const thread = seedThread(harness.deps, {
         projectId: project.id,
@@ -3442,12 +3666,32 @@ describe("public thread data routes", () => {
         projectId: project.id,
         path: "/tmp/queued-message-reprovision",
         status: "error",
-        managed: true,
-        workspaceProvisionType: "managed-worktree",
+        environmentProviderId: "personal-workspace",
+        environmentProviderPluginId: "bb-plugin-environment-personal-workspace",
+        isGitRepo: false,
       });
       const thread = seedThread(harness.deps, {
         projectId: project.id,
         environmentId: environment.id,
+      });
+      installFakeEnvironmentProvider({
+        id: "personal-workspace",
+        pluginId: "bb-plugin-environment-personal-workspace",
+        displayName: "Personal workspace",
+        requires: {
+          projectCheckout: false,
+          gitCheckout: false,
+          gitRemote: false,
+          projectless: false,
+        },
+        decide: () => ({
+          action: "ready",
+          environment: {
+            type: "host",
+            hostId: host.id,
+            path: "/tmp/queued-message-reprovision-rebuilt",
+          },
+        }),
       });
 
       const createResponse = await harness.app.request(
@@ -3490,13 +3734,13 @@ describe("public thread data routes", () => {
       expect(
         getQueuedThreadMessage(harness.db, createdQueuedMessage.id),
       ).toBeNull();
-      const provisionCommand = await waitForQueuedCommand(
+      await reportNextEnvironmentAttachSuccess(harness, thread.id);
+      const startCommand = await waitForQueuedCommand(
         harness,
         ({ command }) =>
-          command.type === "environment.provision" &&
-          command.environmentId === environment.id,
+          command.type === "thread.start" && command.threadId === thread.id,
       );
-      expect(provisionCommand.command.type).toBe("environment.provision");
+      expect(startCommand.command.type).toBe("thread.start");
       const requestedEvent = harness.db
         .select({ data: events.data })
         .from(events)
@@ -3544,8 +3788,6 @@ describe("public thread data routes", () => {
         projectId: project.id,
         path: "/tmp/queued-message-reprovision-rejected",
         status: "error",
-        managed: false,
-        workspaceProvisionType: "managed-worktree",
       });
       const thread = seedThread(harness.deps, {
         projectId: project.id,
@@ -3601,8 +3843,9 @@ describe("public thread data routes", () => {
         projectId: project.id,
         path: "/tmp/queued-message-immediate-reprovision",
         status: "error",
-        managed: true,
-        workspaceProvisionType: "managed-worktree",
+        environmentProviderId: "personal-workspace",
+        environmentProviderPluginId: "bb-plugin-environment-personal-workspace",
+        isGitRepo: false,
       });
       const thread = seedThread(harness.deps, {
         projectId: project.id,
@@ -3611,6 +3854,25 @@ describe("public thread data routes", () => {
       const queuedMessage = seedQueuedMessage(harness.deps, {
         threadId: thread.id,
         content: textInput("Queued message before immediate reprovision"),
+      });
+      installFakeEnvironmentProvider({
+        id: "personal-workspace",
+        pluginId: "bb-plugin-environment-personal-workspace",
+        displayName: "Personal workspace",
+        requires: {
+          projectCheckout: false,
+          gitCheckout: false,
+          gitRemote: false,
+          projectless: false,
+        },
+        decide: () => ({
+          action: "ready",
+          environment: {
+            type: "host",
+            hostId: host.id,
+            path: "/tmp/queued-message-immediate-reprovision-rebuilt",
+          },
+        }),
       });
       let stateAtProvisionStart: {
         activeContextStage: string | null;
@@ -3621,12 +3883,18 @@ describe("public thread data routes", () => {
       const responder = registerHostRpcResponder(harness, {
         hostId: host.id,
         sessionId: session.id,
-        handle: (request) => {
-          if (request.command.type === "environment.provision") {
+        handle: (request): HostRpcHandlerResult => {
+          if (request.command.type === "environment.attach") {
+            const currentThread = getThread(harness.db, thread.id);
             stateAtProvisionStart = {
               activeContextStage:
-                loadActiveThreadProvisionContext(harness.deps, thread.id)?.state
-                  .stage ?? null,
+                currentThread?.status !== "starting"
+                  ? "inactive"
+                  : (getPreparingEnvironment(harness.db, thread.id)?.status ??
+                    (currentThread.environmentId === null
+                      ? null
+                      : (getEnvironment(harness.db, currentThread.environmentId)
+                          ?.status ?? null))),
               queuedMessageExists:
                 getQueuedThreadMessage(harness.db, queuedMessage.id) !== null,
               requestEventCount: harness.db
@@ -3643,13 +3911,11 @@ describe("public thread data routes", () => {
             return {
               ok: true,
               result: {
-                path:
-                  environment.path ??
-                  "/tmp/queued-message-immediate-reprovision",
+                path: request.command.path,
+                isGitRepo: true,
+                isWorktree: false,
                 branchName: `bb/${thread.id}`,
                 defaultBranch: "main",
-                isGitRepo: true,
-                isWorktree: true,
                 transcript: [],
               },
             };
@@ -3689,11 +3955,13 @@ describe("public thread data routes", () => {
       );
 
       expect(sendResponse.status, await sendResponse.clone().text()).toBe(200);
-      expect(stateAtProvisionStart).toEqual({
-        activeContextStage: "environment-provisioning",
-        queuedMessageExists: false,
-        requestEventCount: 1,
-      });
+      await vi.waitFor(() =>
+        expect(stateAtProvisionStart).toEqual({
+          activeContextStage: "provisioning",
+          queuedMessageExists: false,
+          requestEventCount: 1,
+        }),
+      );
       await vi.waitFor(() => {
         expect(
           responder.requests.some(
@@ -3717,8 +3985,9 @@ describe("public thread data routes", () => {
         projectId: project.id,
         path: "/tmp/grouped-queued-message-reprovision",
         status: "error",
-        managed: true,
-        workspaceProvisionType: "managed-worktree",
+        environmentProviderId: "personal-workspace",
+        environmentProviderPluginId: "bb-plugin-environment-personal-workspace",
+        isGitRepo: false,
       });
       const thread = seedThread(harness.deps, {
         projectId: project.id,
@@ -3731,6 +4000,25 @@ describe("public thread data routes", () => {
       const secondQueuedMessage = seedQueuedMessage(harness.deps, {
         threadId: thread.id,
         content: textInput("Second reprovision grouped message"),
+      });
+      installFakeEnvironmentProvider({
+        id: "personal-workspace",
+        pluginId: "bb-plugin-environment-personal-workspace",
+        displayName: "Personal workspace",
+        requires: {
+          projectCheckout: false,
+          gitCheckout: false,
+          gitRemote: false,
+          projectless: false,
+        },
+        decide: () => ({
+          action: "ready",
+          environment: {
+            type: "host",
+            hostId: host.id,
+            path: "/tmp/grouped-queued-message-reprovision-rebuilt",
+          },
+        }),
       });
       expect(
         setQueuedThreadMessageGroupBoundary({
@@ -3764,13 +4052,12 @@ describe("public thread data routes", () => {
         getQueuedThreadMessage(harness.db, secondQueuedMessage.id),
       ).toBeNull();
 
-      const provisionCommand = await waitForQueuedCommand(
+      await reportNextEnvironmentAttachSuccess(harness, thread.id);
+      const startCommand = await waitForQueuedCommand(
         harness,
         ({ command }) =>
-          command.type === "environment.provision" &&
-          command.environmentId === environment.id,
+          command.type === "thread.start" && command.threadId === thread.id,
       );
-      expect(provisionCommand.command.type).toBe("environment.provision");
 
       const requestedEvent = harness.db
         .select({ data: events.data })
@@ -3793,21 +4080,6 @@ describe("public thread data routes", () => {
         ],
       );
 
-      await reportQueuedCommandSuccess(harness, provisionCommand, {
-        path: "/tmp/grouped-queued-message-reprovision",
-        branchName: `bb/${thread.id}`,
-        defaultBranch: "main",
-        isGitRepo: true,
-        isWorktree: true,
-        transcript: [],
-      });
-      const startCommand = await waitForQueuedCommandAfter(
-        harness,
-        provisionCommand.row.cursor,
-        ({ command }) =>
-          command.type === "thread.start" && command.threadId === thread.id,
-      );
-      expect(startCommand.command.type).toBe("thread.start");
       if (startCommand.command.type !== "thread.start") {
         throw new Error("Expected thread.start command");
       }
@@ -3833,12 +4105,18 @@ describe("public thread data routes", () => {
       const senderThread = seedThread(harness.deps, {
         projectId: project.id,
       });
+      seedThreadIdentity(harness.deps, {
+        threadId: thread.id,
+        environmentId: environment.id,
+        providerThreadId: "provider-active-grouped-sender",
+        sequence: 1,
+      });
       seedEvent(harness.deps, {
         threadId: thread.id,
         environmentId: environment.id,
         providerThreadId: "provider-active-grouped-sender",
         scope: turnScope("turn-active-grouped-sender"),
-        sequence: 1,
+        sequence: 2,
         type: "turn/started",
         data: {},
       });
@@ -4015,18 +4293,18 @@ describe("public thread data routes", () => {
         },
       );
 
+      // "Send now" overrides plugin waits, not core ones: the workspace is
+      // still being prepared, so the row goes back on the queue waiting on that
+      // rather than being dispatched into a thread that cannot take it.
       expect(sendResponse.status).toBe(409);
       await expect(readJson(sendResponse)).resolves.toMatchObject({
-        code: "thread_not_writable",
-        details: {
-          reason: "still_starting",
-          threadStatus: "starting",
-        },
+        code: "queued_message_still_waiting",
       });
       expect(
         getQueuedThreadMessage(harness.db, createdQueuedMessage.id),
       ).toMatchObject({
         id: createdQueuedMessage.id,
+        waitingOn: JSON.stringify({ kind: "provisioning" }),
       });
       const requestedEvents = harness.db
         .select({ type: events.type })
@@ -4161,6 +4439,8 @@ describe("public thread data routes", () => {
         limit: 1000,
         includeFiles: true,
         includeDirectories: true,
+        includeHidden: false,
+        excludeNames: expect.arrayContaining(["node_modules"]),
       });
       await reportQueuedCommandSuccess(harness, pathsCommand, {
         paths: [
@@ -4200,48 +4480,6 @@ describe("public thread data routes", () => {
             positions: [0, 1, 2, 3, 4],
           },
         ],
-        truncated: false,
-        storageRootPath: threadStoragePath,
-      });
-    });
-  });
-
-  it("lists thread storage files for threads with environments", async () => {
-    await withTestHarness(async (harness) => {
-      const { host } = seedHostSession(harness.deps);
-      const { project } = seedProjectWithSource(harness.deps, {
-        hostId: host.id,
-        path: "/tmp/project-source",
-      });
-      const environment = seedEnvironment(harness.deps, {
-        hostId: host.id,
-        projectId: project.id,
-        path: "/tmp/project-source",
-      });
-      const thread = seedThread(harness.deps, {
-        projectId: project.id,
-        environmentId: environment.id,
-      });
-      const threadStoragePath = `/tmp/bb-host-data/${host.id}/thread-storage/${thread.id}`;
-
-      const filesPromise = harness.app.request(
-        `/api/v1/threads/${thread.id}/thread-storage/files`,
-      );
-      const filesCommand = await waitForQueuedCommand(
-        harness,
-        ({ command }) =>
-          command.type === "host.list_files" &&
-          command.path === threadStoragePath,
-      );
-      await reportQueuedCommandSuccess(harness, filesCommand, {
-        files: [{ path: "notes/plan.md", name: "plan.md" }],
-        truncated: false,
-      });
-
-      const filesResponse = await filesPromise;
-      expect(filesResponse.status).toBe(200);
-      await expect(readJson(filesResponse)).resolves.toEqual({
-        files: [{ path: "notes/plan.md", name: "plan.md" }],
         truncated: false,
         storageRootPath: threadStoragePath,
       });
@@ -4353,6 +4591,45 @@ describe("public thread data routes", () => {
     });
   });
 
+  it("privately revalidates worktree images", async () => {
+    await withTestHarness(async (harness) => {
+      const { host, session, environment, thread } = seedThreadFixture(harness);
+      registerHostRpcResponder(harness, {
+        hostId: host.id,
+        sessionId: session.id,
+        handle: (request) => {
+          expect(request.command).toMatchObject({
+            type: "host.read_file",
+            ifNoneMatch: {
+              kind: "sha256",
+              values: ["0".repeat(64)],
+            },
+          });
+          return {
+            ok: true,
+            result: {
+              path: `${environment.path}/public/chart.png`,
+              contentEncoding: "base64",
+              mimeType: "image/png",
+              sizeBytes: 4,
+              sha256: "0".repeat(64),
+              notModified: true,
+            },
+          };
+        },
+      });
+
+      const fileResponse = await harness.app.request(
+        `/api/v1/threads/${thread.id}/worktree/files/public/chart.png`,
+        { headers: { "if-none-match": `"${"0".repeat(64)}"` } },
+      );
+      expect(fileResponse.status).toBe(304);
+      expect(fileResponse.headers.get("cache-control")).toBe(
+        "private, no-cache",
+      );
+    });
+  });
+
   it("serves worktree HTML preview content as raw text/html without app bridge injection", async () => {
     await withTestHarness(async (harness) => {
       const { host } = seedHostSession(harness.deps);
@@ -4409,58 +4686,166 @@ describe("public thread data routes", () => {
     });
   });
 
-  it("serves thread storage HTML preview content as raw text/html without app bridge injection", async () => {
+  it("serves a byte range from a thread storage video", async () => {
     await withTestHarness(async (harness) => {
-      const { host } = seedHostSession(harness.deps);
-      const { project } = seedProjectWithSource(harness.deps, {
+      const { host, session, thread } = seedThreadFixture(harness);
+      const bytes = Buffer.from([0, 1, 2, 3, 4, 5]);
+      registerHostRpcResponder(harness, {
         hostId: host.id,
-        path: "/tmp/project-source",
+        sessionId: session.id,
+        handle: (request) => {
+          if (request.command.type !== "host.read_file_chunk")
+            throw new Error("Unexpected command");
+          expect(request.command.length).toBeLessThanOrEqual(2);
+          expect(request.command.rootPath).toContain(thread.id);
+          return {
+            ok: true,
+            result: {
+              path: "/tmp/clip.mp4",
+              content: bytes
+                .subarray(
+                  request.command.offset,
+                  request.command.offset + request.command.length,
+                )
+                .toString("base64"),
+              offset: request.command.offset,
+              modifiedAtMs: 1234,
+              mimeType: "video/mp4",
+              sizeBytes: bytes.length,
+              revision: "0".repeat(64),
+            },
+          };
+        },
       });
-      const environment = seedEnvironment(harness.deps, {
+      const response = await harness.app.request(
+        `/api/v1/threads/${thread.id}/thread-storage/files/clip.mp4`,
+        { headers: { Range: "bytes=0-1" } },
+      );
+      expect(response.status).toBe(206);
+      expect(response.headers.get("accept-ranges")).toBe("bytes");
+      expect(response.headers.get("content-range")).toBe("bytes 0-1/6");
+      expect(response.headers.get("content-length")).toBe("2");
+      expect(response.headers.get("content-type")).toBe("video/mp4");
+      expect(Buffer.from(await response.arrayBuffer())).toEqual(
+        bytes.subarray(0, 2),
+      );
+    });
+  });
+
+  it("reports file changes before streaming as retryable conflicts", async () => {
+    await withTestHarness(async (harness) => {
+      const { host, session, thread } = seedThreadFixture(harness);
+      registerHostRpcResponder(harness, {
         hostId: host.id,
-        projectId: project.id,
-        path: "/tmp/project-source",
+        sessionId: session.id,
+        handle: ({ command }) => {
+          if (command.type !== "host.read_file_chunk")
+            throw new Error("Unexpected command");
+          if (command.length !== 0)
+            return {
+              ok: false,
+              errorCode: "file_changed",
+              errorMessage: "File changed",
+            };
+          return {
+            ok: true,
+            result: {
+              path: command.path,
+              content: "",
+              offset: 0,
+              sizeBytes: 30 * 1024 * 1024,
+              mimeType: "video/mp4",
+              modifiedAtMs: 1234,
+              revision: "0".repeat(64),
+            },
+          };
+        },
       });
-      const thread = seedThread(harness.deps, {
-        projectId: project.id,
-        environmentId: environment.id,
+      const response = await harness.app.request(
+        `/api/v1/threads/${thread.id}/thread-storage/files/clip.mp4`,
+      );
+      expect(response.status).toBe(409);
+      expect(await response.json()).toMatchObject({
+        code: "file_changed",
+        retryable: true,
       });
-      const threadStorageRoot = `/tmp/bb-host-data/${host.id}/thread-storage/${thread.id}`;
+    });
+  });
+
+  it("serves thread storage HTML with preview protections through bounded reads", async () => {
+    await withTestHarness(async (harness) => {
+      const { host, session, thread } = seedThreadFixture(harness);
       const html = "<!doctype html><h1>Preview</h1>";
-
-      // Percent-encoded segments decode exactly once before hitting the host.
-      const filePromise = harness.app.request(
+      registerHostRpcResponder(harness, {
+        hostId: host.id,
+        sessionId: session.id,
+        handle: ({ command }) => {
+          if (command.type !== "host.read_file_chunk")
+            throw new Error("Unexpected command");
+          expect(command.path).toBe(
+            `${command.rootPath}/reports/preview v2.html`,
+          );
+          return {
+            ok: true,
+            result: {
+              path: command.path,
+              content: Buffer.from(html)
+                .subarray(command.offset, command.offset + command.length)
+                .toString("base64"),
+              offset: command.offset,
+              mimeType: "text/html",
+              modifiedAtMs: 1234,
+              sizeBytes: Buffer.byteLength(html),
+              revision: "0".repeat(64),
+            },
+          };
+        },
+      });
+      const response = await harness.app.request(
         `/api/v1/threads/${thread.id}/thread-storage/files/reports/preview%20v2.html`,
+        { headers: { "if-none-match": "*" } },
       );
-      const fileCommand = await waitForQueuedCommand(
-        harness,
-        ({ command }) =>
-          command.type === "host.read_file" &&
-          command.path === `${threadStorageRoot}/reports/preview v2.html`,
-      );
-      expect(fileCommand.command).toMatchObject({
-        type: "host.read_file",
-        path: `${threadStorageRoot}/reports/preview v2.html`,
-        rootPath: threadStorageRoot,
-      });
-      await reportQueuedCommandSuccess(harness, fileCommand, {
-        path: `${threadStorageRoot}/reports/preview v2.html`,
-        content: html,
-        contentEncoding: "utf8",
-        mimeType: "text/html",
-        sizeBytes: Buffer.byteLength(html),
-        sha256: "0".repeat(64),
-      });
-
-      const fileResponse = await filePromise;
-      expect(fileResponse.status).toBe(200);
-      expect(fileResponse.headers.get("content-type")).toBe(
+      expect(response.status).toBe(200);
+      expect(response.headers.get("content-type")).toBe(
         "text/html; charset=utf-8",
       );
-      expect(fileResponse.headers.get("content-security-policy")).toBe(
+      expect(response.headers.get("content-security-policy")).toBe(
         "sandbox allow-scripts",
       );
-      expect(await fileResponse.text()).toBe(html);
+      expect(response.headers.get("cache-control")).toBe("no-store");
+      expect(await response.text()).toBe(html);
+    });
+  });
+
+  it("rejects oversized storage HTML before requesting content", async () => {
+    await withTestHarness(async (harness) => {
+      const { host, session, thread } = seedThreadFixture(harness);
+      registerHostRpcResponder(harness, {
+        hostId: host.id,
+        sessionId: session.id,
+        handle: ({ command }) => {
+          expect(command).toMatchObject({
+            type: "host.read_file_chunk",
+            length: 0,
+          });
+          return {
+            ok: true,
+            result: {
+              path: "/tmp/report.html",
+              offset: 0,
+              content: "",
+              mimeType: "text/html",
+              sizeBytes: 6 * 1024 * 1024,
+              modifiedAtMs: 1234,
+              revision: "0".repeat(64),
+            },
+          };
+        },
+      });
+      const response = await harness.app.request(
+        `/api/v1/threads/${thread.id}/thread-storage/files/report.html`,
+      );
+      expect(response.status).toBe(413);
     });
   });
 
@@ -4915,6 +5300,27 @@ describe("public thread data routes", () => {
     });
   });
 
+  it("rejects thread event list pages above the public limit", async () => {
+    await withTestHarness(async (harness) => {
+      const { environment, thread } = seedThreadFixture(harness);
+      for (let sequence = 1; sequence <= 101; sequence += 1) {
+        seedEvent(harness.deps, {
+          data: { message: `error ${sequence}` },
+          environmentId: environment.id,
+          scope: threadScope(),
+          sequence,
+          threadId: thread.id,
+          type: "system/error",
+        });
+      }
+
+      const response = await harness.app.request(
+        `/api/v1/threads/${thread.id}/events?limit=1000`,
+      );
+      expect(response.status).toBe(400);
+    });
+  });
+
   it("rejects invalid thread event list filters", async () => {
     await withTestHarness(async (harness) => {
       const { thread } = seedThreadFixture(harness);
@@ -5039,7 +5445,6 @@ describe("public thread data routes", () => {
         data: { item: { type: "agentMessage", id: "msg-1", text: "Reply" } },
       });
 
-      // afterSeq=5 means "after sequence 5" — the match at seq 5 should NOT be returned
       const response = await harness.app.request(
         `/api/v1/threads/${thread.id}/events/wait?type=item/completed&afterSeq=5&waitMs=100`,
       );

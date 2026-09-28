@@ -14,11 +14,11 @@ import {
   activityRowClass,
   activityTextClass,
   type ActivityRowState,
-} from "@bb/shared-ui/activity-row-styles";
-import { Button } from "@bb/shared-ui/button";
-import { Icon } from "@bb/shared-ui/icon";
-import { cn } from "@bb/shared-ui/lib/utils";
-import { Skeleton } from "@bb/shared-ui/skeleton";
+} from "@/components/ui/activity-row-styles";
+import { Button } from "@/components/ui/button";
+import { Icon } from "@/components/ui/icon";
+import { cn } from "@/lib/utils";
+import { Skeleton } from "@/components/ui/skeleton";
 import {
   WorkflowPhaseStrip,
   WorkflowProgress,
@@ -27,7 +27,7 @@ import {
   type WorkflowProgressAgentState,
   type WorkflowProgressSnapshot,
   type WorkflowStatusPillState,
-} from "@bb/shared-ui/workflow-progress";
+} from "@/components/ui/workflow-progress";
 import {
   definePluginApp,
   useBbNavigate,
@@ -132,8 +132,6 @@ function settledAgentCount(agents: readonly WorkflowProgressAgent[]): number {
   ).length;
 }
 
-// A running workflow shows no pill: the shimmering header, phase strip, and
-// per-agent spinners already say it is live.
 function runPillState(
   status: WorkflowRunView["status"],
 ): WorkflowStatusPillState | null {
@@ -182,7 +180,6 @@ function formatDuration(startedAt: number | null, finishedAt: number | null) {
     .join(" ");
 }
 
-/** Matches the native workflow card's one-second-delayed live duration. */
 function WorkflowDuration({ startedAt }: { startedAt: number }) {
   const [elapsed, setElapsed] = useState(() => Date.now() - startedAt);
   useEffect(() => {
@@ -338,6 +335,18 @@ function buildSharedWorkflowView(run: WorkflowRunView): SharedWorkflowView {
   };
 }
 
+function activateWorkflowAgent(
+  agent: WorkflowProgressAgent,
+  callsById: ReadonlyMap<string, WorkflowCallView>,
+  toThread: (threadId: string) => void,
+): void {
+  const childThreadId =
+    agent.id === undefined
+      ? null
+      : (callsById.get(agent.id)?.childThreadId ?? null);
+  if (childThreadId !== null) toThread(childThreadId);
+}
+
 function useWorkflowRun(
   threadId: string,
   runId: string | null,
@@ -398,12 +407,6 @@ function useDocumentVisible(): boolean {
   );
 }
 
-/**
- * Poll `refresh` every second, but only while `active` and the document is
- * visible. A hidden tab (phone in a pocket, app switcher) never polls; when
- * it comes back, and when the realtime connection comes back, one immediate
- * refresh catches up on whatever the pause or the outage hid.
- */
 function useVisibleActivePolling(
   refresh: () => Promise<void>,
   active: boolean,
@@ -453,10 +456,7 @@ function useVisibleActivePolling(
   }, [enabled, refresh]);
 }
 
-function useActiveWorkflowRuns(threadId: string): {
-  state: ActiveRunsLoadState;
-  setRuns: (update: (runs: WorkflowRunView[]) => WorkflowRunView[]) => void;
-} {
+function useActiveWorkflowRuns(threadId: string): ActiveRunsLoadState {
   const rpc = useRpc<typeof workflowUiRpcContract>();
   const [state, setState] = useState<ActiveRunsLoadState>({
     status: "loading",
@@ -483,9 +483,6 @@ function useActiveWorkflowRuns(threadId: string): {
     };
   }, [refresh]);
 
-  // The service publishes when this thread's run set changes (start, claim,
-  // settle, cancel), so an idle thread needs no standing poll to learn about
-  // a new run; polling below covers progress while a run is active.
   useRealtime(WORKFLOW_RUNS_REALTIME_CHANNEL, (payload) => {
     if (workflowRunsSignalThreadId(payload) === threadId) void refresh();
   });
@@ -495,42 +492,29 @@ function useActiveWorkflowRuns(threadId: string): {
     (state.status === "ready" && state.runs.some(isRunActive));
   useVisibleActivePolling(refresh, shouldPoll);
 
-  const setRuns = useCallback(
-    (update: (runs: WorkflowRunView[]) => WorkflowRunView[]) => {
-      setState((current) =>
-        current.status === "ready"
-          ? { status: "ready", runs: update(current.runs) }
-          : current,
-      );
-    },
-    [],
-  );
-
-  return { state, setRuns };
+  return state;
 }
 
-function EmptyOrError({ children }: { children: ReactNode }) {
+export function EmptyOrError({ children }: { children: ReactNode }) {
   return (
-    <div
-      role="alert"
-      className="my-2 rounded-md border border-border bg-muted px-3 py-2 text-sm text-muted-foreground"
-    >
+    <div role="alert" className="text-sm text-muted-foreground">
       {children}
     </div>
   );
 }
 
-function LoadingPreview() {
+export function LoadingPreview() {
   return (
-    <div
-      className="my-2 space-y-2 rounded-lg border border-border p-3"
-      aria-busy="true"
-    >
+    <div className="space-y-2" aria-busy="true">
       <Skeleton className="h-3.5 w-44 rounded-sm" />
       <Skeleton className="h-3 w-2/3 rounded-sm" />
       <Skeleton className="h-3 w-1/2 rounded-sm" />
     </div>
   );
+}
+
+export function WorkflowRunPanelState({ children }: { children: ReactNode }) {
+  return <div className="p-4">{children}</div>;
 }
 
 function RefreshWarning({ message }: { message: string }) {
@@ -667,7 +651,7 @@ function WorkflowComposerCard({ run }: { run: WorkflowRunView }) {
 }
 
 function WorkflowStatusBannerLoaded({ threadId }: { threadId: string }) {
-  const { state } = useActiveWorkflowRuns(threadId);
+  const state = useActiveWorkflowRuns(threadId);
 
   if (state.status !== "ready" || state.runs.length === 0) return null;
 
@@ -826,6 +810,11 @@ function WorkflowPreviewLoaded({
               collapsiblePhases
               currentPhaseIndex={shared.currentPhaseIndex}
               terminalState={runTerminalState(run)}
+              onAgentActivate={(agent) =>
+                activateWorkflowAgent(agent, shared.callsById, (threadId) =>
+                  navigate.toThread(threadId),
+                )
+              }
             />
           </div>
         </div>
@@ -861,11 +850,13 @@ function WorkflowPreviewLoaded({
 function WorkflowRunPanel({ threadId, params }: PluginThreadPanelProps) {
   const runId = panelRunId(params);
   return (
-    <div className="h-full min-h-0 flex-1 p-4">
+    <div className="h-full min-h-0 flex-1 bg-border">
       {runId === undefined ? (
-        <EmptyOrError>
-          This workflow panel has invalid run parameters.
-        </EmptyOrError>
+        <WorkflowRunPanelState>
+          <EmptyOrError>
+            This workflow panel has invalid run parameters.
+          </EmptyOrError>
+        </WorkflowRunPanelState>
       ) : (
         <WorkflowRunPanelLoaded threadId={threadId} runId={runId} />
       )}
@@ -890,13 +881,27 @@ function WorkflowRunPanelLoaded({
     () => (run === null ? null : buildSharedWorkflowView(run)),
     [run],
   );
-  if (state.status === "loading") return <LoadingPreview />;
+  if (state.status === "loading") {
+    return (
+      <WorkflowRunPanelState>
+        <LoadingPreview />
+      </WorkflowRunPanelState>
+    );
+  }
   if (state.status === "error") {
-    return <EmptyOrError>{state.message}</EmptyOrError>;
+    return (
+      <WorkflowRunPanelState>
+        <EmptyOrError>{state.message}</EmptyOrError>
+      </WorkflowRunPanelState>
+    );
   }
   if (run === null || shared === null) {
     return (
-      <EmptyOrError>No workflow runs were found for this thread.</EmptyOrError>
+      <WorkflowRunPanelState>
+        <EmptyOrError>
+          No workflow runs were found for this thread.
+        </EmptyOrError>
+      </WorkflowRunPanelState>
     );
   }
   const pillState = runPillState(run.status);
@@ -921,10 +926,10 @@ function WorkflowRunPanelLoaded({
     }
   };
   return (
-    <div className="flex h-full min-h-0 flex-col bg-background">
+    <div className="flex h-full min-h-0 flex-col bg-border">
       <div
         data-detail-scroll-area="workflow-panel"
-        className="min-h-0 flex-1 overflow-y-auto"
+        className="min-h-0 flex-1 overflow-y-auto p-4"
       >
         <div className="flex items-start gap-2">
           <div className="min-w-0 flex-1">
@@ -979,13 +984,11 @@ function WorkflowRunPanelLoaded({
             collapsiblePhases
             currentPhaseIndex={shared.currentPhaseIndex}
             terminalState={runTerminalState(run)}
-            onAgentActivate={(agent) => {
-              const childThreadId =
-                agent.id === undefined
-                  ? null
-                  : (shared.callsById.get(agent.id)?.childThreadId ?? null);
-              if (childThreadId !== null) navigate.toThread(childThreadId);
-            }}
+            onAgentActivate={(agent) =>
+              activateWorkflowAgent(agent, shared.callsById, (threadId) =>
+                navigate.toThread(threadId),
+              )
+            }
           />
         </div>
         <div className="my-4 h-px bg-border-seam" />

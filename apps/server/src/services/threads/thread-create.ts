@@ -1,7 +1,9 @@
+import { requestThreadStorageDeletion } from "./thread-lifecycle.js";
+import { assertEnvironmentPathAvailable } from "../environments/path-admission.js";
 import {
-  deleteThread,
-  findProjectEnvironmentByHostPath,
+  markThreadDeleted,
   getEnvironment,
+  getProjectSourceByHost,
   getThread,
 } from "@bb/db";
 import type {
@@ -11,16 +13,12 @@ import type {
   ThreadOriginKind,
   ThreadVisibility,
 } from "@bb/domain";
-import type { BaseBranchSpec, UnmanagedBranchSpec } from "@bb/server-contract";
-import type { LoggedPendingInteractionWorkSessionDeps } from "../../types.js";
-import { COMMAND_TIMEOUT_MS } from "../../constants.js";
+import type {
+  AppDeps,
+  LoggedPendingInteractionWorkSessionDeps,
+} from "../../types.js";
 import { ApiError } from "../../errors.js";
-import { unmanagedAttachRefusal } from "./workspace-path-claims.js";
 import { ensureHostSessionReadyForWork } from "../hosts/host-lifecycle.js";
-import { callHostRetryableOnlineRpc } from "../hosts/online-rpc.js";
-import { requireNonDestroyedHostWithStatus } from "../lib/entity-lookup.js";
-import { runtimeErrorLogFields } from "../lib/error-log-fields.js";
-import { throwEnvironmentNotReady } from "../lib/lifecycle-api-errors.js";
 import { buildExecutionOptions } from "./thread-commands.js";
 import {
   copyForkSourceHistory,
@@ -32,7 +30,15 @@ import {
   resolveProjectExecutionDefaultsForCreate,
 } from "./project-execution-defaults.js";
 import { validatePromptAttachmentReferences } from "../projects/attachments.js";
-import { resolvePluginMentionContextInputs } from "../plugins/plugin-mentions.js";
+import {
+  appendPluginMentionContext,
+  captureUserMessageSentTelemetry,
+} from "./thread-send.js";
+import {
+  attemptDispatch,
+  hostIdForEnvironmentIntent,
+  type PendingThreadStartContext,
+} from "./dispatch-attempt.js";
 import { emitPluginThreadDeleted } from "../plugins/plugin-thread-events.js";
 import {
   createThreadRecord,
@@ -44,46 +50,28 @@ import {
   type ResolvedStableThreadRequestEnvironment,
 } from "./thread-request-eligibility.js";
 import {
+  requireEnvironmentPlacementHost,
+  resolveThreadEnvironmentPlacement,
+} from "./thread-environment-placement.js";
+import {
   buildProviderThreadExecutionDefaults,
   resolveCreateThreadEnvironment,
-  resolveProjectDefaultThreadEnvironment,
 } from "./thread-default-policy.js";
 import { assertValidParentThread } from "./thread-parent.js";
 import {
   type ThreadCreateServiceRequestInput,
   type ThreadCreateServiceRequest,
 } from "./thread-create-request.js";
+import { resolveDispatchAuthor } from "./dispatch-author.js";
 import { deriveTitleFallback } from "./title-generation.js";
-import {
-  advanceThreadProvisioning,
-  requestThreadProvision,
-} from "./thread-provisioning.js";
-import type {
-  ThreadProvisionContext,
-  ThreadProvisionEnvironmentIntent,
-} from "./thread-provisioning-context.js";
-import {
-  resolveManagedDefaultBaseBranchSpec,
-  resolveManagedNamedBaseBranchSpec,
-} from "../projects/worktree-base-branch.js";
-import { applyLoggedEnvironmentLifecycleEvent } from "../environments/lifecycle-outcome.js";
+import type { ThreadProvisionEnvironmentIntent } from "./thread-startup-store.js";
 import { resolveSystemProviderModels } from "../system/execution-options.js";
+import {
+  getEnvironmentProvider,
+  listEnvironmentCompositions,
+} from "../plugins/plugin-environment-provider-registry.js";
 
 type ThreadCreateDeps = LoggedPendingInteractionWorkSessionDeps;
-
-interface ExistingUnmanagedEnvironmentIntentByHostPathArgs {
-  branch: UnmanagedBranchSpec | undefined;
-  hostId: string;
-  path: string;
-  request: ThreadCreateServiceRequest;
-}
-
-interface ExistingUnmanagedEnvironmentIntentResult {
-  environmentId: string;
-  intent:
-    | Extract<ThreadProvisionEnvironmentIntent, { type: "reuse" }>
-    | Extract<ThreadProvisionEnvironmentIntent, { type: "checkout-unmanaged" }>;
-}
 
 interface CreateProvisioningThreadArgs {
   environmentId: string | null;
@@ -96,7 +84,6 @@ interface CreateProvisioningThreadArgs {
 }
 
 interface ResolveForkPointArgs {
-  childHostId: string;
   originKind: ThreadOriginKind | null;
   providerId: string;
   sourceSeqEnd: number | undefined;
@@ -106,26 +93,23 @@ interface ResolveForkPointArgs {
 interface ResolveCatalogExecutionDefaultsArgs {
   cwd?: string;
   executionDefaults: ProjectExecutionDefaults | null;
-  hostId: string;
+  hostId: string | null;
   providerId: string;
+  providerFallbackCandidates: readonly string[];
   requestedModel: string | null;
 }
 
-async function resolveCatalogExecutionDefaults(
+async function loadCatalogDefaultForProvider(
   deps: ThreadCreateDeps,
-  args: ResolveCatalogExecutionDefaultsArgs,
-): Promise<ProjectExecutionDefaults | null> {
-  if (args.executionDefaults !== null || args.requestedModel !== null) {
-    return args.executionDefaults;
-  }
-
+  args: { cwd?: string; hostId: string; providerId: string },
+): Promise<ProjectExecutionDefaults | ApiError> {
   const catalog = await resolveSystemProviderModels(deps, {
     ...(args.cwd !== undefined ? { cwd: args.cwd } : {}),
     hostId: args.hostId,
     providerId: args.providerId,
   });
   if (catalog.modelLoadError !== null) {
-    throw new ApiError(
+    return new ApiError(
       503,
       "model_catalog_unavailable",
       `Unable to load ${args.providerId} models to resolve the default. Try again once the host is connected and the provider is ready.`,
@@ -138,7 +122,7 @@ async function resolveCatalogExecutionDefaults(
   const defaultModel =
     catalog.models.find((model) => model.isDefault) ?? catalog.models[0];
   if (defaultModel === undefined) {
-    throw new ApiError(
+    return new ApiError(
       503,
       "model_catalog_unavailable",
       `The ${args.providerId} model catalog is empty, so no default model can be resolved.`,
@@ -151,20 +135,38 @@ async function resolveCatalogExecutionDefaults(
   });
 }
 
-/**
- * Resolve the native-fork point for a source-derived thread, or null when it
- * cannot be provisioned as a fork. Both forks and side chats are native forks:
- * they clone the source thread's provider session at its branch point so the
- * new thread carries the conversation history, and they inherit the source's
- * timeline through that same point (a fork then waits idle; a side chat runs
- * its question turn). Forking requires: a live source thread (any non-null
- * originKind), a provider that supports native fork, a source that already has
- * a provider session, and a new workspace on the same host as the source (a
- * cross-host clone of a provider session is not possible).
- * Returns null when the request has no source provenance or the source session
- * cannot be cloned; the consumer treats a null fork point for a source-derived
- * thread as an unforkable error rather than a silent fresh start.
- */
+async function resolveCatalogExecutionDefaults(
+  deps: ThreadCreateDeps,
+  args: ResolveCatalogExecutionDefaultsArgs,
+): Promise<ProjectExecutionDefaults | null> {
+  if (args.executionDefaults !== null || args.requestedModel !== null) {
+    return args.executionDefaults;
+  }
+
+  if (args.hostId === null) {
+    throw new ApiError(
+      400,
+      "model_required",
+      "Pick a model: this environment provider has no machine yet to list a default from, and the project has no remembered one.",
+    );
+  }
+
+  const candidates = [args.providerId, ...args.providerFallbackCandidates];
+  let lastError: ApiError | null = null;
+  for (const providerId of candidates) {
+    const result = await loadCatalogDefaultForProvider(deps, {
+      ...(args.cwd !== undefined ? { cwd: args.cwd } : {}),
+      hostId: args.hostId,
+      providerId,
+    });
+    if (!(result instanceof ApiError)) {
+      return result;
+    }
+    lastError = result;
+  }
+  throw lastError;
+}
+
 function resolveForkPoint(
   deps: Pick<ThreadCreateDeps, "db" | "providerRegistry">,
   args: ResolveForkPointArgs,
@@ -175,8 +177,6 @@ function resolveForkPoint(
   if (!deps.providerRegistry.supportsFork(args.providerId)) {
     return null;
   }
-  // A provider session ID is opaque to every other provider, so a fork is
-  // possible only when the source and the child use the same provider.
   if (args.sourceThread.providerId !== args.providerId) {
     return null;
   }
@@ -185,16 +185,47 @@ function resolveForkPoint(
     return null;
   }
   const sourceEnvironment = getEnvironment(deps.db, sourceEnvironmentId);
-  if (
-    sourceEnvironment === null ||
-    sourceEnvironment.hostId !== args.childHostId
-  ) {
+  if (sourceEnvironment === null) {
     return null;
   }
   return resolveThreadForkPoint(deps, {
     sourceSeqEnd: args.sourceSeqEnd,
     sourceThread: args.sourceThread,
   });
+}
+
+function assertForkSourceHost(
+  deps: Pick<ThreadCreateDeps, "db">,
+  args: {
+    childHostId: string | null;
+    originKind: ThreadOriginKind | null;
+    sourceThread: Thread | null;
+  },
+): void {
+  if (args.originKind !== "fork" || args.sourceThread === null) {
+    return;
+  }
+  const sourceEnvironment =
+    args.sourceThread.environmentId === null
+      ? null
+      : getEnvironment(deps.db, args.sourceThread.environmentId);
+  if (sourceEnvironment !== null && args.childHostId === null) {
+    throw new ApiError(
+      400,
+      "invalid_request",
+      `Fork environment must name the source thread's host (${sourceEnvironment.hostId})`,
+    );
+  }
+  if (
+    sourceEnvironment !== null &&
+    sourceEnvironment.hostId !== args.childHostId
+  ) {
+    throw new ApiError(
+      400,
+      "invalid_request",
+      `Fork environment must use the source thread's host (${sourceEnvironment.hostId}), not ${args.childHostId}`,
+    );
+  }
 }
 
 function childHostIdForResolvedEnvironment(
@@ -208,6 +239,15 @@ function childHostIdForResolvedEnvironment(
     case "personal":
       return resolvedEnvironment.hostId;
   }
+}
+
+function projectCheckoutPathOnHost(
+  deps: Pick<AppDeps, "db">,
+  projectId: string,
+  hostId: string,
+): string | undefined {
+  const source = getProjectSourceByHost(deps.db, projectId, hostId);
+  return source?.type === "local_path" ? source.path : undefined;
 }
 
 function modelCatalogCwdForResolvedEnvironment(
@@ -227,38 +267,6 @@ function modelCatalogCwdForResolvedEnvironment(
   }
 }
 
-interface ResolveManagedBaseBranchForCreateArgs {
-  baseBranch: BaseBranchSpec;
-  hostId: string;
-  originKind: ThreadOriginKind | null;
-  sourcePath: string;
-}
-
-function scheduleThreadProvisioningAdvance(
-  deps: ThreadCreateDeps,
-  context: ThreadProvisionContext,
-  threadId: string,
-): void {
-  void advanceThreadProvisioning(deps, {
-    context,
-    threadId,
-  }).catch((error) => {
-    deps.logger.warn(
-      {
-        threadId,
-        ...runtimeErrorLogFields(deps.config, error),
-      },
-      "Failed to advance thread provisioning after thread creation",
-    );
-  });
-}
-
-function shouldAdvanceProvisioningBeforeResponse(
-  environmentIntent: ThreadProvisionEnvironmentIntent,
-): boolean {
-  return environmentIntent.type === "direct-personal";
-}
-
 function requestUsesPersonalWorkspace(
   request: ThreadCreateServiceRequestInput,
 ): boolean {
@@ -274,7 +282,17 @@ function assertProjectWorkspaceCompatibility(
 ): void {
   const personalWorkspace = requestUsesPersonalWorkspace(request);
   if (project.kind === "personal") {
-    if (request.environment.type !== "reuse" && !personalWorkspace) {
+    if (
+      request.environment.type !== "reuse" &&
+      request.environment.type !== "provider" &&
+      request.environment.type !== "project-default" &&
+      !(
+        request.environment.type === "host" &&
+        request.environment.workspace.type === "unmanaged" &&
+        request.environment.workspace.path === null
+      ) &&
+      !personalWorkspace
+    ) {
       throw new ApiError(
         400,
         "invalid_request",
@@ -329,166 +347,64 @@ function requireLiveSourceThread(
 }
 
 /**
- * Pick the ref a new managed worktree starts from. `host.list_branches`
- * refreshes the remote-tracking refs and reports how the local default branch
- * relates to origin; the default spec and a plain name that is the default
- * branch both prefer origin when local is equal or behind. A fork names the
- * branch its source environment is on, so it keeps that branch verbatim.
- * Origin-qualified names are already authoritative and are fetched by
- * provisioning, so they do not need this inspection.
+ * Creates the thread row and hands its first message to the dispatch
+ * checkpoint.
+ *
+ * This is the whole of thread creation's dispatch story now, and it replaced a
+ * pair of near-identical functions — one that provisioned immediately and one
+ * that queued the first turn — whose only real difference was
+ * whether anything was allowed to run yet. That is a question the checkpoint
+ * answers, so asking it here as well meant two code paths that had to be kept
+ * in agreement about forks, execution defaults, telemetry and cleanup.
+ *
+ * The row inserts `pending`: created, with its provider resolved, and nothing
+ * provisioned. Creation itself is unhooked — it is a cheap row — and admission
+ * happens at the first message's attempt. A cleared attempt moves the thread
+ * to `starting` and provisions with the message riding along; a queued one
+ * leaves the thread exactly where it is, with the start context recorded so a
+ * later drain (or a later server) can start it.
  */
-async function resolveManagedBaseBranchForCreate(
-  deps: ThreadCreateDeps,
-  args: ResolveManagedBaseBranchForCreateArgs,
-): Promise<BaseBranchSpec> {
-  if (
-    args.baseBranch.kind === "named" &&
-    (args.originKind !== null || args.baseBranch.name.startsWith("origin/"))
-  ) {
-    // Forks continue from their source ref verbatim. An origin-qualified ref is
-    // already unambiguous and provisioning fetches that exact remote branch, so
-    // neither case needs the default-branch relationship inspection below.
-    return args.baseBranch;
-  }
-
-  try {
-    const result = await callHostRetryableOnlineRpc(deps, {
-      hostId: args.hostId,
-      timeoutMs: COMMAND_TIMEOUT_MS,
-      command: {
-        type: "host.list_branches",
-        path: args.sourcePath,
-        limit: 1,
-      },
-    });
-    return args.baseBranch.kind === "named"
-      ? resolveManagedNamedBaseBranchSpec(args.baseBranch, result)
-      : resolveManagedDefaultBaseBranchSpec(result);
-  } catch (error) {
-    deps.logger.warn(
-      {
-        hostId: args.hostId,
-        sourcePath: args.sourcePath,
-        ...runtimeErrorLogFields(deps.config, error),
-      },
-      "Failed to resolve smart worktree base branch; using requested base",
-    );
-    return args.baseBranch;
-  }
-}
-
-interface AssertUnmanagedHostPathIsAttachableArgs {
-  branch: UnmanagedBranchSpec | undefined;
-  dataDir: string;
-  hostId: string;
-  path: string;
-  projectId: string;
-}
-
-/**
- * The environment claim on a path is project-scoped, but the directory is
- * physical and shared. Guard the two things that scoping cannot: attaching in
- * place to another project's bb-managed worktree, and rewriting the working
- * tree while another project works in the same folder.
- */
-function assertUnmanagedHostPathIsAttachable(
-  deps: ThreadCreateDeps,
-  args: AssertUnmanagedHostPathIsAttachableArgs,
-): void {
-  const refusal = unmanagedAttachRefusal(deps.db, {
-    checksOutBranch: args.branch !== undefined,
-    dataDir: args.dataDir,
-    hostId: args.hostId,
-    path: args.path,
-    projectId: args.projectId,
-  });
-  if (refusal) {
-    throw new ApiError(409, "invalid_request", refusal.message);
-  }
-}
-
-function existingUnmanagedEnvironmentIntentByHostPath(
-  deps: ThreadCreateDeps,
-  args: ExistingUnmanagedEnvironmentIntentByHostPathArgs,
-): ExistingUnmanagedEnvironmentIntentResult | null {
-  const existing = findProjectEnvironmentByHostPath(
-    deps.db,
-    args.request.projectId,
-    args.hostId,
-    args.path,
-  );
-  if (!existing) {
-    return null;
-  }
-
-  if (!args.branch) {
-    if (existing.status === "ready" || existing.status === "provisioning") {
-      return {
-        environmentId: existing.id,
-        intent: {
-          type: "reuse",
-          environmentId: existing.id,
-        },
-      };
-    }
-
-    throw new ApiError(
-      409,
-      "invalid_request",
-      `Workspace path is already attached to an environment in ${existing.status} state`,
-    );
-  }
-
-  if (existing.status !== "ready" || !existing.path) {
-    throw new ApiError(
-      409,
-      "invalid_request",
-      `Cannot checkout branch while the workspace environment is in ${existing.status} state`,
-    );
-  }
-
-  return {
-    environmentId: existing.id,
-    intent: {
-      type: "checkout-unmanaged",
-      environmentId: existing.id,
-      hostId: args.hostId,
-      path: args.path,
-      branch: args.branch,
-    },
-  };
-}
-
-/** Machine a provisioning intent lands on, for the permission ceiling. */
-function intentHostId(
-  deps: ThreadCreateDeps,
-  intent: ThreadProvisionEnvironmentIntent,
-): string | null {
-  if (intent.type === "reuse") {
-    return getEnvironment(deps.db, intent.environmentId)?.hostId ?? null;
-  }
-  return intent.hostId;
-}
-
-async function createProvisioningThread(
+async function createPendingThreadAndAttemptFirstDispatch(
   deps: ThreadCreateDeps,
   args: CreateProvisioningThreadArgs & {
     environmentIntent: ThreadProvisionEnvironmentIntent;
+    sendAt: number | undefined;
   },
 ) {
+  const environment =
+    args.environmentId === null
+      ? null
+      : getEnvironment(deps.db, args.environmentId);
+  if (environment !== null)
+    assertEnvironmentPathAvailable(deps, { ...environment, threadId: null });
+  if (args.request.sourceThreadId) {
+    requireLiveSourceThread(deps, {
+      projectId: args.request.projectId,
+      sourceThreadId: args.request.sourceThreadId,
+    });
+  }
+  const startContext: PendingThreadStartContext = {
+    environmentIntent: args.environmentIntent,
+    fork: args.fork?.descriptor ?? null,
+    ...(args.providerInput !== undefined
+      ? { providerInput: args.providerInput }
+      : {}),
+    startedOnBehalfOf: args.request.startedOnBehalfOf,
+    titleProvided: Boolean(args.request.title),
+  };
+  const placementHostId = hostIdForEnvironmentIntent(
+    deps,
+    args.environmentIntent,
+  );
+  if (placementHostId !== null)
+    requireEnvironmentPlacementHost(deps, placementHostId);
   const thread = createThreadRecord(deps, {
     request: args.request,
     environmentId: args.environmentId,
+    startupContext: JSON.stringify({ kind: "pending", ...startContext }),
   });
   let execution: Awaited<ReturnType<typeof buildExecutionOptions>>;
-  let context: ThreadProvisionContext;
   try {
-    // The clone the provider makes of the source session is invisible to the
-    // timeline, so a fork inherits the source's conversation rows through the
-    // same branch point before its own thread-start rows are appended. Only a
-    // visible fork does: it is the thread page the user continues on. A hidden
-    // fork is an aside (a side chat) or a plugin worker rendered by its owner
-    // next to the source, so its own timeline holds only what it adds.
     if (
       args.fork !== null &&
       args.fork.historyEndSequence !== null &&
@@ -500,26 +416,39 @@ async function createProvisioningThread(
         sourceThreadId: args.fork.sourceThreadId,
       });
     }
-    execution = await buildExecutionOptions(deps, args.request, {
-      ...(args.executionDefaults
-        ? { projectDefaults: args.executionDefaults }
-        : {}),
-      // The environment usually does not exist yet, so the machine's
-      // permission ceiling comes from the provisioning intent.
-      hostId: intentHostId(deps, args.environmentIntent),
+    const executionPlanArgs = {
+      projectDefaults: args.executionDefaults,
+      hostId: hostIdForEnvironmentIntent(deps, args.environmentIntent),
       threadId: thread.id,
-    });
-    context = requestThreadProvision(deps, {
+    };
+    execution = await buildExecutionOptions(
+      deps,
+      args.request,
+      executionPlanArgs,
+    );
+    await attemptDispatch(deps, {
       thread,
-      environmentIntent: args.environmentIntent,
-      execution,
-      fork: args.fork?.descriptor ?? null,
-      input: args.request.input,
-      ...(args.providerInput !== undefined
-        ? { providerInput: args.providerInput }
-        : {}),
+      payload: {
+        input: args.request.input,
+        mode: "start",
+        model: execution.model,
+        reasoningLevel: execution.reasoningLevel,
+        serviceTier: execution.serviceTier,
+        permissionMode: execution.permissionMode,
+        ...(args.request.executionInputSources !== undefined
+          ? { executionInputSources: args.request.executionInputSources }
+          : {}),
+        ...(args.sendAt !== undefined ? { sendAt: args.sendAt } : {}),
+      },
+      source: { kind: "inline" },
+      queuePayload: { kind: "inline" },
+      pluginSubmission: args.request.pluginSubmission ?? null,
+      startContext,
+      executionDefaults: executionPlanArgs,
+      origin: args.request.origin,
+      originPluginId: args.request.originPluginId ?? null,
       startedOnBehalfOf: args.request.startedOnBehalfOf,
-      titleProvided: Boolean(args.request.title),
+      trigger: "user",
     });
   } catch (error) {
     emitPluginThreadDeleted({
@@ -527,36 +456,31 @@ async function createProvisioningThread(
       deletedAt: Date.now(),
       updatedAt: Date.now(),
     });
-    deleteThread(deps.db, deps.hub, thread.id);
+    const deleted = markThreadDeleted(deps.db, deps.hub, {
+      threadId: thread.id,
+    });
+    if (deleted)
+      requestThreadStorageDeletion(
+        deps,
+        deleted,
+        deleted.environmentId
+          ? getEnvironment(deps.db, deleted.environmentId)
+          : null,
+      );
     throw error;
   }
   rememberProjectExecutionDefaultsForCreate(deps, {
     execution,
     request: args.request,
   });
-  if (shouldAdvanceProvisioningBeforeResponse(args.environmentIntent)) {
-    await advanceThreadProvisioning(deps, {
-      context,
-      threadId: thread.id,
-    });
-  } else {
-    scheduleThreadProvisioningAdvance(deps, context, thread.id);
-  }
   return getThreadSafe(deps, thread.id);
 }
 
 interface ResolveCreateThreadVisibilityArgs {
-  /** Resolved hierarchy parent; null for roots and forks. */
   parentThread: Pick<Thread, "visibility"> | null;
   requestedVisibility: ThreadVisibility | undefined;
 }
 
-/**
- * Visibility default for a new thread. An explicit request always wins. A
- * hierarchy child otherwise inherits its parent, so sub-agents delegated by a
- * hidden thread stay out of navigation with it. A side chat is forked with an
- * explicit `hidden` by the plugin that owns it.
- */
 function resolveCreateThreadVisibility(
   args: ResolveCreateThreadVisibilityArgs,
 ): ThreadVisibility {
@@ -566,13 +490,33 @@ function resolveCreateThreadVisibility(
   return args.parentThread?.visibility ?? "visible";
 }
 
+function resolveCreateThreadPluginMetadata(
+  request: Pick<
+    ThreadCreateServiceRequestInput,
+    "originPluginId" | "pluginMetadata"
+  >,
+): ThreadCreateServiceRequest["pluginMetadata"] {
+  if (request.pluginMetadata === undefined) {
+    return null;
+  }
+  if (request.originPluginId === undefined) {
+    throw new ApiError(
+      400,
+      "invalid_request",
+      'pluginMetadata requires origin "plugin"',
+    );
+  }
+  return {
+    pluginId: request.originPluginId,
+    metadata: request.pluginMetadata,
+  };
+}
+
 export async function createThreadFromRequest(
   deps: ThreadCreateDeps,
   rawRequestInput: ThreadCreateServiceRequestInput,
   options: {
-    /** Provider-facing input when it differs from the persisted start seed. */
     providerInput?: ThreadCreateServiceRequestInput["input"];
-    /** Source environment selected by the public fork route. */
     forkSourceEnvironmentId?: string;
   } = {},
 ) {
@@ -595,27 +539,11 @@ export async function createThreadFromRequest(
       'originPluginId requires origin "plugin"',
     );
   }
-  // Resolve the server-owned "project-default" environment marker into a
-  // concrete environment before any workspace/provisioning logic runs.
-  const requestInput = {
-    ...rawRequestInput,
-    environment:
-      rawRequestInput.environment.type === "project-default"
-        ? await resolveProjectDefaultThreadEnvironment(deps, {
-            projectId: rawRequestInput.projectId,
-          })
-        : rawRequestInput.environment,
-  };
-  // Plugin mentions resolve once at send time (plugin design §4.9): each
-  // unique mention becomes an agent-only context input appended after the
-  // user's message; a resolve failure throws a 422 before the thread is
-  // created.
-  const pluginMentionContext = await resolvePluginMentionContextInputs(
-    requestInput.input,
-  );
-  if (pluginMentionContext.length > 0) {
-    requestInput.input = [...requestInput.input, ...pluginMentionContext];
-  }
+  const pluginMetadata = resolveCreateThreadPluginMetadata(rawRequestInput);
+  const requestInput = { ...rawRequestInput };
+  requestInput.input = (
+    await appendPluginMentionContext({ input: requestInput.input })
+  ).input;
   assertProjectWorkspaceCompatibility(project, requestInput);
   const originKind = requestInput.originKind ?? null;
   const sourceThreadId =
@@ -649,8 +577,6 @@ export async function createThreadFromRequest(
       })
     : null;
   if (originKind !== null && sourceThread !== null) {
-    // Forks and side chats are not hierarchy children, but they still consume
-    // the same spawn allowance exposed as ThreadResponse.canSpawnChild.
     assertValidParentThread(deps, {
       parentThreadId: sourceThread.id,
     });
@@ -671,9 +597,6 @@ export async function createThreadFromRequest(
     requestInput.environment.environmentId === sourceThread.environmentId
       ? sourceThread.environmentId
       : undefined);
-  // Provenance coherence + anti-forgery. The validated source/parent thread
-  // anchors senderThreadId so a caller cannot claim a start on behalf of an
-  // arbitrary or cross-project thread.
   if (requestInput.startedOnBehalfOf !== null) {
     const senderThread = sourceThread ?? parentThread;
     if (senderThread === null) {
@@ -692,10 +615,6 @@ export async function createThreadFromRequest(
           : "startedOnBehalfOf.senderThreadId must match sourceThreadId",
       );
     }
-    // Seeding a thread-start without a provider run (startedOnBehalfOf) is
-    // only meaningful for a tagged source-derived spawn. Requiring originKind
-    // keeps the two signals coupled so the thread is excluded from reshaping
-    // the project's stored execution defaults.
     if (originKind === null) {
       throw new ApiError(
         400,
@@ -705,27 +624,49 @@ export async function createThreadFromRequest(
     }
   }
   await validatePromptAttachmentReferences({
+    db: deps.db,
     dataDir: deps.config.dataDir,
     input: requestInput.input,
     projectId: requestInput.projectId,
   });
-  // Providers register with plugin startup, which the listener does not wait
-  // for: without this, a thread created on boot sees an empty registry and
-  // fails with "no provider available".
   await deps.providerRegistry.whenRegistrationsSettled();
-  const { executionDefaults, providerId, requestedModel } =
-    resolveProjectExecutionDefaultsForCreate(deps, {
-      executionInputSources: requestInput.executionInputSources,
-      model: requestInput.model,
-      projectId: requestInput.projectId,
-      providerId: requestInput.providerId,
-    });
+  const {
+    executionDefaults,
+    providerId,
+    providerFallbackCandidates,
+    requestedModel,
+  } = resolveProjectExecutionDefaultsForCreate(deps, {
+    executionInputSources: requestInput.executionInputSources,
+    model: requestInput.model,
+    projectId: requestInput.projectId,
+    providerId: requestInput.providerId,
+  });
   const {
     originKind: _requestedOriginKind,
     parentThreadId: _requestedParentThreadId,
+    pluginMetadata: _requestedPluginMetadata,
     sourceThreadId: _requestedSourceThreadId,
     ...requestRest
   } = requestInput;
+  const requestedEnvironment = await resolveCreateThreadEnvironment(deps, {
+    parentThread:
+      forkSourceEnvironmentId !== undefined
+        ? null
+        : (sourceThread ?? parentThread),
+    projectId: requestInput.projectId,
+    requestedEnvironment: requestInput.environment,
+  });
+  if (
+    requestedEnvironment.type === "provider" &&
+    getEnvironmentProvider(requestedEnvironment.environmentProviderId) ===
+      undefined &&
+    !listEnvironmentCompositions().some(
+      (record) =>
+        record.composition.id === requestedEnvironment.environmentProviderId,
+    )
+  ) {
+    throw new ApiError(400, "invalid_request", "unknown environment provider");
+  }
   const request: ThreadCreateServiceRequest = {
     ...requestRest,
     ...(hierarchyParentThreadId
@@ -733,35 +674,51 @@ export async function createThreadFromRequest(
       : {}),
     ...(sourceThread ? { sourceThreadId: sourceThread.id } : {}),
     originKind,
+    pluginMetadata,
     visibility: resolveCreateThreadVisibility({
       parentThread,
       requestedVisibility: requestInput.visibility,
     }),
-    environment: resolveCreateThreadEnvironment({
-      // Source-derived forks already resolve their environment before this
-      // call. Applying ordinary child defaults here would turn an isolated
-      // personal fork back into source reuse.
-      parentThread:
-        forkSourceEnvironmentId !== undefined
-          ? null
-          : (sourceThread ?? parentThread),
-      projectId: requestInput.projectId,
-      requestedEnvironment: requestInput.environment,
-    }),
+    environment: requestedEnvironment,
     providerId,
     titleFallback: deriveTitleFallback(requestInput.input),
   };
-  const resolvedEnvironment = resolveStableThreadRequestEnvironment(deps, {
-    allowUnmanagedPersonalProjectReuseEnvironmentId: forkSourceEnvironmentId,
-    environment: request.environment,
-    projectId: request.projectId,
+  const resolvedEnvironment =
+    requestedEnvironment.type === "provider"
+      ? null
+      : resolveStableThreadRequestEnvironment(deps, {
+          allowUnmanagedPersonalProjectReuseEnvironmentId:
+            forkSourceEnvironmentId,
+          environment: requestedEnvironment,
+          projectId: request.projectId,
+        });
+  const childHostId =
+    resolvedEnvironment !== null
+      ? childHostIdForResolvedEnvironment(resolvedEnvironment)
+      : request.environment.type === "provider"
+        ? request.environment.machine?.type === "existing"
+          ? request.environment.machine.hostId
+          : null
+        : null;
+  assertForkSourceHost(deps, {
+    childHostId,
+    originKind: request.originKind ?? null,
+    sourceThread,
   });
-  const childHostId = childHostIdForResolvedEnvironment(resolvedEnvironment);
-  const hostDataDir = (
-    await ensureHostSessionReadyForWork(deps, { hostId: childHostId })
-  ).dataDir;
+  if (childHostId !== null) {
+    await ensureHostSessionReadyForWork(deps, { hostId: childHostId });
+  }
   const modelCatalogCwd =
-    modelCatalogCwdForResolvedEnvironment(resolvedEnvironment);
+    resolvedEnvironment !== null
+      ? modelCatalogCwdForResolvedEnvironment(resolvedEnvironment)
+      : request.environment.type === "provider" &&
+          request.environment.machine?.type === "existing"
+        ? projectCheckoutPathOnHost(
+            deps,
+            request.projectId,
+            request.environment.machine.hostId,
+          )
+        : undefined;
   const resolvedExecutionDefaults = await resolveCatalogExecutionDefaults(
     deps,
     {
@@ -769,121 +726,36 @@ export async function createThreadFromRequest(
       executionDefaults,
       hostId: childHostId,
       providerId,
+      providerFallbackCandidates,
       requestedModel,
     },
   );
-
-  let environmentId: string | null = null;
-  let environmentIntent: ThreadProvisionEnvironmentIntent;
-
-  switch (resolvedEnvironment.type) {
-    case "reuse": {
-      let environment = resolvedEnvironment.environment;
-      if (environment.status === "retiring") {
-        applyLoggedEnvironmentLifecycleEvent(deps, {
-          environmentId: environment.id,
-          event: { type: "retire.cancelled" },
-        });
-        environment = getEnvironment(deps.db, environment.id) ?? environment;
-      }
-      if (
-        environment.status !== "ready" &&
-        environment.status !== "provisioning"
-      ) {
-        throwEnvironmentNotReady(environment);
-      }
-      if (environment.status === "ready" && !environment.path) {
-        throwEnvironmentNotReady(environment);
-      }
-      if (environment.status === "provisioning") {
-        requireNonDestroyedHostWithStatus(deps, environment.hostId);
-      }
-      environmentId = environment.id;
-      environmentIntent = {
-        type: "reuse",
-        environmentId: environment.id,
-      };
-      break;
-    }
-    case "host": {
-      const hostId = resolvedEnvironment.hostId;
-      const workspace = resolvedEnvironment.workspace;
-      if (workspace.type === "unmanaged") {
-        if (resolvedEnvironment.unmanagedPath === null) {
-          throw new Error(
-            "Validated unmanaged host request is missing a workspace path",
-          );
-        }
-        assertUnmanagedHostPathIsAttachable(deps, {
-          branch: workspace.branch,
-          dataDir: hostDataDir,
-          hostId,
-          path: resolvedEnvironment.unmanagedPath,
-          projectId: request.projectId,
-        });
-        const existingIntent = existingUnmanagedEnvironmentIntentByHostPath(
-          deps,
-          {
-            branch: workspace.branch,
-            hostId,
-            path: resolvedEnvironment.unmanagedPath,
-            request,
-          },
-        );
-        environmentIntent = existingIntent?.intent ?? {
-          type: "direct-unmanaged",
-          hostId,
-          path: resolvedEnvironment.unmanagedPath,
-          ...(workspace.branch ? { branch: workspace.branch } : {}),
-        };
-        if (existingIntent) {
-          environmentId = existingIntent.environmentId;
-        }
-        break;
-      }
-
-      const managedSource = resolvedEnvironment.localSource;
-      if (!managedSource) {
-        throw new Error(
-          "Validated managed host request is missing a local source",
-        );
-      }
-      environmentIntent = {
-        type: "direct-managed",
-        hostId,
-        sourcePath: managedSource.path,
-        baseBranch: await resolveManagedBaseBranchForCreate(deps, {
-          baseBranch: workspace.baseBranch,
-          hostId,
-          originKind,
-          sourcePath: managedSource.path,
-        }),
-        workspaceProvisionType: workspace.type,
-      };
-      break;
-    }
-    case "personal": {
-      environmentIntent = {
-        type: "direct-personal",
-        hostId: resolvedEnvironment.hostId,
-        workspaceProvisionType: "personal",
-      };
-      break;
-    }
+  if (
+    resolvedExecutionDefaults !== null &&
+    resolvedExecutionDefaults.providerId !== request.providerId
+  ) {
+    request.providerId = resolvedExecutionDefaults.providerId;
   }
 
+  const { environmentId, environmentIntent } =
+    await resolveThreadEnvironmentPlacement(deps, {
+      ...(forkSourceEnvironmentId !== undefined
+        ? {
+            allowUnmanagedPersonalProjectReuseEnvironmentId:
+              forkSourceEnvironmentId,
+          }
+        : {}),
+      projectId: request.projectId,
+      requestedEnvironment: request.environment,
+    });
+
   const fork = resolveForkPoint(deps, {
-    childHostId,
     originKind: request.originKind ?? null,
     providerId: request.providerId,
     sourceSeqEnd: request.sourceSeqEnd,
     sourceThread,
   });
 
-  // A fork/side-chat must clone the source provider session. If that clone
-  // cannot be resolved (source has no active session, provider lacks fork
-  // support, or the target is cross-host), do not fall back to a fresh
-  // history-less thread.start.
   if (request.originKind !== null && fork === null) {
     throw new ApiError(
       400,
@@ -892,7 +764,7 @@ export async function createThreadFromRequest(
     );
   }
 
-  const thread = await createProvisioningThread(deps, {
+  const createArgs = {
     environmentId,
     environmentIntent,
     executionDefaults: resolvedExecutionDefaults,
@@ -901,6 +773,10 @@ export async function createThreadFromRequest(
       ? { providerInput: options.providerInput }
       : {}),
     request,
+  };
+  const thread = await createPendingThreadAndAttemptFirstDispatch(deps, {
+    ...createArgs,
+    sendAt: request.sendAt,
   });
   deps.telemetry.capture({
     name: "thread_created",
@@ -909,17 +785,16 @@ export async function createThreadFromRequest(
       provider: request.providerId,
     },
   });
-  if (
-    (request.startedOnBehalfOf?.initiator ?? "user") === "user" &&
-    request.input.length > 0
-  ) {
-    deps.telemetry.capture({
-      name: "user_message_sent",
-      properties: {
-        is_child_thread: parentThread !== null,
-        message_source: "thread_create",
-        provider: request.providerId,
-      },
+  const { initiator } = resolveDispatchAuthor({
+    retrying: false,
+    senderThreadId: null,
+    startedOnBehalfOf: request.startedOnBehalfOf,
+  });
+  if (initiator === "user" && request.input.length > 0) {
+    captureUserMessageSentTelemetry(deps, {
+      isChildThread: parentThread !== null,
+      messageSource: "thread_create",
+      providerId: request.providerId,
     });
   }
   return thread;

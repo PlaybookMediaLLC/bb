@@ -86,36 +86,37 @@ describe("app keybindings", () => {
     ).toBe(true);
   });
 
-  // macOS composes Option+letter chords, so matching on `key` alone would never
-  // fire the composer cycles there — the physical code carries the match.
   it.each([
     ["m", "µ", "KeyM"],
     ["p", "π", "KeyP"],
     ["t", "†", "KeyT"],
-  ])("matches Alt+%s by physical key when macOS reports %s", (key, composed, code) => {
-    const shortcut: AppShortcut = {
-      key,
-      mod: false,
-      meta: false,
-      control: false,
-      alt: true,
-      shift: false,
-    };
-    expect(
-      matchesAppShortcut(
-        {
-          key: composed,
-          code,
-          metaKey: false,
-          ctrlKey: false,
-          altKey: true,
-          shiftKey: false,
-        },
-        shortcut,
-        true,
-      ),
-    ).toBe(true);
-  });
+  ])(
+    "matches Alt+%s by physical key when macOS reports %s",
+    (key, composed, code) => {
+      const shortcut: AppShortcut = {
+        key,
+        mod: false,
+        meta: false,
+        control: false,
+        alt: true,
+        shift: false,
+      };
+      expect(
+        matchesAppShortcut(
+          {
+            key: composed,
+            code,
+            metaKey: false,
+            ctrlKey: false,
+            altKey: true,
+            shiftKey: false,
+          },
+          shortcut,
+          true,
+        ),
+      ).toBe(true);
+    },
+  );
 
   it.each([
     ["m", "Â", "KeyM"],
@@ -186,9 +187,6 @@ describe("app keybindings", () => {
         false,
       ),
     ).toBe(true);
-    // A non-US layout still reports a plain letter for Alt chords. AZERTY
-    // Alt+A is key "a" on physical KeyQ — it must keep matching the character
-    // the user sees, not the physical key underneath it.
     expect(
       matchesAppShortcut(
         {
@@ -260,5 +258,21 @@ describe("app keybindings", () => {
     expect(formatAppShortcut(ALT_P, "MacIntel")).toBe("⌥ P");
     expect(formatAppShortcut(ALT_P, "Win32")).toBe("Alt + P");
     expect(formatAppShortcutAria(ALT_P, "MacIntel")).toBe("Alt+P");
+  });
+
+  it("formats arrow keys as arrow glyphs", () => {
+    const shortcut: AppShortcut = {
+      key: "ArrowLeft",
+      mod: true,
+      meta: false,
+      control: true,
+      alt: false,
+      shift: false,
+    };
+    expect(formatAppShortcut(shortcut, "MacIntel")).toBe("⌃ ⌘ ←");
+    expect(formatAppShortcut(shortcut, "Win32")).toBe("Ctrl + ←");
+    expect(formatAppShortcutAria(shortcut, "MacIntel")).toBe(
+      "Control+Meta+ArrowLeft",
+    );
   });
 });

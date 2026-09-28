@@ -6,6 +6,10 @@ import type {
   ThreadWithRuntime,
 } from "@bb/domain";
 import {
+  makeThreadQueuedMessage,
+  makeThreadWithRuntime,
+} from "@bb/test-helpers/domain-fixtures";
+import {
   act,
   cleanup,
   fireEvent,
@@ -23,29 +27,11 @@ import {
 import { getPromptDraftAccessor } from "@/hooks/usePromptDraftStorage";
 import { ThreadDetailPromptArea } from "./ThreadDetailPromptArea";
 
-/**
- * Keystroke isolation for the published plugin composer host.
- *
- * The host published by ThreadDetailPromptArea reaches large non-draft
- * subscribers (ThreadDetailSecondaryContentBody -> SecondaryPanelLayout ->
- * ThreadTimelinePane, the hosted-panel registry). It must stay referentially
- * stable while the user types: a per-keystroke identity notified the pane
- * scope and re-rendered the whole thread shell per character. The live draft
- * must instead reach actual draft consumers through the host's
- * getCurrent/subscribeDraft pair. These tests use the real draft store so
- * keystrokes flow the way they do in the app.
- */
-
 const mocks = vi.hoisted(() => ({
   sendMessageMutateAsync: vi.fn(),
   shellProbeRenders: vi.fn(),
   updateQueuedMessageMutateAsync: vi.fn(),
 }));
-
-vi.mock("react-router-dom", async (importOriginal) => {
-  const actual = await importOriginal<typeof import("react-router-dom")>();
-  return { ...actual, useNavigate: () => vi.fn() };
-});
 
 vi.mock("@/components/promptbox/FollowUpPromptBox", () => ({
   FollowUpPromptBox: ({
@@ -67,8 +53,6 @@ vi.mock("@/components/promptbox/FollowUpPromptBox", () => ({
         {pendingInteraction}
       </div>
       {composer ? (
-        // Like the real FollowUpPromptBox: hidden, not unmounted, while a
-        // pending interaction takes the composer's place.
         <div hidden={pendingInteraction !== null}>
           <input
             aria-label="Composer message"
@@ -176,7 +160,7 @@ vi.mock("@/hooks/useCommandSuggestions", () => ({
     isLoadingMore: false,
     loadMore: vi.fn(),
     suggestions: [],
-    trigger: null,
+    triggers: [],
   }),
 }));
 
@@ -201,6 +185,7 @@ vi.mock("@/hooks/useThreadCreationOptions", () => ({
     moreModelOptions: [],
     permissionMode: "auto",
     permissionModeOptions: [],
+    providers: [],
     providerOptions: [],
     reasoningLevel: "medium",
     reasoningOptions: [],
@@ -236,6 +221,7 @@ vi.mock("@/hooks/mutations/thread-runtime-mutations", () => {
   return {
     useCancelThreadPlan: idleMutation,
     useClearThreadGoal: idleMutation,
+    useCreateThread: idleMutation,
     useCreateThreadQueuedMessage: idleMutation,
     useDeleteThreadQueuedMessage: idleMutation,
     useReorderThreadQueuedMessage: idleMutation,
@@ -250,6 +236,11 @@ vi.mock("@/hooks/mutations/thread-runtime-mutations", () => {
 });
 
 vi.mock("@/hooks/mutations/thread-state-mutations", () => ({
+  useRestoreThreadEnvironment: () => ({
+    isPending: false,
+    mutate: vi.fn(),
+    variables: null,
+  }),
   useUnarchiveThread: () => ({
     isPending: false,
     mutate: vi.fn(),
@@ -288,29 +279,22 @@ vi.mock("@/hooks/queries/thread-queries", () => ({
 const PROJECT_ID = "proj_keystrokes";
 
 function makeThread(id: string): ThreadWithRuntime {
-  return {
-    archivedAt: null,
+  return makeThreadWithRuntime({
     environmentId: null,
     id,
     projectId: PROJECT_ID,
-    providerId: "codex",
-    runtime: { displayStatus: "idle" },
-    status: "idle",
-  } as ThreadWithRuntime;
+  });
 }
 
 function makeQueuedMessage(): ThreadQueuedMessage {
-  return {
+  return makeThreadQueuedMessage({
     id: "qmsg_1",
+    threadId: "thr_keystrokes",
     content: [{ type: "text", text: "Already queued", mentions: [] }],
     model: "gpt-5",
-    reasoningLevel: "medium",
-    permissionMode: "auto",
-    serviceTier: "default",
-    groupWithNext: false,
     createdAt: 1,
     updatedAt: 1,
-  };
+  });
 }
 
 function makePendingInteraction(threadId: string): PendingInteraction {
@@ -346,18 +330,11 @@ function makePendingInteraction(threadId: string): PendingInteraction {
   };
 }
 
-/**
- * Mirrors ThreadDetailSecondaryContentBody: holds the published host without
- * reading its draft. Every render is one shell re-render in the app
- * (SecondaryPanelLayout, ThreadTimelinePane), so this must stay flat while
- * the user types.
- */
 function ShellProbe() {
   mocks.shellProbeRenders(usePluginComposerHost());
   return null;
 }
 
-/** An actual draft consumer (the plugin-hook read path). */
 function PublishedHostDraftProbe() {
   const host = usePluginComposerHost();
   const draft = usePluginComposerHostDraft(host);
@@ -368,11 +345,6 @@ function observedShellHosts(): readonly unknown[] {
   return mocks.shellProbeRenders.mock.calls.map((call) => call[0]);
 }
 
-/**
- * Mounting settles at two shell renders: the probe first sees an empty scope,
- * then the area's layout-effect publish delivers the host. Everything after
- * that baseline is a real shell re-render.
- */
 function shellRenderCount(): number {
   return mocks.shellProbeRenders.mock.calls.length;
 }
@@ -400,6 +372,7 @@ function buildPromptArea({
         childThreadsSection={null}
         composerFocusRequestNonce={0}
         contextBannerMergeBase={null}
+        canRestoreEnvironment={false}
         environmentGoneStatus={null}
         goal={null}
         modelFallback={null}
@@ -408,6 +381,7 @@ function buildPromptArea({
         parentThreadSection={null}
         pendingInteractions={pendingInteractions}
         pendingInteractionsInitialLoading={false}
+        queuedMessageCount={0}
         pendingTodos={null}
         projectId={PROJECT_ID}
         pullRequest={null}
@@ -467,10 +441,7 @@ describe("ThreadDetailPromptArea published composer host", () => {
     }
 
     expect(input.value).toBe(typed);
-    // Draft consumers saw every keystroke through the stable host...
     expect(screen.getByTestId("published-host-draft").textContent).toBe(typed);
-    // ...while the pane scope never notified: no shell re-render for the
-    // entire burst, including the empty -> non-empty flip.
     expect(shellRenderCount()).toBe(rendersAfterMount);
     expect(observedShellHosts().at(-1)).toBe(hostAfterMount);
   });
@@ -546,8 +517,6 @@ describe("ThreadDetailPromptArea published composer host", () => {
     fireEvent.click(
       screen.getByRole("button", { name: "Edit queued message 1" }),
     );
-    // Opening the editor publishes the queued-message host: exactly one
-    // legitimate shell notification.
     expect(shellRenderCount()).toBe(rendersAfterMount + 1);
     expect(observedShellHosts().at(-1)).not.toBe(threadHost);
     expect(screen.getByTestId("published-host-draft").textContent).toBe(
@@ -569,11 +538,9 @@ describe("ThreadDetailPromptArea published composer host", () => {
     }
 
     expect(inlineInput.value).toBe(typed);
-    // Inline keystrokes reached consumers through the same stable host...
     expect(screen.getByTestId("published-host-draft").textContent).toBe(typed);
     expect(shellRenderCount()).toBe(rendersAfterMount + 1);
 
-    // ...and closing the editor swaps back to the identical thread host.
     fireEvent.click(screen.getByRole("button", { name: "Cancel queued edit" }));
     expect(shellRenderCount()).toBe(rendersAfterMount + 2);
     expect(observedShellHosts().at(-1)).toBe(threadHost);

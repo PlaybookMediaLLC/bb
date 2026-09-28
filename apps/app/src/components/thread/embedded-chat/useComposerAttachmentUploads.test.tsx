@@ -1,8 +1,8 @@
 // @vitest-environment jsdom
 
 import { act, renderHook } from "@testing-library/react";
-import { beforeEach, describe, expect, it, vi } from "vitest";
-import type { InlineQueuedMessageEditState } from "./useInlineQueuedMessageEditing";
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
+import type { InlineComposerDraftSession } from "./useActiveComposerDraft";
 import type { PromptDraftAttachment } from "@bb/client-core";
 import { BbHttpError } from "@bb/sdk/browser";
 import { createDeferredPromise } from "@bb/test-helpers";
@@ -19,24 +19,20 @@ vi.mock("@/hooks/mutations/project-mutations", () => ({
   useUploadPromptAttachment: () => ({ mutateAsync: mocks.upload }),
 }));
 
-function makeInlineEdit(editSessionId: number): InlineQueuedMessageEditState {
-  return {
-    draft: { attachments: [], mentions: [], text: "queued" },
-    editSessionId,
-    expectedUpdatedAt: 1,
-    model: "gpt-5",
-    ownerThreadId: "thr_1",
-    permissionMode: "auto",
-    queuedMessageId: "qmsg_1",
-    queuedMessageIndex: 0,
-    reasoningLevel: "medium",
-    serviceTier: "default",
-  };
+function makeInlineSession(
+  editSessionId: number,
+  setDraft = vi.fn(),
+): InlineComposerDraftSession {
+  return { editSessionId, setDraft };
 }
 
 describe("useComposerAttachmentUploads", () => {
   beforeEach(() => {
     mocks.upload.mockReset();
+  });
+
+  afterEach(() => {
+    vi.unstubAllGlobals();
   });
 
   it("keeps bottom and queued attachment operations independent", async () => {
@@ -45,15 +41,14 @@ describe("useComposerAttachmentUploads", () => {
     mocks.upload
       .mockReturnValueOnce(bottomUpload.promise)
       .mockReturnValueOnce(inlineUpload.promise);
-    const inline = makeInlineEdit(1);
+    const inline = makeInlineSession(1);
     const inlineRef = { current: inline };
     const { result } = renderHook(() =>
       useComposerAttachmentUploads({
         projectId: "proj_1",
         addDraftAttachment: vi.fn(),
-        inlineEditingQueuedMessage: inline,
-        inlineEditingQueuedMessageRef: inlineRef,
-        commitInlineQueuedMessage: vi.fn(),
+        inlineEditSessionId: inline.editSessionId,
+        inlineSessionRef: inlineRef,
       }),
     );
 
@@ -65,6 +60,8 @@ describe("useComposerAttachmentUploads", () => {
     });
     expect(result.current.isAttachingBottomFiles).toBe(true);
     expect(result.current.isAttachingInlineFiles).toBe(false);
+    expect(result.current.bottomPendingUploads.map((upload) => upload.file.name)).toEqual(["bottom.txt"]);
+    expect(result.current.inlinePendingUploads).toEqual([]);
 
     let inlinePromise!: Promise<void>;
     act(() => {
@@ -74,6 +71,7 @@ describe("useComposerAttachmentUploads", () => {
     });
     expect(result.current.isAttachingBottomFiles).toBe(true);
     expect(result.current.isAttachingInlineFiles).toBe(true);
+    expect(result.current.inlinePendingUploads.map((upload) => upload.file.name)).toEqual(["inline.txt"]);
 
     await act(async () => {
       inlineUpload.reject(new Error("inline failed"));
@@ -84,6 +82,8 @@ describe("useComposerAttachmentUploads", () => {
     );
     expect(result.current.bottomAttachmentError).toBeNull();
     expect(result.current.isAttachingBottomFiles).toBe(true);
+    expect(result.current.inlinePendingUploads).toEqual([]);
+    expect(result.current.bottomPendingUploads).toHaveLength(1);
 
     await act(async () => {
       bottomUpload.reject(new Error("bottom failed"));
@@ -100,23 +100,22 @@ describe("useComposerAttachmentUploads", () => {
   it("does not leak a dismissed upload into a later queued edit", async () => {
     const oldUpload = createDeferredPromise<never>();
     mocks.upload.mockReturnValueOnce(oldUpload.promise);
-    const firstEdit = makeInlineEdit(1);
-    const inlineRef: { current: InlineQueuedMessageEditState | null } = {
+    const setDraft = vi.fn();
+    const firstEdit = makeInlineSession(1, setDraft);
+    const inlineRef: { current: InlineComposerDraftSession | null } = {
       current: firstEdit,
     };
-    const commitInlineQueuedMessage = vi.fn();
     const { result, rerender } = renderHook(
-      ({ inline }: { inline: InlineQueuedMessageEditState | null }) =>
+      ({ inline }: { inline: InlineComposerDraftSession | null }) =>
         useComposerAttachmentUploads({
           projectId: "proj_1",
           addDraftAttachment: vi.fn(),
-          inlineEditingQueuedMessage: inline,
-          inlineEditingQueuedMessageRef: inlineRef,
-          commitInlineQueuedMessage,
+          inlineEditSessionId: inline?.editSessionId ?? null,
+          inlineSessionRef: inlineRef,
         }),
       {
         initialProps: {
-          inline: firstEdit as InlineQueuedMessageEditState | null,
+          inline: firstEdit as InlineComposerDraftSession | null,
         },
       },
     );
@@ -128,13 +127,15 @@ describe("useComposerAttachmentUploads", () => {
       ]);
     });
     expect(result.current.isAttachingInlineFiles).toBe(true);
+    expect(result.current.inlinePendingUploads).toHaveLength(1);
 
     inlineRef.current = null;
     rerender({ inline: null });
     expect(result.current.isAttachingInlineFiles).toBe(false);
     expect(result.current.inlineAttachmentError).toBeNull();
+    expect(result.current.inlinePendingUploads).toEqual([]);
 
-    const secondEdit = makeInlineEdit(2);
+    const secondEdit = makeInlineSession(2, setDraft);
     inlineRef.current = secondEdit;
     rerender({ inline: secondEdit });
     await act(async () => {
@@ -144,7 +145,7 @@ describe("useComposerAttachmentUploads", () => {
 
     expect(result.current.isAttachingInlineFiles).toBe(false);
     expect(result.current.inlineAttachmentError).toBeNull();
-    expect(commitInlineQueuedMessage).not.toHaveBeenCalled();
+    expect(setDraft).not.toHaveBeenCalled();
   });
 
   it("shows the server's reason when it refuses an upload", async () => {
@@ -177,6 +178,47 @@ describe("useComposerAttachmentUploads", () => {
     expect(result.current.attachmentError).toBe(
       `Failed to attach IMG_0001.heic, shot.png: ${message}`,
     );
+  });
+
+  it("settles concurrent previews without the secure-context randomUUID API", async () => {
+    vi.stubGlobal("crypto", {
+      getRandomValues: crypto.getRandomValues.bind(crypto),
+    });
+    const first = createDeferredPromise<PromptDraftAttachment>();
+    const concurrent = createDeferredPromise<PromptDraftAttachment>();
+    const second = createDeferredPromise<PromptDraftAttachment>();
+    mocks.upload.mockReturnValueOnce(first.promise).mockReturnValueOnce(concurrent.promise).mockReturnValueOnce(second.promise);
+    const addAttachment = vi.fn();
+    const { result } = renderHook(() => useDraftAttachmentUploads({
+      projectId: "proj_1",
+      target: { key: "bottom", addAttachment },
+    }));
+    const file = new File(["image"], "same-name.png", { type: "image/png" });
+    let batch!: Promise<void>;
+    let other!: Promise<void>;
+    act(() => {
+      batch = result.current.handleAttachFiles([file, file]);
+      other = result.current.handleAttachFiles([file]);
+    });
+    expect(new Set(result.current.pendingUploads.map((upload) => upload.id)).size).toBe(3);
+    expect(result.current.isAttachingFiles).toBe(true);
+    await act(async () => {
+      first.resolve({ type: "localImage", name: file.name, path: "uploaded.png", sizeBytes: 5 });
+      await first.promise;
+    });
+    expect(addAttachment).toHaveBeenCalledTimes(1);
+    expect(result.current.pendingUploads).toHaveLength(2);
+    await act(async () => {
+      concurrent.reject(new Error("Failed"));
+      await other;
+    });
+    expect(result.current.pendingUploads).toHaveLength(1);
+    await act(async () => {
+      second.reject(new Error("Failed"));
+      await batch;
+    });
+    expect(result.current.pendingUploads).toEqual([]);
+    expect(result.current.isAttachingFiles).toBe(false);
   });
 
   it("does not leak a dismissed upload into a later independent draft", async () => {

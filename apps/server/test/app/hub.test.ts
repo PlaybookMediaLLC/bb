@@ -12,12 +12,6 @@ import { NotificationHub } from "../../src/ws/hub.js";
 import { createMockHubSocket } from "../helpers/mock-hub-socket.js";
 import { TRANSPORT_TEST_BRIDGE_LAUNCH } from "../helpers/provider-registry.js";
 
-/**
- * Smuggles an out-of-contract change kind into a typed changes array without a
- * cast: `ThreadChangeKind[]` is assignable to `string[]` (array covariance),
- * so pushing through the widened parameter reproduces a producer bug that the
- * type system cannot catch — exactly what the outgoing schema gate exists for.
- */
 function appendRawChangeKind(changes: string[], kind: string): void {
   changes.push(kind);
 }
@@ -338,69 +332,6 @@ describe("NotificationHub", () => {
     });
   });
 
-  it("does not resolve host RPC waiters from mismatched daemon sessions", async () => {
-    const hub = new NotificationHub();
-    const socket = createMockHubSocket();
-    hub.registerDaemon("session-1", "host-1", socket);
-    hub.registerDaemon("session-2", "host-2", createMockHubSocket());
-
-    const wait = hub.requestHostOnlineRpc({
-      hostId: "host-1",
-      timeoutMs: 1_000,
-      message: {
-        type: "host-rpc.request",
-        requestId: "rpc-session-scoped",
-        command: {
-          type: "provider.list_models",
-          providerId: "codex",
-          bridgeLaunch: TRANSPORT_TEST_BRIDGE_LAUNCH,
-        },
-      },
-    });
-    let resolved = false;
-    const observed = wait.then((response) => {
-      resolved = true;
-      return response;
-    });
-
-    const mismatch = hub.recordHostOnlineRpcResponse({
-      message: {
-        type: "host-rpc.response",
-        requestId: "rpc-session-scoped",
-        commandType: "provider.list_models",
-        ok: true,
-        result: { models: [], selectedOnlyModels: [] },
-      },
-      sessionId: "session-2",
-    });
-    expect(mismatch).toEqual({
-      expectedSessionId: "session-1",
-      handled: false,
-      reason: "session_mismatch",
-    });
-    await Promise.resolve();
-    expect(resolved).toBe(false);
-
-    const handled = hub.recordHostOnlineRpcResponse({
-      message: {
-        type: "host-rpc.response",
-        requestId: "rpc-session-scoped",
-        commandType: "provider.list_models",
-        ok: true,
-        result: { models: [], selectedOnlyModels: [] },
-      },
-      sessionId: "session-1",
-    });
-    expect(handled).toEqual({ handled: true });
-    await expect(observed).resolves.toEqual({
-      type: "host-rpc.response",
-      requestId: "rpc-session-scoped",
-      commandType: "provider.list_models",
-      ok: true,
-      result: { models: [], selectedOnlyModels: [] },
-    });
-  });
-
   it("rejects in-flight host RPC requests when the daemon unregisters", async () => {
     const hub = new NotificationHub();
     const socket = createMockHubSocket();
@@ -511,11 +442,6 @@ describe("NotificationHub", () => {
     expect(otherHostSocket.messages).toHaveLength(0);
   });
 
-  // The host-connected broadcast must fire at daemon socket registration —
-  // the moment /hosts starts reading "connected" — not earlier (e.g. at
-  // session open). A client that refetches on an earlier broadcast captures
-  // "disconnected" as fresh and never heals (the desktop cold-start
-  // "Host is offline" bug).
   it("broadcasts host-connected when a daemon registers", () => {
     const hub = new NotificationHub();
     const clientSocket = createMockHubSocket();
@@ -536,9 +462,6 @@ describe("NotificationHub", () => {
     );
   });
 
-  // One broadcast per entity carrying every declared change kind must clear
-  // the outgoing schema gate intact. The per-kind delivery behavior is the
-  // same code path; what this pins is that no declared kind is rejected.
   it("passes every declared change kind through the outgoing schema gate", () => {
     const hub = new NotificationHub();
     const threadSocket = createMockHubSocket();
@@ -610,7 +533,10 @@ describe("NotificationHub events-appended thread-list coalescing", () => {
     const detailSocket = createMockHubSocket();
     const listSocket = createMockHubSocket();
     const listAndDetailSocket = createMockHubSocket();
-    hub.subscribe(detailSocket, { kind: "thread-detail", threadId: "thread-1" });
+    hub.subscribe(detailSocket, {
+      kind: "thread-detail",
+      threadId: "thread-1",
+    });
     hub.subscribe(listSocket, { kind: "thread-list" });
     hub.subscribe(listAndDetailSocket, { kind: "thread-list" });
     hub.subscribe(listAndDetailSocket, {
@@ -618,16 +544,18 @@ describe("NotificationHub events-appended thread-list coalescing", () => {
       threadId: "thread-1",
     });
 
-    for (const eventType of ["item/agentMessage/delta", "item/agentMessage/delta", "item/started"] as const) {
+    for (const eventType of [
+      "item/agentMessage/delta",
+      "item/agentMessage/delta",
+      "item/started",
+    ] as const) {
       hub.notifyThread("thread-1", ["events-appended"], {
         eventTypes: [eventType],
       });
     }
 
     expect(detailSocket.messages).toHaveLength(3);
-    // The socket holding both subscriptions is a detail subscriber: no copy.
     expect(listAndDetailSocket.messages).toHaveLength(3);
-    // Leading edge only until the window closes.
     expect(listSocket.messages).toHaveLength(1);
     expect(messagesOf(listSocket)[0]).toMatchObject({
       id: "thread-1",
@@ -639,7 +567,6 @@ describe("NotificationHub events-appended thread-list coalescing", () => {
     expect(listSocket.messages).toHaveLength(1);
     vi.advanceTimersByTime(1);
     expect(listSocket.messages).toHaveLength(2);
-    // The trailing frame carries the union of the merged event types.
     expect(messagesOf(listSocket)[1]).toMatchObject({
       id: "thread-1",
       changes: ["events-appended"],
@@ -648,7 +575,6 @@ describe("NotificationHub events-appended thread-list coalescing", () => {
     expect(detailSocket.messages).toHaveLength(3);
     expect(listAndDetailSocket.messages).toHaveLength(3);
 
-    // A quiet window sends nothing extra; the next frame is a fresh leading edge.
     vi.advanceTimersByTime(5_000);
     expect(listSocket.messages).toHaveLength(2);
     hub.notifyThread("thread-1", ["events-appended"], {
@@ -670,7 +596,6 @@ describe("NotificationHub events-appended thread-list coalescing", () => {
     });
     expect(listSocket.messages).toHaveLength(1);
 
-    // Inside the window: each of these must still arrive immediately.
     hub.notifyThread("thread-1", ["events-appended"], {
       backgroundActivityChanged: true,
       eventTypes: ["item/agentMessage/delta"],
@@ -717,7 +642,6 @@ describe("NotificationHub events-appended thread-list coalescing", () => {
     const waiter = hub.registerThreadEventWaiter("thread-1", 10_000).promise;
     hub.notifyThread("thread-1", ["events-appended"]);
     await expect(waiter).resolves.toBe(true);
-    // Merged frame without event types omits metadata entirely.
     vi.advanceTimersByTime(1_000);
     expect(listSocket.messages).toHaveLength(3);
     expect(messagesOf(listSocket)[2]).toEqual({

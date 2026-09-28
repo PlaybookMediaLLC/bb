@@ -10,6 +10,8 @@ function Block({ block }: { block: PostBlock }): ReactNode {
   switch (block.kind) {
     case "heading":
       return <h2>{block.text}</h2>;
+    case "subheading":
+      return <h3>{block.text}</h3>;
     case "paragraph":
       return (
         <p>
@@ -45,6 +47,17 @@ function Block({ block }: { block: PostBlock }): ReactNode {
           href={block.href}
         />
       );
+    case "video":
+      return (
+        <figure className="post-figure">
+          <video controls playsInline preload="metadata" poster={block.poster}>
+            <source src={block.src} type="video/mp4" />
+          </video>
+          <figcaption>
+            <ChangelogInline text={block.caption} />
+          </figcaption>
+        </figure>
+      );
     case "tweet":
       return <TweetEmbed href={block.href} id={block.id} />;
   }
@@ -64,7 +77,12 @@ function XMark() {
 function TweetCard({ tweet }: { tweet: Tweet }) {
   return (
     <article className="tweet">
-      <a className="tweet-head" href={tweet.href} target="_blank" rel="noreferrer">
+      <a
+        className="tweet-head"
+        href={tweet.href}
+        target="_blank"
+        rel="noreferrer"
+      >
         <img
           className="tweet-avatar"
           src={tweet.avatarSrc}
@@ -100,7 +118,12 @@ function TweetCard({ tweet }: { tweet: Tweet }) {
           height={tweet.media.height}
         />
       ) : null}
-      <a className="tweet-foot" href={tweet.href} target="_blank" rel="noreferrer">
+      <a
+        className="tweet-foot"
+        href={tweet.href}
+        target="_blank"
+        rel="noreferrer"
+      >
         <time dateTime={tweet.dateIso}>{tweet.date}</time>
       </a>
     </article>
@@ -112,7 +135,12 @@ function TweetEmbed({ href, id }: { href: string; id: string }) {
   if (!tweet) {
     return (
       <p className="tweet-fallback">
-        <a className="release-link" href={href} target="_blank" rel="noreferrer">
+        <a
+          className="release-link"
+          href={href}
+          target="_blank"
+          rel="noreferrer"
+        >
           View on X
         </a>
       </p>
@@ -136,7 +164,6 @@ function PostMedia({
   return (
     <figure className="post-figure">
       {href ? (
-        // The author linked this image. A click must open that destination.
         <a
           className="post-figure-link"
           href={href}
@@ -178,12 +205,7 @@ export function PostHeader({
       {lightbox ? (
         <LightboxImage src={src} alt={alt} loading="eager" />
       ) : (
-        <img
-          src={src}
-          alt={alt}
-          width={size?.width}
-          height={size?.height}
-        />
+        <img src={src} alt={alt} width={size?.width} height={size?.height} />
       )}
     </figure>
   );

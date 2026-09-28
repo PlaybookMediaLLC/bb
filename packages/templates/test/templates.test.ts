@@ -28,6 +28,13 @@ describe("@bb/templates", () => {
     expect(guide).not.toContain("workspace-write|readonly");
   });
 
+  it("documents project-aware thread references", () => {
+    const guide = renderTemplate("bbGuideThreads", {});
+
+    expect(guide).toContain("@thread:thr_abc123");
+    expect(guide).toContain("do not construct thread URLs manually");
+  });
+
   it("renders agent thread messages without inline reply guidance", () => {
     const rendered = renderTemplate("agentThreadMessage", {
       senderThreadId: "thr_sender",
@@ -40,16 +47,6 @@ describe("@bb/templates", () => {
         "",
         "Please check the failing test.",
       ].join("\n"),
-    );
-  });
-
-  it("renders standardAgentAppendInstructions without user-question guidance", () => {
-    const rendered = renderTemplate("standardAgentAppendInstructions", {});
-
-    expect(rendered).toContain("You are working inside bb");
-    expect(rendered).toContain("agentic IDE");
-    expect(rendered).not.toContain(
-      "Ask the user a blocking question only when",
     );
   });
 
@@ -103,7 +100,6 @@ describe("@bb/templates", () => {
   it("renders all templates without error", () => {
     const templates = templateDefinitions;
 
-    // Build placeholder variables for each template
     const placeholderVariables: Record<string, Record<string, string>> = {};
     for (const template of templates) {
       const vars: Record<string, string> = {};

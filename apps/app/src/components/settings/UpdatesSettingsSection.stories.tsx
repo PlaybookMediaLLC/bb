@@ -1,5 +1,6 @@
 import type { ReactNode } from "react";
 import type { Host } from "@bb/domain";
+import type { SystemAppUpdateStatus } from "@bb/server-contract";
 import { UPDATE_ACTION_ICON } from "@bb/domain/update-state";
 import {
   HOST_DAEMON_PROTOCOL_VERSION,
@@ -21,6 +22,7 @@ import {
   BbAppUpdateRows,
   BbDaemonUpdateRow,
   ChangelogPreviewCard,
+  MachineUpdatesFleetSection,
   MachineUpdatesRows,
   MachineUpdatesSection,
   ProviderCliCheckRow,
@@ -42,6 +44,22 @@ const NPM_VERSION = {
   updateAvailable: false,
   isDevelopment: false,
   upgradeCommand: "npx bb-app@latest",
+};
+
+const IN_APP_UPDATE: SystemAppUpdateStatus = {
+  activity: { phase: "idle" },
+  available: {
+    channel: "latest",
+    commit: null,
+    commitCount: null,
+    subjects: [],
+    version: "0.39.0",
+  },
+  blocked: null,
+  current: { commit: null, version: "0.38.0" },
+  lastResult: null,
+  runningThreadCount: 0,
+  support: { kind: "supported", mode: "npm" },
 };
 
 const DESKTOP_UPDATE = {
@@ -125,17 +143,22 @@ function StoryPage({ children }: { children: ReactNode }) {
   );
 }
 
-/** The default-off changelog preview experiment in its enabled state. */
 export function ChangelogPreviewExperiment() {
-  // A review story must always expose the initial state, even when this
-  // browser already exercised dismissal for the same bundled release.
   window.localStorage.removeItem(
     "bb.settings.updates.dismissed-changelog-version",
   );
+  const workstation = machineOf({
+    host: makeHost({ id: "changelog-workstation", name: "workstation" }),
+    isPrimary: true,
+    issues: [updateIssue("codex", "0.145.0", "0.146.0")],
+  });
   return (
-    <SettingsStoryChrome activeSection="updates">
+    <StoryPage>
       <ChangelogPreviewCard />
-    </SettingsStoryChrome>
+      <MachineUpdatesFleetSection>
+        <StoryMachineSection machine={workstation} app />
+      </MachineUpdatesFleetSection>
+    </StoryPage>
   );
 }
 
@@ -143,12 +166,10 @@ function StoryMachineSection({
   machine,
   app = false,
   appUpdate = false,
-  action,
 }: {
   machine: UpdateInventoryMachine;
   app?: boolean;
   appUpdate?: boolean;
-  action?: ReactNode;
 }) {
   const showDaemon =
     machine.canRetryDaemonUpdate || machine.host.status !== "connected";
@@ -156,7 +177,7 @@ function StoryMachineSection({
     <MachineUpdatesSection
       machine={machine}
       isThisMachine={false}
-      action={action}
+      showServerBadge={false}
     >
       {app ? (
         <BbAppUpdateRows
@@ -215,7 +236,11 @@ function StoryAppState({ children }: { children: ReactNode }) {
     isPrimary: true,
   });
   return (
-    <MachineUpdatesSection machine={machine} isThisMachine={false}>
+    <MachineUpdatesSection
+      machine={machine}
+      isThisMachine={false}
+      showServerBadge={false}
+    >
       {children}
     </MachineUpdatesSection>
   );
@@ -266,11 +291,6 @@ function missingProviderIssue(provider: ProviderCliKey): ProviderCliIssue {
   };
 }
 
-/**
- * Every state Settings → Updates can reach, once, using the production rows.
- * Keep this separate from the representative page stories: this is the
- * reviewed vocabulary catalogue, while those stories exercise page density.
- */
 export function UpdateStates() {
   const providerUpdate = machineOf({
     host: makeHost({ id: "state-provider-update", name: "workstation" }),
@@ -386,6 +406,119 @@ export function UpdateStates() {
         </State>
 
         <State
+          name="In-app update available"
+          note="bb runs under the update shim, so it can download the update and restart itself."
+        >
+          <StoryAppState>
+            <BbAppUpdateRows
+              systemVersion={NPM_VERSION}
+              appUpdate={IN_APP_UPDATE}
+              desktopInfo={null}
+              isDesktop={false}
+              onApplyAppUpdate={noop}
+              onRelaunchDesktop={null}
+              onRetryDesktop={null}
+              onShowAppUpdateResult={noop}
+            />
+          </StoryAppState>
+        </State>
+
+        <State
+          name="In-app update downloading"
+          note="The launcher is installing the new version while bb keeps running."
+        >
+          <StoryAppState>
+            <BbAppUpdateRows
+              systemVersion={NPM_VERSION}
+              appUpdate={{
+                ...IN_APP_UPDATE,
+                activity: {
+                  output: [],
+                  phase: "preparing",
+                  startedAt: "2026-09-23T00:00:00.000Z",
+                  step: "Downloading bb-app 0.39.0",
+                  targetVersion: "0.39.0",
+                },
+              }}
+              desktopInfo={null}
+              isDesktop={false}
+              onApplyAppUpdate={noop}
+              onRelaunchDesktop={null}
+              onRetryDesktop={null}
+              onShowAppUpdateResult={noop}
+            />
+          </StoryAppState>
+        </State>
+
+        <State
+          name="In-app update failed"
+          note="The download failed, bb kept running the current version, and the row keeps the details until dismissed."
+        >
+          <StoryAppState>
+            <BbAppUpdateRows
+              systemVersion={NPM_VERSION}
+              appUpdate={{
+                ...IN_APP_UPDATE,
+                lastResult: {
+                  acknowledged: false,
+                  finishedAt: "2026-09-23T00:00:00.000Z",
+                  from: { commit: null, version: "0.38.0" },
+                  id: "update-1",
+                  logTail: ["npm error code E404"],
+                  message: "npm install failed",
+                  outcome: "failed",
+                  phase: "install",
+                  to: { commit: null, version: "0.39.0" },
+                },
+              }}
+              desktopInfo={null}
+              isDesktop={false}
+              onApplyAppUpdate={noop}
+              onRelaunchDesktop={null}
+              onRetryDesktop={null}
+              onShowAppUpdateResult={noop}
+            />
+          </StoryAppState>
+        </State>
+
+        <State
+          name="Source checkout blocked"
+          note="A pnpm start checkout explains why it cannot fast-forward instead of offering a button."
+        >
+          <StoryAppState>
+            <BbAppUpdateRows
+              systemVersion={NPM_VERSION}
+              appUpdate={{
+                ...IN_APP_UPDATE,
+                available: {
+                  channel: "main",
+                  commit: "4f1c2e9a7b0d3c5e8f1a2b3c4d5e6f7a8b9c0d1e",
+                  commitCount: 12,
+                  subjects: ["Fix sidebar flicker"],
+                  version: "0.38.0",
+                },
+                blocked: {
+                  message:
+                    "The working tree has uncommitted changes. Commit or stash them to update from the app.",
+                  reason: "uncommitted-changes",
+                },
+                current: {
+                  commit: "9a8b7c6d5e4f3a2b1c0d9e8f7a6b5c4d3e2f1a0b",
+                  version: "0.38.0",
+                },
+                support: { kind: "supported", mode: "source" },
+              }}
+              desktopInfo={null}
+              isDesktop={false}
+              onApplyAppUpdate={noop}
+              onRelaunchDesktop={null}
+              onRetryDesktop={null}
+              onShowAppUpdateResult={noop}
+            />
+          </StoryAppState>
+        </State>
+
+        <State
           name="Downloading"
           note="The desktop shell is fetching the update automatically."
         >
@@ -480,6 +613,7 @@ export function UpdateStates() {
           <MachineUpdatesSection
             machine={providerInstalling}
             isThisMachine={false}
+            showServerBadge={false}
           >
             <MachineUpdatesRows
               machine={providerInstalling}
@@ -523,7 +657,6 @@ export function UpdateStates() {
   );
 }
 
-/** Multiple machines, each owning its app, daemon, or provider update rows. */
 export function MultiMachine() {
   const workstation = machineOf({
     host: makeHost({ id: "host-primary", name: "workstation" }),
@@ -550,31 +683,28 @@ export function MultiMachine() {
 
   return (
     <StoryPage>
-      <StoryMachineSection
-        machine={workstation}
-        app
-        appUpdate
+      <MachineUpdatesFleetSection
         action={
           <div role="toolbar" aria-label="Bulk update actions">
             <UpdateActionButton
               label="Update all 3 CLI tools"
               tooltipLabel="Update all"
               icon={UPDATE_ACTION_ICON}
-              iconPosition="end"
               visibleLabel="Update all"
               variant="default"
               onClick={noop}
             />
           </div>
         }
-      />
-      <StoryMachineSection machine={studioMac} />
-      <StoryMachineSection machine={ciRunner} />
+      >
+        <StoryMachineSection machine={workstation} app appUpdate />
+        <StoryMachineSection machine={studioMac} />
+        <StoryMachineSection machine={ciRunner} />
+      </MachineUpdatesFleetSection>
     </StoryPage>
   );
 }
 
-/** The same hierarchy without a redundant all-machines wrapper. */
 export function SingleMachine() {
   const workstation = machineOf({
     host: makeHost({ id: "host-primary", name: "workstation" }),
@@ -588,7 +718,6 @@ export function SingleMachine() {
   );
 }
 
-/** A settled machine keeps the existing explicit bb app confirmation. */
 export function NoUpdatesAvailable() {
   const workstation = machineOf({
     host: makeHost({ id: "host-primary", name: "workstation" }),

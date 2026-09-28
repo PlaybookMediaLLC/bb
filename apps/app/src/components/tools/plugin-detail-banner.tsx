@@ -2,26 +2,14 @@ import type { AriaRole, ReactNode } from "react";
 import { Icon, type IconName } from "@bb/shared-ui/icon";
 import { cn } from "@bb/shared-ui/lib/utils";
 
-type PluginBannerTone = "destructive" | "warning";
+type PluginBannerTone = "destructive" | "warning" | "muted";
 
 const TONE_ICON: Record<PluginBannerTone, string> = {
   destructive: "text-destructive",
   warning: "text-warning",
+  muted: "text-muted-foreground",
 };
 
-/**
- * A page-level notification bar.
- *
- * These span the pane and sit above the detail page rather than inside it. As
- * inset cards in the centered column they read as content — one more block
- * among the sections — when the whole point is that they are conditions on the
- * page, not part of it. The neutral surface runs edge to edge; only the icon
- * carries semantic color, and the text lines up with the page gutter so a
- * banner and a section heading share a left edge.
- *
- * `maxWidthClassName` and the padding mirror ToolsScrollPage (ToolsView.tsx:87)
- * so that alignment holds.
- */
 export function PluginBannerBar({
   tone,
   icon,
@@ -47,22 +35,25 @@ export function PluginBannerBar({
         separator && "border-b border-border",
       )}
     >
-      <div className="mx-auto flex w-full min-w-0 max-w-5xl items-start gap-3 px-4 py-2.5 md:px-5">
+      <div className="mx-auto flex w-full min-w-0 max-w-5xl items-center gap-2 px-4 py-1.5 md:px-5">
         <Icon
           name={icon}
-          className={cn("mt-0.5 size-4 shrink-0", TONE_ICON[tone])}
+          className={cn("size-3.5 shrink-0", TONE_ICON[tone])}
           aria-hidden
         />
-        <div className="min-w-0 flex-1">
-          <p className="text-sm font-medium text-foreground">{title}</p>
+        <p className="min-w-0 flex-1 text-xs leading-snug text-muted-foreground">
+          <span className="font-medium text-foreground">{title}</span>
           {detail === null || detail === undefined ? null : (
-            <p className="mt-0.5 text-xs leading-relaxed text-muted-foreground">
+            <>
+              {": "}
               {detail}
-            </p>
+            </>
           )}
-        </div>
+        </p>
         {action ? (
-          <span className="flex shrink-0 items-center pt-0.5">{action}</span>
+          <span className="flex shrink-0 items-center">
+            {action}
+          </span>
         ) : null}
       </div>
     </div>

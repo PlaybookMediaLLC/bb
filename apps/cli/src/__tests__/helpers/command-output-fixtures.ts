@@ -35,11 +35,6 @@ interface MakeEnvironmentArgs extends Partial<Environment> {
   hostId: string;
 }
 
-/**
- * A provider interaction pairs its payload with the resolution that answers
- * it, so the fixture takes either loosely and pairs them itself: a
- * mismatched pair is a fixture bug and throws.
- */
 type MakePendingInteractionArgs = Partial<
   Omit<ProviderPendingInteraction, "payload" | "resolution">
 > & {
@@ -62,12 +57,6 @@ export function makeTimelineBase(args: TimelineBaseArgs): TimelineRowBase {
   };
 }
 
-/**
- * Mock for the `GET /threads/:id/timeline` endpoint used by `bb thread show`
- * and `bb status` to read `pendingTodos`. Tests should add this alongside
- * their `:id.$get` mock so contract drift on the timeline lane fails loudly
- * instead of silently degrading to `pendingTodos: null`.
- */
 export function makeEmptyTimelineGetMock() {
   return vi.fn(async () => makeTimelineResponse([]));
 }
@@ -77,6 +66,8 @@ export function makeTimelineResponse(
 ): ThreadTimelineResponse {
   return {
     rows,
+    contextBoundarySeq: null,
+    completedTurnDisplay: "collapse",
     activePromptMode: null,
     activeThinking: null,
     activeWorkflows: [],
@@ -122,6 +113,7 @@ export function makeThread(overrides: MakeThreadArgs): Thread {
     sectionId: null,
     environmentId: null,
     parentThreadId: null,
+    lifecycleOwnerThreadId: null,
     sourceThreadId: null,
     originKind: null,
     originPluginId: null,
@@ -141,14 +133,19 @@ export function makeEnvironment(overrides: MakeEnvironmentArgs): Environment {
   return {
     name: null,
     path: "/tmp/environment",
-    managed: false,
     isGitRepo: true,
     isWorktree: false,
-    workspaceProvisionType: "unmanaged",
     branchName: "bb/thread",
     defaultBranch: "main",
     baseBranch: null,
     mergeBaseBranch: null,
+    environmentProviderId: null,
+    environmentProviderSelection: null,
+    environmentProviderInstanceKey: null,
+    lifecycle: { phase: "active", retireAt: null, teardown: null },
+    hostLifecycle: "active",
+    managed: false,
+    workspaceProvisionType: null,
     status: "ready",
     createdAt: Date.now(),
     updatedAt: Date.now(),
@@ -159,9 +156,6 @@ export function makeEnvironment(overrides: MakeEnvironmentArgs): Environment {
 export function makePendingInteraction(
   overrides: MakePendingInteractionArgs,
 ): ProviderPendingInteraction {
-  // The provider request/thread/turn ids are incidental to every assertion, so
-  // derive them from the interaction id suffix (`int-foo` -> `request-foo`,
-  // `provider-thread-foo`, `turn-foo`) instead of repeating them per call.
   const suffix = overrides.id.startsWith("int-")
     ? overrides.id.slice("int-".length)
     : overrides.id;

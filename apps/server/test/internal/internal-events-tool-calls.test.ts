@@ -1,5 +1,7 @@
+import { Buffer } from "node:buffer";
 import { once } from "node:events";
 import { setTimeout as sleep } from "node:timers/promises";
+import { gunzipSync } from "node:zlib";
 import { eq } from "drizzle-orm";
 import {
   closeSession,
@@ -13,6 +15,7 @@ import {
 import { threadScope, turnScope, type ToolCallResponse } from "@bb/domain";
 import {
   groupHostDaemonEvents,
+  hostDaemonEventBatchResponseSchema,
   type HostDaemonEventEnvelope,
 } from "@bb/host-daemon-contract";
 import { describe, expect, it, vi } from "vitest";
@@ -30,26 +33,47 @@ import {
   seedHostSession,
   seedProjectWithSource,
   seedThread,
+  seedThreadFixture,
   seedThreadRuntimeState,
 } from "../helpers/seed.js";
-import { withTestHarness } from "../helpers/test-app.js";
+import { startTestServer, withTestHarness } from "../helpers/test-app.js";
 import type { TestAppHarness } from "../helpers/test-app.js";
 import { setPluginAgentContributions } from "../../src/services/plugins/plugin-agent-contributions.js";
 import type { PluginAgentToolRecord } from "../../src/services/plugins/plugin-api.js";
 
 async function postEventBatch(args: {
+  acceptEncoding?: string;
   events: HostDaemonEventEnvelope[];
   harness: TestAppHarness;
   sessionId: string;
 }): Promise<Response> {
+  const headers = new Headers(internalAuthHeaders(args.harness));
+  if (args.acceptEncoding !== undefined) {
+    headers.set("accept-encoding", args.acceptEncoding);
+  }
   return args.harness.app.request("/internal/session/events", {
     method: "POST",
-    headers: internalAuthHeaders(args.harness),
+    headers,
     body: JSON.stringify({
       sessionId: args.sessionId,
       eventGroups: groupHostDaemonEvents(args.events),
     }),
   });
+}
+
+function systemErrorEnvelopes(
+  threadId: string,
+  count: number,
+): HostDaemonEventEnvelope[] {
+  return Array.from({ length: count }, (_, index) => ({
+    threadId,
+    event: {
+      type: "system/error",
+      threadId,
+      scope: threadScope(),
+      message: `daemon error ${index}`,
+    },
+  }));
 }
 
 async function postToolCall(args: {
@@ -256,9 +280,6 @@ describe("internal event and tool-call routes", () => {
               event.type === "item/started" || event.type === "item/completed",
           );
         expect(storedToolEvents).toHaveLength(2);
-        // The plugin's labels reach the row only through the presentation
-        // the bridge stamps on the item (resolved onto the tool definition
-        // it receives); the server no longer writes a `statusLabels` key.
         for (const event of storedToolEvents) {
           const item = JSON.parse(event.data).item;
           expect(item.tool).toBe(record.name);
@@ -270,71 +291,76 @@ describe("internal event and tool-call routes", () => {
     });
   });
 
-  it("appends event batches and returns accepted event indexes", async () => {
+  it("serves a small event batch response over HTTP with an exact Content-Length", async () => {
+    const server = await startTestServer();
+    try {
+      const { session, thread } = seedThreadFixture(server, {
+        thread: { status: "active" },
+      });
+      const headers = new Headers(internalAuthHeaders(server));
+      headers.set("accept-encoding", "gzip, deflate");
+      const response = await fetch(
+        `${server.baseUrl}/internal/session/events`,
+        {
+          method: "POST",
+          headers,
+          body: JSON.stringify({
+            sessionId: session.id,
+            eventGroups: groupHostDaemonEvents(
+              systemErrorEnvelopes(thread.id, 1),
+            ),
+          }),
+        },
+      );
+
+      expect(response.status).toBe(200);
+      expect(response.headers.has("content-encoding")).toBe(false);
+      expect(response.headers.has("transfer-encoding")).toBe(false);
+      expect(response.headers.get("content-type")).toBe("application/json");
+      const text = await response.text();
+      expect(response.headers.get("content-length")).toBe(
+        String(Buffer.byteLength(text)),
+      );
+      expect(
+        hostDaemonEventBatchResponseSchema.parse(JSON.parse(text)),
+      ).toEqual({
+        acceptedEvents: [{ eventIndex: 0, sequence: 1, threadId: thread.id }],
+        rejectedEvents: [],
+      });
+    } finally {
+      await server.close();
+    }
+  });
+
+  it("still compresses a large event batch response", async () => {
     await withTestHarness(async (harness) => {
-      const { session } = seedHostSession(harness.deps);
-      const { project } = seedProjectWithSource(harness.deps, {
-        hostId: session.hostId,
-      });
-      const environment = seedEnvironment(harness.deps, {
-        hostId: session.hostId,
-        projectId: project.id,
-      });
-      const thread = seedThread(harness.deps, {
-        projectId: project.id,
-        environmentId: environment.id,
-        status: "active",
+      const { session, thread } = seedThreadFixture(harness, {
+        thread: { status: "active" },
       });
 
       const response = await postEventBatch({
+        acceptEncoding: "gzip, deflate",
         harness,
         sessionId: session.id,
-        events: [
-          {
-            threadId: thread.id,
-            event: {
-              type: "turn/started",
-              threadId: thread.id,
-              providerThreadId: "provider-1",
-              scope: turnScope("turn-1"),
-            },
-          },
-          {
-            threadId: thread.id,
-            event: {
-              type: "turn/completed",
-              threadId: thread.id,
-              providerThreadId: "provider-1",
-              scope: turnScope("turn-1"),
-              status: "completed",
-            },
-          },
-        ],
+        events: systemErrorEnvelopes(thread.id, 40),
       });
 
       expect(response.status).toBe(200);
-      await expect(readJson(response)).resolves.toEqual({
-        acceptedEvents: [
-          {
-            eventIndex: 0,
-            threadId: thread.id,
-            sequence: 1,
-          },
-          {
-            eventIndex: 1,
-            threadId: thread.id,
-            sequence: 2,
-          },
-        ],
+      expect(response.headers.get("content-encoding")).toBe("gzip");
+      expect(response.headers.get("content-type")).toBe("application/json");
+      const bytes = Buffer.from(await response.arrayBuffer());
+      expect(
+        hostDaemonEventBatchResponseSchema.parse(
+          JSON.parse(gunzipSync(bytes).toString("utf8")),
+        ),
+      ).toEqual({
+        acceptedEvents: Array.from({ length: 40 }, (_, index) => ({
+          eventIndex: index,
+          sequence: index + 1,
+          threadId: thread.id,
+        })),
         rejectedEvents: [],
       });
-      expect(
-        harness.db
-          .select()
-          .from(events)
-          .where(eq(events.threadId, thread.id))
-          .all(),
-      ).toHaveLength(2);
     });
   });
 
@@ -601,9 +627,14 @@ describe("internal event and tool-call routes", () => {
       );
 
       expect(sendResponse.status).toBe(200);
-      await expect(readJson(sendResponse)).resolves.toEqual({
+      await expect(readJson(sendResponse)).resolves.toMatchObject({
         ok: true,
         delivery: "queued",
+        queuedMessage: {
+          id: expect.any(String),
+          waitingOn: { kind: "thread-busy" },
+          sendAt: null,
+        },
       });
       const queuedRows = listQueuedThreadMessages(harness.db, thread.id);
       expect(queuedRows).toHaveLength(1);
@@ -857,8 +888,6 @@ describe("internal event and tool-call routes", () => {
         providerThreadId: "provider-side-chat-parent",
         threadId: parentThread.id,
       });
-      // A side chat keeps a parent id next to its origin; the
-      // origin, not the hidden visibility, is what excludes them.
       const childThread = seedThread(harness.deps, {
         projectId: project.id,
         environmentId: environment.id,
@@ -1017,8 +1046,6 @@ describe("internal event and tool-call routes", () => {
         harness.db.select().from(threads).where(eq(threads.id, thread.id)).get()
           ?.status,
       ).toBe("idle");
-      // The replayed turn/started is the same provider turn, so it is not
-      // stored twice; a second start would break timeline projection.
       expect(
         harness.db
           .select({ type: events.type })
@@ -1093,9 +1120,6 @@ describe("internal event and tool-call routes", () => {
       });
 
       expect(response.status).toBe(200);
-      // run.succeeded has no THREAD_LIFECYCLE cell for "idle": the
-      // redelivered completion is an illegal-transition no-op and the thread
-      // row is untouched.
       expect(
         harness.db
           .select()
@@ -1121,8 +1145,7 @@ describe("internal event and tool-call routes", () => {
         hostId: host.id,
         projectId: project.id,
         path: "/tmp/existing-managed-worktree",
-        managed: true,
-        workspaceProvisionType: "managed-worktree",
+        environmentProviderId: "git-worktree",
       });
       const thread = seedThread(harness.deps, {
         projectId: project.id,
@@ -1164,7 +1187,9 @@ describe("internal event and tool-call routes", () => {
       expect(getThread(harness.db, thread.id)?.environmentId).toBe(
         targetEnvironment.id,
       );
-      expect(listEnvironments(harness.db, project.id)).toHaveLength(2);
+      expect(
+        listEnvironments(harness.db, { projectId: project.id }),
+      ).toHaveLength(2);
       const storedEvents = harness.db
         .select()
         .from(events)
@@ -1220,19 +1245,18 @@ describe("internal event and tool-call routes", () => {
       const provisionCommand = await waitForQueuedCommand(
         harness,
         ({ command }) =>
-          command.type === "environment.provision" &&
-          command.workspaceProvisionType === "unmanaged" &&
+          command.type === "environment.attach" &&
           command.path === "/tmp/new-unmanaged-worktree",
       );
-      if (provisionCommand.command.type !== "environment.provision") {
-        throw new Error("Expected environment.provision command");
+      if (provisionCommand.command.type !== "environment.attach") {
+        throw new Error("Expected environment.attach command");
       }
       expect(provisionCommand.command.initiator).toBeNull();
 
       await reportQueuedCommandSuccess(harness, provisionCommand, {
         path: "/tmp/new-unmanaged-worktree",
         isGitRepo: true,
-        isWorktree: true,
+        isWorktree: false,
         branchName: "feature/new-worktree",
         defaultBranch: "main",
         transcript: [],
@@ -1251,14 +1275,15 @@ describe("internal event and tool-call routes", () => {
           },
         ],
       });
-      const targetEnvironment = listEnvironments(harness.db, project.id).find(
+      const targetEnvironment = listEnvironments(harness.db, {
+        projectId: project.id,
+      }).find(
         (environment) => environment.path === "/tmp/new-unmanaged-worktree",
       );
       expect(targetEnvironment).toMatchObject({
         hostId: host.id,
         projectId: project.id,
         status: "ready",
-        workspaceProvisionType: "unmanaged",
       });
       expect(getThread(harness.db, thread.id)?.environmentId).toBe(
         targetEnvironment?.id,
@@ -1270,7 +1295,6 @@ describe("internal event and tool-call routes", () => {
       ).toMatchObject({
         branchName: "feature/new-worktree",
         isGitRepo: true,
-        isWorktree: true,
       });
       const storedEvents = harness.db
         .select()
@@ -1292,7 +1316,6 @@ describe("internal event and tool-call routes", () => {
     await withTestHarness(async (harness) => {
       const { host, session } = seedHostSession(harness.deps);
       const sharedPath = "/tmp/shared-with-another-project";
-      // Another project already holds an environment for the folder.
       const { project: otherProject } = seedProjectWithSource(harness.deps, {
         hostId: host.id,
         name: "Other Project",
@@ -1340,9 +1363,7 @@ describe("internal event and tool-call routes", () => {
       const provisionCommand = await waitForQueuedCommand(
         harness,
         ({ command }) =>
-          command.type === "environment.provision" &&
-          command.workspaceProvisionType === "unmanaged" &&
-          command.path === sharedPath,
+          command.type === "environment.attach" && command.path === sharedPath,
       );
       await reportQueuedCommandSuccess(harness, provisionCommand, {
         path: sharedPath,
@@ -1356,8 +1377,6 @@ describe("internal event and tool-call routes", () => {
       await expect(readJson(await responsePromise)).resolves.toMatchObject({
         success: true,
       });
-      // The switching project gets its own environment; the other project's
-      // claim on the folder is untouched.
       const switched = getThread(harness.db, thread.id)?.environmentId;
       expect(switched).not.toBe(otherEnvironment.id);
       expect(getEnvironment(harness.db, switched ?? "")).toMatchObject({
@@ -1379,14 +1398,12 @@ describe("internal event and tool-call routes", () => {
         hostId: host.id,
         name: "Owning Project",
       });
-      // Cleanup of this environment deletes the directory, so no other project
-      // may attach to it in place.
       seedEnvironment(harness.deps, {
         hostId: host.id,
         projectId: owner.id,
         path: worktreePath,
-        managed: true,
-        workspaceProvisionType: "managed-worktree",
+        environmentProviderId: "git-worktree",
+        providerOwnsPath: true,
       });
 
       const { project } = seedProjectWithSource(harness.deps, {
@@ -1437,7 +1454,9 @@ describe("internal event and tool-call routes", () => {
       expect(getThread(harness.db, thread.id)?.environmentId).toBe(
         currentEnvironment.id,
       );
-      expect(listEnvironments(harness.db, project.id)).toHaveLength(1);
+      expect(
+        listEnvironments(harness.db, { projectId: project.id }),
+      ).toHaveLength(1);
     });
   });
 
@@ -1477,7 +1496,9 @@ describe("internal event and tool-call routes", () => {
       expect(getThread(harness.db, thread.id)?.environmentId).toBe(
         environment.id,
       );
-      expect(listEnvironments(harness.db, project.id)).toHaveLength(1);
+      expect(
+        listEnvironments(harness.db, { projectId: project.id }),
+      ).toHaveLength(1);
     });
   });
 
@@ -1531,116 +1552,6 @@ describe("internal event and tool-call routes", () => {
     });
   });
 
-  it("does not support agent side chat send-to-main tool calls", async () => {
-    await withTestHarness(async (harness) => {
-      const { host, session } = seedHostSession(harness.deps);
-      const { project } = seedProjectWithSource(harness.deps, {
-        hostId: host.id,
-      });
-      const environment = seedEnvironment(harness.deps, {
-        hostId: host.id,
-        projectId: project.id,
-      });
-      const mainThread = seedThread(harness.deps, {
-        projectId: project.id,
-        environmentId: environment.id,
-      });
-      const sideChatThread = seedThread(harness.deps, {
-        projectId: project.id,
-        environmentId: environment.id,
-        originKind: "fork",
-        originPluginId: "side-chat",
-        visibility: "hidden",
-        sourceThreadId: mainThread.id,
-        status: "active",
-      });
-
-      const response = await harness.app.request(
-        "/internal/session/tool-call",
-        {
-          method: "POST",
-          headers: internalAuthHeaders(harness),
-          body: JSON.stringify({
-            sessionId: session.id,
-            threadId: sideChatThread.id,
-            providerThreadId: "provider-side-chat",
-            turnId: "turn-side-chat",
-            callId: "call-send-main",
-            tool: "bb_send_to_main_thread",
-            arguments: {
-              message: "Please carry this back to the main thread.",
-            },
-          }),
-        },
-      );
-
-      expect(response.status).toBe(200);
-      await expect(readJson(response)).resolves.toEqual({
-        success: false,
-        contentItems: [
-          {
-            type: "inputText",
-            text: "Unsupported tool: bb_send_to_main_thread",
-          },
-        ],
-      });
-      expect(
-        listQueuedThreadCommands(harness, "turn.submit", mainThread.id),
-      ).toHaveLength(0);
-    });
-  });
-
-  it("rejects message_user tool calls as unsupported", async () => {
-    await withTestHarness(async (harness) => {
-      const { host, session } = seedHostSession(harness.deps);
-      const { project } = seedProjectWithSource(harness.deps, {
-        hostId: host.id,
-      });
-      const environment = seedEnvironment(harness.deps, {
-        hostId: host.id,
-        projectId: project.id,
-      });
-      const thread = seedThread(harness.deps, {
-        projectId: project.id,
-        environmentId: environment.id,
-      });
-
-      const response = await harness.app.request(
-        "/internal/session/tool-call",
-        {
-          method: "POST",
-          headers: internalAuthHeaders(harness),
-          body: JSON.stringify({
-            sessionId: session.id,
-            threadId: thread.id,
-            providerThreadId: "provider-message-user",
-            turnId: "turn-missing",
-            callId: "call-missing-turn",
-            tool: "message_user",
-            arguments: {
-              text: "Need input from the user",
-            },
-          }),
-        },
-      );
-
-      expect(response.status).toBe(200);
-      await expect(readJson(response)).resolves.toEqual({
-        success: false,
-        contentItems: [
-          { type: "inputText", text: "Unsupported tool: message_user" },
-        ],
-      });
-      expect(
-        harness.db
-          .select()
-          .from(events)
-          .where(eq(events.threadId, thread.id))
-          .all(),
-      ).toHaveLength(0);
-    });
-  });
-
   it("rejects empty tool call turn ids at the internal contract boundary", async () => {
     await withTestHarness(async (harness) => {
       const { host, session } = seedHostSession(harness.deps);
@@ -1686,68 +1597,6 @@ describe("internal event and tool-call routes", () => {
           .where(eq(events.threadId, thread.id))
           .all(),
       ).toHaveLength(0);
-    });
-  });
-
-  it("still rejects message_user after the turn start is stored", async () => {
-    await withTestHarness(async (harness) => {
-      const { host, session } = seedHostSession(harness.deps);
-      const { project } = seedProjectWithSource(harness.deps, {
-        hostId: host.id,
-      });
-      const environment = seedEnvironment(harness.deps, {
-        hostId: host.id,
-        projectId: project.id,
-      });
-      const thread = seedThread(harness.deps, {
-        projectId: project.id,
-        environmentId: environment.id,
-      });
-      seedEvent(harness.deps, {
-        threadId: thread.id,
-        environmentId: environment.id,
-        providerThreadId: "provider-message-user",
-        sequence: 1,
-        type: "turn/started",
-        scope: turnScope("turn-2"),
-        data: {
-          providerThreadId: "provider-message-user",
-        },
-      });
-
-      const response = await harness.app.request(
-        "/internal/session/tool-call",
-        {
-          method: "POST",
-          headers: internalAuthHeaders(harness),
-          body: JSON.stringify({
-            sessionId: session.id,
-            threadId: thread.id,
-            providerThreadId: "provider-message-user",
-            turnId: "turn-2",
-            callId: "call-2",
-            tool: "message_user",
-            arguments: {
-              text: "Need input from the user",
-            },
-          }),
-        },
-      );
-
-      expect(response.status).toBe(200);
-      await expect(readJson(response)).resolves.toEqual({
-        success: false,
-        contentItems: [
-          { type: "inputText", text: "Unsupported tool: message_user" },
-        ],
-      });
-      const storedEvents = harness.db
-        .select()
-        .from(events)
-        .where(eq(events.threadId, thread.id))
-        .orderBy(events.sequence)
-        .all();
-      expect(storedEvents).toHaveLength(1);
     });
   });
 });

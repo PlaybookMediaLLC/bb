@@ -1,12 +1,23 @@
-/**
- * Resizable-panel bounds for the thread secondary panel.
- *
- * A leaf module: the split-workspace host, the loading placeholder and the
- * real panel all size themselves within the same bounds, and the route
- * closure must be able to read them without pulling in ThreadSecondaryPanel
- * (which loads lazily).
- */
-export const THREAD_SECONDARY_PANEL_MIN_SIZE_PERCENT = 24;
-export const THREAD_SECONDARY_PANEL_MAX_SIZE_PERCENT = 70;
-/** The panel takes the whole group while the conversation is collapsed. */
+import { createContext, useContext, useMemo } from "react";
+import { useElementWidth } from "@/hooks/useElementWidth";
+import { splitWidthLimits } from "@/lib/split-layout/sizing";
+
+export const SecondaryPanelMinimumContext = createContext({ min: 0, max: 1 });
+
+export function useSecondaryPanelMinimum() {
+  return useContext(SecondaryPanelMinimumContext);
+}
+
+export function useSecondaryPanelSizing(dividerWidth = 0) {
+  const { ref, width } = useElementWidth();
+  const minimum = useMemo(
+    () =>
+      width > 0
+        ? splitWidthLimits(width - dividerWidth)
+        : { min: 0, max: 1 },
+    [width, dividerWidth],
+  );
+  return { ref, minimum };
+}
+
 export const CONVERSATION_COLLAPSED_PANEL_SIZE_PERCENT = 100;

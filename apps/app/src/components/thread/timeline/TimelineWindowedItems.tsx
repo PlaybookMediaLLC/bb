@@ -11,46 +11,18 @@ import {
   defaultRangeExtractor,
   useVirtualizer,
   type Range,
-  type Virtualizer,
 } from "@tanstack/react-virtual";
-import type { TimelineWindowedItemsProps } from "./TimelineWindowedItemsLoader.js";
+import {
+  DEFAULT_WINDOWING_MIN_ITEM_COUNT,
+  recordTimelineMeasurement,
+  type TimelineWindowedItemsProps,
+} from "./TimelineWindowedItemsLoader.js";
 
-export type { TimelineWindowedItemRenderState } from "./TimelineWindowedItemsLoader.js";
-
-/** Rich rows retained on each side of the visible range. */
 const TIMELINE_WINDOW_OVERSCAN_ITEMS = 8;
-/** TanStack's scroll-idle boundary also drives rich-content realization. */
-const TIMELINE_WINDOW_IDLE_DELAY_MS = 300;
-/** Bound row-local interaction state retained across a long-lived session. */
 const TIMELINE_WINDOW_MAX_INTERACTION_PINS = 24;
-/** Bound exact heights that survive nested-list unmounts. */
-const TIMELINE_WINDOW_MAX_MEASUREMENTS = 2_000;
-/** Short lists cost less to keep mounted than to virtualize. */
-const TIMELINE_WINDOWING_MIN_ITEM_COUNT = 20;
 
 const EMPTY_KEY_SET: ReadonlySet<string> = new Set();
 const GET_NO_SCROLL_ELEMENT = () => null;
-const NOOP_ITEM_REF = () => {};
-
-function recordTimelineMeasurement(
-  measurements: Map<string, number>,
-  key: string,
-  height: number,
-): void {
-  measurements.delete(key);
-  measurements.set(key, height);
-  while (measurements.size > TIMELINE_WINDOW_MAX_MEASUREMENTS) {
-    const oldestKey = measurements.keys().next().value;
-    if (oldestKey === undefined) break;
-    measurements.delete(oldestKey);
-  }
-}
-
-interface ScrollSample {
-  at: number;
-  fast: boolean;
-  offset: number;
-}
 
 function measureBorderBox(
   element: HTMLElement,
@@ -74,36 +46,22 @@ function findOwnedWindowKey(
   return null;
 }
 
-/**
- * Timeline adapter around TanStack Virtual.
- *
- * TanStack owns range calculation, dynamic measurement, scroll correction,
- * and iOS momentum safety. This adapter only retains product policy: stable
- * row keys, nested scroll offsets, search/interaction pins, and cheap
- * placeholders during a synthetic or high-velocity traversal.
- */
 export function TimelineWindowedItems({
-  enabled,
   alwaysMountedKeys = EMPTY_KEY_SET,
   estimateItemHeight,
   gap,
   getScrollElement,
   itemKeys,
   measurements,
-  minItemCount = TIMELINE_WINDOWING_MIN_ITEM_COUNT,
+  minItemCount = DEFAULT_WINDOWING_MIN_ITEM_COUNT,
   renderItem,
 }: TimelineWindowedItemsProps) {
   const configured =
-    enabled && itemKeys.length >= minItemCount && getScrollElement !== null;
+    itemKeys.length >= minItemCount && getScrollElement !== null;
   const [scrollRootUsable, setScrollRootUsable] = useState(true);
   const [scrollMargin, setScrollMargin] = useState(0);
   const [interactionPins, setInteractionPins] = useState<readonly string[]>([]);
   const containerElementRef = useRef<HTMLDivElement>(null);
-  const scrollSampleRef = useRef<ScrollSample>({
-    at: 0,
-    fast: false,
-    offset: 0,
-  });
   const windowingEnabled = configured && scrollRootUsable;
   const resolvedGetScrollElement = getScrollElement ?? GET_NO_SCROLL_ELEMENT;
 
@@ -164,31 +122,6 @@ export function TimelineWindowedItems({
     },
     [forcedIndexes],
   );
-  const handleVirtualizerChange = useCallback(
-    (
-      instance: Virtualizer<HTMLElement, HTMLDivElement>,
-      scrolling: boolean,
-    ) => {
-      const sample = scrollSampleRef.current;
-      if (!scrolling) {
-        sample.fast = false;
-        sample.at = 0;
-        sample.offset = instance.scrollOffset ?? sample.offset;
-        return;
-      }
-      const now = performance.now();
-      const offset = instance.scrollOffset ?? 0;
-      const elapsed = sample.at === 0 ? 0 : now - sample.at;
-      const distance = Math.abs(offset - sample.offset);
-      const viewportSize = instance.scrollRect?.height ?? 0;
-      sample.fast =
-        (sample.at === 0 || elapsed <= 100) &&
-        distance >= Math.max(200, viewportSize * 0.5);
-      sample.at = now;
-      sample.offset = offset;
-    },
-    [],
-  );
   const initialOffset = useCallback(
     () => resolvedGetScrollElement()?.scrollTop ?? 0,
     [resolvedGetScrollElement],
@@ -204,9 +137,7 @@ export function TimelineWindowedItems({
     getItemKey,
     getScrollElement: resolvedGetScrollElement,
     initialOffset,
-    isScrollingResetDelay: TIMELINE_WINDOW_IDLE_DELAY_MS,
     measureElement,
-    onChange: handleVirtualizerChange,
     overscan: TIMELINE_WINDOW_OVERSCAN_ITEMS,
     rangeExtractor,
     scrollMargin,
@@ -242,6 +173,7 @@ export function TimelineWindowedItems({
     };
     const scrollElement = resolvedGetScrollElement();
     if (scrollElement === null) {
+      setScrollRootUsable(false);
       const frame = requestAnimationFrame(() => {
         updateRootUsability();
         updateScrollGeometry();
@@ -263,8 +195,6 @@ export function TimelineWindowedItems({
     return () => observer.disconnect();
   }, [configured, resolvedGetScrollElement, updateScrollGeometry]);
 
-  // A nested list's offset can change when its owning row expands or reflows
-  // without resizing the scroll root itself. Re-read after those React commits.
   useLayoutEffect(updateScrollGeometry);
 
   const retainInteractedItem = useCallback(
@@ -282,29 +212,9 @@ export function TimelineWindowedItems({
     [indexByKey],
   );
 
-  if (!windowingEnabled) {
-    return (
-      <>
-        {itemKeys.map((key, index) =>
-          renderItem(index, {
-            isRealized: true,
-            itemIndex: undefined,
-            itemRef: NOOP_ITEM_REF,
-            itemStyle: undefined,
-            windowingEnabled: false,
-          }),
-        )}
-      </>
-    );
-  }
-
-  const fastScrolling = scrollSampleRef.current.fast;
   const virtualItemsByIndex = new Map(
     virtualizer.getVirtualItems().map((item) => [item.index, item]),
   );
-  // Range calculation starts after the scroll element is measured. Product-
-  // pinned rows must exist in the first commit so navigation search and saved
-  // scroll restoration can find their DOM ids immediately.
   for (const index of forcedIndexes) {
     const item = virtualizer.measurementsCache[index];
     if (item !== undefined) virtualItemsByIndex.set(index, item);
@@ -312,35 +222,40 @@ export function TimelineWindowedItems({
   const virtualItems = [...virtualItemsByIndex.values()].sort(
     (left, right) => left.index - right.index,
   );
+  const renderWindow = windowingEnabled && virtualizer.range !== null;
+  const indexes = renderWindow
+    ? virtualItems.map((item) => item.index)
+    : itemKeys.map((_, index) => index);
   return (
     <div
       ref={containerRef}
       className="relative w-full"
-      data-timeline-virtual-spacer=""
+      style={renderWindow ? undefined : { display: "contents" }}
+      data-timeline-items=""
+      data-timeline-virtual-spacer={renderWindow ? "" : undefined}
       onClickCapture={retainInteractedItem}
       onFocusCapture={retainInteractedItem}
     >
-      {virtualItems.map((item) => {
-        const isRealized = !fastScrolling || forcedIndexes.has(item.index);
-        return renderItem(item.index, {
-          isRealized,
-          itemIndex: item.index,
-          itemRef: virtualizer.measureElement,
-          itemStyle: {
-            position: "absolute",
-            left: 0,
-            width: "100%",
-            ...(isRealized
-              ? undefined
-              : {
-                  height: item.size,
-                  minHeight: item.size,
-                  overflow: "hidden",
-                }),
-          },
-          windowingEnabled: true,
-        });
-      })}
+      {indexes.map((index) =>
+        renderItem(index, {
+          isRealized: true,
+          itemIndex: index,
+          itemRef: renderWindow
+            ? virtualizer.measureElement
+            : (element) => {
+                if (element === null) return;
+                const key = itemKeys[index];
+                const height = element.getBoundingClientRect().height;
+                if (key !== undefined && height > 0) {
+                  recordTimelineMeasurement(measurements, key, height);
+                }
+              },
+          itemStyle: renderWindow
+            ? { position: "absolute", left: 0, width: "100%" }
+            : undefined,
+          windowingEnabled: renderWindow,
+        }),
+      )}
     </div>
   );
 }

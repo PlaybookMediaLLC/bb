@@ -27,13 +27,6 @@ const requestLineSchema = z
   })
   .passthrough();
 
-/**
- * A bridge that is protocol-clean everywhere except on thread/start, which
- * it answers with the bb thread id instead of a provider identity. The
- * runtime adopts no session from such an answer (the result schema requires
- * `providerThreadId`), so the kit must name the missing field in its
- * verdict rather than report an opaque parse failure.
- */
 function startWithoutIdentityTransport(): BridgeConformanceTransport {
   const emitted: unknown[] = [];
   const reply = (id: string | number, body: Record<string, unknown>): void => {
@@ -90,28 +83,18 @@ function startWithoutIdentityTransport(): BridgeConformanceTransport {
 }
 
 interface StubBridgeOptions {
-  /** What the handshake declares for `fork`. */
   fork: "none" | "tip";
-  /** Answer thread/resume with a bare `{}` instead of an identity. */
   blankResume?: boolean;
-  /** Answer thread/fork with a bare `{}` instead of an identity. */
   blankFork?: boolean;
+  announceIdentity?: "match" | "none" | "other-id";
 }
 
 interface StubBridge {
   transport: BridgeConformanceTransport;
-  /** Every thread/fork request the kit sent, by params. */
   forks: { threadId?: string; providerThreadId?: string }[];
-  /** Every thread/stop request the kit sent, by params. */
   stops: { threadId?: string; providerThreadId?: string; intent?: unknown }[];
 }
 
-/**
- * A conformant bridge (echo-shaped v3 deltas, a fresh identity per session
- * construction) whose resume and fork answers can be blanked, so the rules
- * that pin those identities have something to fail on. `thread/fork` is
- * answered only when the handshake declared fork, like a real bridge.
- */
 function stubBridge(options: StubBridgeOptions): StubBridge {
   const emitted: unknown[] = [];
   const forks: StubBridge["forks"] = [];
@@ -128,9 +111,26 @@ function stubBridge(options: StubBridgeOptions): StubBridge {
       params: { threadId, deltas },
     });
   };
-  const identity = (): { providerThreadId: string } => {
+  const identity = (
+    threadId: string | undefined,
+  ): { providerThreadId: string } => {
     sessions += 1;
-    return { providerThreadId: `prov-${sessions}` };
+    const providerThreadId = `prov-${sessions}`;
+    const announce = options.announceIdentity ?? "match";
+    if (announce !== "none") {
+      emitted.push({
+        jsonrpc: "2.0",
+        method: "thread/identity",
+        params: {
+          threadId,
+          providerThreadId:
+            announce === "match"
+              ? providerThreadId
+              : `${providerThreadId}-other`,
+        },
+      });
+    }
+    return { providerThreadId };
   };
   return {
     forks,
@@ -162,11 +162,12 @@ function stubBridge(options: StubBridgeOptions): StubBridge {
             });
             return;
           case BRIDGE_REQUEST_METHODS.threadStart:
-            reply(message.id, { result: identity() });
+            reply(message.id, { result: identity(params.threadId) });
             return;
           case BRIDGE_REQUEST_METHODS.threadResume:
             reply(message.id, {
-              result: options.blankResume === true ? {} : identity(),
+              result:
+                options.blankResume === true ? {} : identity(params.threadId),
             });
             return;
           case BRIDGE_REQUEST_METHODS.threadFork:
@@ -181,7 +182,8 @@ function stubBridge(options: StubBridgeOptions): StubBridge {
               return;
             }
             reply(message.id, {
-              result: options.blankFork === true ? {} : identity(),
+              result:
+                options.blankFork === true ? {} : identity(params.threadId),
             });
             return;
           case BRIDGE_REQUEST_METHODS.threadStop:
@@ -293,8 +295,6 @@ describe("conformance session/start-identity", () => {
     expect(results.get("session/start-identity")?.detail).toContain(
       '{"threadId":"thr_conformance_1"}',
     );
-    // One clear verdict, not a cascade: everything that needs the session
-    // is skipped with the prerequisite named.
     expect(failedIds(report)).toEqual(["session/start-identity"]);
     expect(
       report.results
@@ -309,11 +309,50 @@ describe("conformance session/start-identity", () => {
   });
 });
 
+describe("conformance session/start-identity-announced", () => {
+  it("fails a bridge that returns a session but never announces it", async () => {
+    const { report } = await runStub({ fork: "tip", announceIdentity: "none" });
+    const results = byId(report);
+    expect(results.get("session/start-identity")?.status).toBe("pass");
+    expect(results.get("session/start-identity-announced")).toMatchObject({
+      status: "fail",
+      detail: expect.stringContaining(
+        'thread/start returned providerThreadId "prov-1" for thread "thr_conformance_1", but no thread/identity notification or thread.identity delta announced it',
+      ),
+    });
+    expect(results.get("session/fork-identity")?.status).toBe("pass");
+    expect(results.get("session/fork-identity-announced")?.status).toBe("fail");
+    expect(failedIds(report)).toEqual([
+      "session/start-identity-announced",
+      "session/fork-identity-announced",
+    ]);
+    expect(report.passed).toBe(false);
+  });
+
+  it("fails a bridge whose thread/identity names a different session than the result", async () => {
+    const { report } = await runStub({
+      fork: "none",
+      announceIdentity: "other-id",
+    });
+    expect(
+      byId(report).get("session/start-identity-announced")?.detail,
+    ).toContain('(thread/identity named "prov-1-other")');
+    expect(failedIds(report)).toEqual(["session/start-identity-announced"]);
+  });
+
+  it("passes a bridge that announces the returned session", async () => {
+    const { report } = await runStub({ fork: "tip" });
+    const results = byId(report);
+    expect(results.get("session/start-identity-announced")?.status).toBe(
+      "pass",
+    );
+    expect(results.get("session/fork-identity-announced")?.status).toBe("pass");
+    expect(report.passed).toBe(true);
+  });
+});
+
 describe("conformance session/resume-identity", () => {
   it("names the missing providerThreadId when thread/resume answers without one", async () => {
-    // The runtime parses a resume result like a start result and forgets
-    // the thread without the field, so a kit-green bridge that answers
-    // thread/resume with `{}` would fail on its first real resume.
     const { report } = await runStub({ fork: "none", blankResume: true });
     const results = byId(report);
     expect(results.get("session/start-identity")?.status).toBe("pass");
@@ -336,8 +375,6 @@ describe("conformance session/resume-identity", () => {
     const { report, bridge } = await runStub({ fork: "none" });
     expect(failedIds(report)).toEqual([]);
     expect(report.passed).toBe(true);
-    // thread/start minted prov-1, thread/resume minted prov-2: the closing
-    // release names the resumed session, as the runtime would.
     expect(bridge.stops.at(-1)).toMatchObject({
       threadId: "thr_conformance_1",
       providerThreadId: "prov-2",
@@ -348,8 +385,6 @@ describe("conformance session/resume-identity", () => {
 
 describe("conformance session/fork-identity", () => {
   it("sends no thread/fork to a bridge whose handshake declares fork: none", async () => {
-    // The runtime never sends thread/fork to such a bridge, so there is
-    // nothing to judge and no result for the rule.
     const { report, bridge } = await runStub({ fork: "none" });
     expect(bridge.forks).toEqual([]);
     expect(byId(report).has("session/fork-identity")).toBe(false);
@@ -363,7 +398,6 @@ describe("conformance session/fork-identity", () => {
     expect(bridge.forks).toEqual([
       expect.objectContaining({
         threadId: "thr_conformance_1_fork",
-        // The resumed session is the source, not the one thread/start minted.
         sourceProviderThreadId: "prov-2",
         instructionMode: "append",
       }),
@@ -386,7 +420,6 @@ describe("conformance session/fork-identity", () => {
     });
     expect(failedIds(report)).toEqual(["session/fork-identity"]);
     expect(report.passed).toBe(false);
-    // Nothing to release: the bridge produced no session the kit could name.
     expect(
       bridge.stops.filter((stop) => stop.threadId === "thr_conformance_1_fork"),
     ).toEqual([]);

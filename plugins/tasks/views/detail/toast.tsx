@@ -1,12 +1,11 @@
 import { useCallback, useEffect, useRef, useState } from "react";
-import { Icon } from "@bb/shared-ui/icon";
+import { Icon } from "@/components/ui/icon";
 
 interface DetailToast {
   id: number;
   message: string;
 }
 
-/** Minimal transient toast state for the detail page (no host toast API). */
 export function useDetailToasts() {
   const [toasts, setToasts] = useState<DetailToast[]>([]);
   const nextIdRef = useRef(1);

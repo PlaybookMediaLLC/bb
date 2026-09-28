@@ -24,14 +24,12 @@ import type {
   PullRequestActionOptions,
 } from "@bb/host-workspace";
 import { RuntimeManager } from "../../src/runtime-manager.js";
-import { listFilesRecursively } from "../../src/command-handlers/file-list.js";
 import { noopEventSink } from "../../src/command-dispatch-support.js";
 import type { CommandDispatchOptions } from "../../src/command-dispatch-support.js";
 import type { FetchProjectAttachment } from "../../src/project-attachments.js";
 
 const tempDirs: string[] = [];
 const execFileAsync = promisify(execFile);
-/** Dispatch's diagnostic logger; tests that assert on logs pass their own. */
 export const silentLogger: CommandDispatchOptions["logger"] = {
   debug: () => undefined,
   warn: () => undefined,
@@ -42,14 +40,6 @@ export const unexpectedProjectAttachmentFetch: FetchProjectAttachment =
     throw new Error("Unexpected project attachment fetch");
   };
 
-/**
- * The provider maintenance callbacks for a test that never reaches that
- * surface; a test that does supplies its own beside these. The shell-env
- * refresh is the one member that does not throw: the provider-CLI gate
- * awaits it on every gated thread start, and a test seeds the runtime
- * manager with a fixed env, so there is nothing to re-read and a no-op is
- * the faithful answer. A test that drives a PATH change supplies its own.
- */
 export const unexpectedProviderMaintenance: Pick<
   CommandDispatchOptions,
   | "listModels"
@@ -101,10 +91,6 @@ interface FakeWorkspaceState {
   statusReads: number;
 }
 
-/**
- * Direct mutators for the fake runtime's thread state, replacing what the
- * deleted RuntimeManager thread bookkeeping used to provide in tests.
- */
 interface FakeRuntimeThreadControls {
   clearProviderSession: (threadId: string) => void;
   endActiveTurn: (threadId: string) => void;
@@ -134,7 +120,6 @@ interface FakeRuntimeState {
   startedBridgeLaunch: AgentRuntimeBridgeLaunch | undefined;
   startedEnvironmentId: string | undefined;
   startedInput: PromptInput[] | undefined;
-  startedInputGroups: PromptInput[][] | undefined;
   startedInstructions: string | undefined;
   startedThreadId: string | undefined;
   steeredClientRequestId: ClientTurnRequestId | undefined;
@@ -147,9 +132,6 @@ interface FakeRuntimeState {
   unarchivedThreadId: string | undefined;
 }
 
-// Tests reassign workspace fields (e.g. isWorktree, getCurrentBranch) on the
-// fake to vary behavior per test, so the fake exposes mutable equivalents of
-// HostWorkspace's otherwise-readonly fields.
 type FakeHostWorkspace = {
   -readonly [K in keyof HostWorkspace]: HostWorkspace[K];
 };
@@ -168,7 +150,6 @@ export function createFakeWorkspace(pathname: string) {
   };
   const workspace: FakeHostWorkspace = {
     path: pathname,
-    managed: false,
     isGitRepo: true,
     isWorktree: false,
     async getDefaultBranch() {
@@ -256,30 +237,12 @@ export function createFakeWorkspace(pathname: string) {
       state.lastPullRequestAction = action;
       state.pullRequestActionShellPath = options?.shellPath;
     },
-    async listFiles() {
-      return listFilesRecursively(pathname, pathname);
-    },
     async commit(options: { message: string; noVerify: boolean }) {
       state.lastCommitMessage = options.message;
       return {
         commitSha: "commit-1",
         commitSubject: options.message,
       };
-    },
-    async reset() {},
-    async squashMerge(options: {
-      targetBranch: string;
-      commitMessage: string;
-    }) {
-      return {
-        merged: true,
-        commitSha: `merge-${options.targetBranch}`,
-        commitSubject: options.commitMessage,
-        targetBranch: options.targetBranch,
-      };
-    },
-    async destroy() {
-      state.destroyed = true;
     },
   };
 
@@ -306,7 +269,6 @@ export function createFakeRuntime() {
     startedBridgeLaunch: undefined,
     startedEnvironmentId: undefined,
     startedInput: undefined,
-    startedInputGroups: undefined,
     startedInstructions: undefined,
     startedThreadId: undefined,
     steeredClientRequestId: undefined,
@@ -332,8 +294,6 @@ export function createFakeRuntime() {
       activeTurnsByThreadId.delete(threadId);
     },
     setActiveTurn(threadId, turnId) {
-      // An active turn implies a hosted thread, mirroring the real runtime
-      // where turn/started can only be observed for a registered thread.
       if (!providerSessionsByThreadId.has(threadId)) {
         providerSessionsByThreadId.set(threadId, {
           providerId: "fake",
@@ -354,7 +314,6 @@ export function createFakeRuntime() {
       state.startedThreadId = args.threadId;
       state.startedDynamicTools = args.dynamicTools;
       state.startedInput = args.input;
-      state.startedInputGroups = args.inputGroups;
       state.startedInstructions = args.instructions;
       providerSessionsByThreadId.set(args.threadId, {
         providerId: args.providerId,
@@ -431,8 +390,6 @@ export function createFakeRuntime() {
       return activeTurnsByThreadId.get(threadId) ?? null;
     },
     async waitForActiveTurn(threadId) {
-      // The fake resolves immediately with the current state; waiting
-      // semantics are covered by the real runtime's tests.
       return activeTurnsByThreadId.get(threadId) ?? null;
     },
     getProviderSession(threadId) {
@@ -517,7 +474,6 @@ export function createHarness(
     setProvisionedWorkspace(nextWorkspace: HostWorkspace): void {
       provisionedWorkspace = nextWorkspace;
     },
-    /** Default dispatch options with threadStorageRootPath for tests. */
     dispatchOptions(
       overrides: { dataDir?: string; threadStorageRootPath?: string } = {},
     ): CommandDispatchOptions {
@@ -536,7 +492,6 @@ export function createHarness(
   };
 }
 
-/** Build a complete CommandDispatchOptions using an already-created RuntimeManager. */
 export function makeDispatchOptions(
   overrides: Partial<CommandDispatchOptions> &
     Pick<CommandDispatchOptions, "runtimeManager">,
@@ -574,13 +529,6 @@ export async function cleanupTempDirs(): Promise<void> {
   );
 }
 
-/**
- * Every bridge-bound command now carries a `bridgeLaunch`. These tests
- * exercise dispatch and runtime plumbing rather than bridge delivery, so they
- * name a tiny fixed artifact the default dispatch options serve from memory
- * (`DISPATCH_TEST_ARTIFACT_BYTES`, cached once per data dir) with
- * permissive capabilities, so no capability gate trips by accident.
- */
 export const DISPATCH_TEST_ARTIFACT_BYTES = Buffer.from(
   "export const bridge = true;\n",
 );
@@ -589,7 +537,6 @@ const DISPATCH_TEST_ARTIFACT_DIGEST = createHash("sha256")
   .digest("hex");
 const DISPATCH_TEST_DATA_DIR = "/tmp/bb-test-data";
 
-/** Serves the fixed test artifact for any digest it is asked for. */
 export const fetchDispatchTestArtifact = async (): Promise<Uint8Array> =>
   new Uint8Array(DISPATCH_TEST_ARTIFACT_BYTES);
 
@@ -612,12 +559,6 @@ export const DISPATCH_TEST_BRIDGE_LAUNCH: HostDaemonBridgeLaunch = {
   },
 };
 
-/**
- * The same launch after {@link resolveRuntimeBridgeLaunch} under a daemon
- * data dir, for tests that call runtime entry points directly: the resolved
- * shape carries the cached artifact path and the plugin-scoped directory the
- * bridge bootstrap hands its bridge.
- */
 export function dispatchTestRuntimeBridgeLaunch(
   dataDir: string = DISPATCH_TEST_DATA_DIR,
 ): AgentRuntimeBridgeLaunch {
@@ -641,6 +582,5 @@ export function dispatchTestRuntimeBridgeLaunch(
   };
 }
 
-/** {@link dispatchTestRuntimeBridgeLaunch} under the helpers' default data dir. */
 export const DISPATCH_TEST_RUNTIME_BRIDGE_LAUNCH: AgentRuntimeBridgeLaunch =
   dispatchTestRuntimeBridgeLaunch();

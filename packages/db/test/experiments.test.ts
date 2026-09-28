@@ -36,11 +36,11 @@ describe("experiments", () => {
           .map((row) => row.key),
       ).toEqual([
         "changelogPreview",
-        "editMessages",
         "futureExperiment",
+        "legacyJitiPluginLoader",
         "mobileApp",
-        "providerSessionReaping",
-        "timelineWindowing",
+        "serverMove",
+        "sidebarProgressiveDisclosure",
       ]);
     } finally {
       db.$client.close();

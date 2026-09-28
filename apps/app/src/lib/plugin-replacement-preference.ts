@@ -5,20 +5,8 @@ import {
   type ResolvedReplacement,
 } from "@/lib/plugin-slot-resolvers";
 
-/**
- * The per-client pin shared by every exclusive replacement surface that offers
- * one (the sidebar thread list, the source and diff renderers).
- *
- * All three answer the same question — automatic, BB's own, or one named
- * provider — so they answer it the same way, and a stored selection for an
- * unavailable provider degrades to BB without being erased: a temporarily
- * disabled plugin gets its surface back when it returns.
- */
-
-/** Follow deterministic slot order and activate the first provider. */
 export const AUTOMATIC_REPLACEMENT_PROVIDER = "__automatic__";
 
-/** Always use BB's own implementation. */
 export const BUILT_IN_REPLACEMENT_PROVIDER = "__builtin__";
 
 interface ReplacementProviderIdentity {
@@ -41,17 +29,31 @@ export function createReplacementPreferenceAtom(storageKey: string) {
   );
 }
 
+export function findAutomaticReplacement<
+  Slot extends ReplacementProviderIdentity,
+>(slots: readonly Slot[], bundledProvider?: string): Slot | undefined {
+  return (
+    slots.find((slot) => replacementProviderKey(slot) !== bundledProvider) ??
+    slots[0]
+  );
+}
+
 export function resolvePreferredReplacement<
   Slot extends ReplacementProviderIdentity,
 >(
   slots: readonly Slot[],
   preference: string = AUTOMATIC_REPLACEMENT_PROVIDER,
+  bundledProvider?: string,
 ): ResolvedReplacement<Slot> {
   if (preference === BUILT_IN_REPLACEMENT_PROVIDER) return { kind: "owner" };
+  if (preference === AUTOMATIC_REPLACEMENT_PROVIDER) {
+    const registration = findAutomaticReplacement(slots, bundledProvider);
+    return registration === undefined
+      ? { kind: "owner" }
+      : { kind: "plugin", registration };
+  }
   return resolveReplacement(
     slots,
-    preference === AUTOMATIC_REPLACEMENT_PROVIDER
-      ? undefined
-      : (candidate) => replacementProviderKey(candidate) === preference,
+    (candidate) => replacementProviderKey(candidate) === preference,
   );
 }

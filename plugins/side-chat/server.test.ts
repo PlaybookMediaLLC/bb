@@ -1,4 +1,3 @@
-// Backend tests: reply-anchor seed policy, archive cascade, empty-fork sweep.
 import { describe, expect, it, vi } from "vitest";
 import {
   createFakePluginHost,
@@ -90,10 +89,10 @@ describe("createSideChat rpc", () => {
 
     expect(result).toEqual({ threadId: "thr_fork" });
     expect(fork).toHaveBeenCalledWith({
+      lifecycleOwnerThreadId: "thr_src",
       sourceThreadId: "thr_src",
       sourceSeqEnd: 42,
       visibility: "hidden",
-      workspace: "reuse",
       agentContextSeed: [
         {
           type: "text",
@@ -102,6 +101,8 @@ describe("createSideChat rpc", () => {
           visibility: "agent-only",
         },
       ],
+      origin: "plugin",
+      originPluginId: PLUGIN_ID,
     });
   });
 
@@ -187,29 +188,11 @@ describe("createSideChat rpc", () => {
     });
 
     expect(fork).toHaveBeenCalledWith({
+      lifecycleOwnerThreadId: "thr_src",
       sourceThreadId: "thr_src",
       visibility: "hidden",
-      workspace: "reuse",
-    });
-  });
-});
-
-describe("sendToMain rpc", () => {
-  it("queues the text on the source thread with the fork as sender", async () => {
-    const create = vi.fn(async () => ({ id: "qm_1" }));
-    const { harness } = await loadPlugin({ queuedMessages: { create } });
-
-    const result = await harness.callRpc("sendToMain", {
-      sourceThreadId: "thr_src",
-      senderThreadId: "thr_fork",
-      text: "the answer",
-    });
-
-    expect(result).toEqual({ ok: true });
-    expect(create).toHaveBeenCalledWith({
-      threadId: "thr_src",
-      input: [{ type: "text", text: "the answer", mentions: [] }],
-      senderThreadId: "thr_fork",
+      origin: "plugin",
+      originPluginId: PLUGIN_ID,
     });
   });
 });
@@ -291,19 +274,15 @@ describe("empty-fork sweep", () => {
     expect(archive.mock.calls.map(([args]) => args)).toEqual([
       { threadId: "thr_empty_old" },
     ]);
-    // Only candidates past the age cutoff pay for a timeline read.
     expect(timeline.mock.calls.map(([args]) => args.threadId)).toEqual([
       "thr_empty_old",
       "thr_replied_old",
     ]);
   });
 
-  // Archiving removes rows from the `archived: false` set the sweep pages
-  // through, so a full-page offset step would skip that many unswept forks.
   it("advances the page offset by the forks it left behind", async () => {
     const now = Date.now();
     const old = now - EMPTY_FORK_MAX_AGE_MS - 60_000;
-    // One full page: every fork is archived except the one that has a reply.
     const firstPage = Array.from(
       { length: EMPTY_FORK_SWEEP_PAGE_SIZE },
       (_unused, index) =>
@@ -330,8 +309,6 @@ describe("empty-fork sweep", () => {
 
     await harness.runSchedule("empty-fork-cleanup");
 
-    // The single retained fork is the only row still in the set, so the next
-    // page starts at 1 — not at a full page past it.
     expect(list.mock.calls.map(([args]) => args.offset)).toEqual([0, 1]);
   });
 
@@ -361,8 +338,6 @@ describe("empty-fork sweep", () => {
     expect(archive).not.toHaveBeenCalled();
   });
 
-  // A fork with user work can never become empty, so re-reading its whole
-  // timeline every hour is pure waste that grows with the thread history.
   it("remembers a kept fork and stops re-reading its timeline", async () => {
     const now = Date.now();
     const fork = makeThreadResponse({
@@ -392,8 +367,6 @@ describe("empty-fork sweep", () => {
     expect(archive).not.toHaveBeenCalled();
   });
 
-  // A read failure must not be remembered, or one bad hour retires the fork
-  // from the sweep forever.
   it("retries a fork whose timeline read failed", async () => {
     const now = Date.now();
     const fork = makeThreadResponse({

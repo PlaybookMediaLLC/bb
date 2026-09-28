@@ -1,67 +1,81 @@
-import { useCallback, type ReactNode } from "react";
-import { toast } from "sonner";
-import { PluginReplacementSlot } from "@/components/plugin/PluginReplacementSlot";
-import { deprecatedOriginalAlias } from "@/lib/plugin-sdk-deprecated-aliases";
+import { useCallback, useState } from "react";
+import {
+  PluginSlotMount,
+  resetCrashedPluginSlots,
+} from "@/components/plugin/PluginSlotMount";
 import { useSidebar } from "@/components/ui/sidebar.js";
 import { useRouteState } from "@/hooks/useRouteState";
 import type { ResolvedReplacement } from "@/lib/plugin-slot-resolvers";
 import type { PluginThreadListSlot } from "@/lib/plugin-slots";
+import { appToast } from "@/components/ui/app-toast";
+import { usePluginFrontendsSettled } from "@/lib/plugin-frontend-boot-state";
+import { ThreadListPlaceholder } from "./ThreadListPlaceholder";
 
-/** Shared by the mount and the host's crash check. */
 const THREAD_LIST_SLOT_KIND = "threadList";
 
 interface PluginThreadListProps {
   replacement: ResolvedReplacement<PluginThreadListSlot>;
-  /** BB's list bound to this sidebar instance. */
-  original: ReactNode;
-  /** The host search field's text; "" when closed or plugin-owned. */
-  searchQuery: string;
   onNavigate: () => void;
 }
 
-/**
- * Mounts the active `experimental_threadList` slot in the sidebar's scroll
- * area, keyed by generation so a plugin reload remounts it with fresh
- * error-boundary state.
- */
 export function PluginThreadList({
   replacement,
-  original,
-  searchQuery,
   onNavigate,
 }: PluginThreadListProps) {
   const { projectId, threadId } = useRouteState();
   const { isCompactViewport } = useSidebar();
-  const title =
-    replacement.kind === "plugin" ? replacement.registration.title : "Plugin";
+  const bootSettled = usePluginFrontendsSettled();
+  const [attempt, setAttempt] = useState(0);
+  const registration =
+    replacement.kind === "plugin" ? replacement.registration : null;
+  const pluginId = registration?.pluginId ?? null;
+  const title = registration?.title ?? "Thread list";
 
   const handleCrash = useCallback(
-    (pluginId: string) => {
-      toast.error("Sidebar plugin crashed", {
-        description: `${title} (${pluginId}) stopped working, so bb's own thread list is back.`,
+    (crashedPluginId: string) => {
+      appToast.error("Thread list plugin crashed", {
+        description: `${title} (${crashedPluginId}) stopped working.`,
       });
     },
     [title],
   );
+  const handleReload = useCallback(() => {
+    if (pluginId !== null) resetCrashedPluginSlots(pluginId);
+    setAttempt((current) => current + 1);
+  }, [pluginId]);
 
+  if (registration === null) {
+    return (
+      <ThreadListPlaceholder
+        state={bootSettled ? { kind: "missing" } : { kind: "loading" }}
+      />
+    );
+  }
+  const List = registration.component;
   return (
-    <PluginReplacementSlot
-      replacement={replacement}
-      original={original}
+    <PluginSlotMount
+      key={`${registration.pluginId}/${registration.id}/${registration.generation}/${attempt}`}
+      pluginId={registration.pluginId}
       slotKind={THREAD_LIST_SLOT_KIND}
+      slotId={registration.id}
+      crashFallback={
+        <ThreadListPlaceholder
+          state={{
+            kind: "crashed",
+            pluginTitle: title,
+            onReload: handleReload,
+          }}
+        />
+      }
       onCrash={handleCrash}
     >
-      {(slot, BoundOriginal) => (
-        <slot.component
-          activeThreadId={threadId ?? null}
-          activeProjectId={projectId ?? null}
-          isCompactViewport={isCompactViewport}
-          onNavigate={onNavigate}
-          searchQuery={searchQuery}
-          Original={BoundOriginal}
-          experimental_Original={deprecatedOriginalAlias(BoundOriginal)}
-        />
-      )}
-    </PluginReplacementSlot>
+      <List
+        activeThreadId={threadId ?? null}
+        activeProjectId={projectId ?? null}
+        isCompactViewport={isCompactViewport}
+        onNavigate={onNavigate}
+        searchQuery=""
+      />
+    </PluginSlotMount>
   );
 }

@@ -1,6 +1,5 @@
 import { describe, expect, it } from "vitest";
 import {
-  BRIDGE_NOTIFICATION_METHODS,
   bridgeCapabilitiesSchema,
   initializeParamsSchema,
   initializeResultSchema,
@@ -69,8 +68,6 @@ describe("thread delta grammar v3", () => {
   });
 
   it("requires the delta-level presentation for extension shapes, on open and close", () => {
-    // Presentation lives in one place (the lifecycle delta); the extension
-    // shape carries none of its own and cannot render without one.
     const item = {
       type: "extension",
       kind: "codex/goal",
@@ -95,7 +92,6 @@ describe("thread delta grammar v3", () => {
         `expected ${delta.kind} with presentation to parse`,
       ).toBe(true);
     }
-    // A shape-level presentation is not a second home for it.
     expect(
       deltaItemShapeSchema.parse({ ...item, presentation }),
     ).not.toHaveProperty("presentation");
@@ -117,7 +113,6 @@ describe("thread delta grammar v3", () => {
         presentation: { ...presentation, suppress: true },
       }).success,
     ).toBe(true);
-    // A malformed presentation is rejected, not silently dropped.
     expect(
       threadDeltaSchema.safeParse({
         kind: "item.open",
@@ -129,7 +124,6 @@ describe("thread delta grammar v3", () => {
   });
 
   it("rejects malformed v3 shapes", () => {
-    // search needs a mode from the closed enum.
     expect(
       deltaItemShapeSchema.safeParse({
         type: "search",
@@ -137,7 +131,6 @@ describe("thread delta grammar v3", () => {
         query: "x",
       }).success,
     ).toBe(false);
-    // delegation childRef is a provider key: non-empty.
     expect(
       deltaItemShapeSchema.safeParse({
         type: "delegation",
@@ -146,7 +139,6 @@ describe("thread delta grammar v3", () => {
         background: false,
       }).success,
     ).toBe(false);
-    // the extension kind is namespaced.
     for (const kind of ["goal", "Codex/goal", "codex/goal/x", "codex/"]) {
       expect(
         deltaItemShapeSchema.safeParse({
@@ -157,7 +149,6 @@ describe("thread delta grammar v3", () => {
         `expected extension kind ${JSON.stringify(kind)} to be rejected`,
       ).toBe(false);
     }
-    // extension payload must be JSON.
     expect(
       deltaItemShapeSchema.safeParse({
         type: "extension",
@@ -212,7 +203,6 @@ describe("thread delta grammar v3", () => {
         },
       }).success,
     ).toBe(true);
-    // A foreground shape is not a progress snapshot.
     expect(
       threadDeltaSchema.safeParse({
         kind: "item.progress",
@@ -250,8 +240,6 @@ describe("handshake v3 capabilities", () => {
   });
 
   it("negotiates the highest common grammar version in both directions", () => {
-    // An older runtime's params omit the range and read as its protocol
-    // version, so a wider bridge stays on v2.
     const params = initializeParamsSchema.parse({
       protocolVersion: 2,
       client: { name: "bb", version: "1.0.0" },
@@ -281,12 +269,6 @@ describe("handshake v3 capabilities", () => {
 });
 
 describe("provider/recovery notification", () => {
-  it("is a registered bridge notification method", () => {
-    expect(BRIDGE_NOTIFICATION_METHODS.providerRecovery).toBe(
-      "provider/recovery",
-    );
-  });
-
   it("parses every recovery kind with and without a thread", () => {
     for (const kind of [
       "sessionArchived",

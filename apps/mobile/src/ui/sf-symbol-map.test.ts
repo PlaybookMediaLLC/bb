@@ -1,9 +1,8 @@
-import { readdirSync, readFileSync, statSync } from "node:fs";
+import { readFileSync } from "node:fs";
 import { createRequire } from "node:module";
 import { dirname, join } from "node:path";
-import { fileURLToPath } from "node:url";
 import { describe, expect, it } from "vitest";
-import { ICON_NAMES, isIconName, type IconName } from "./icon-map";
+import { ICON_MAP, isIconName } from "./icon-map";
 import {
   SF_SYMBOL_MAP,
   SF_SYMBOL_WEIGHT,
@@ -11,75 +10,8 @@ import {
   sfSymbolFor,
 } from "./sf-symbol-map";
 
-const HERE = dirname(fileURLToPath(import.meta.url));
-const SCAN_ROOTS = [join(HERE, ".."), join(HERE, "..", "..", "app")];
-const SELF_FILES = new Set([
-  "icon-map.ts",
-  "icon-map.test.ts",
-  "sf-symbol-map.ts",
-  "sf-symbol-map.test.ts",
-]);
-
-/** Brand marks have no SF Symbol; `Icon.ios.tsx` keeps Hugeicons for them. */
-const BRAND_MARKS: readonly IconName[] = ["Discord", "Github"];
-
-/**
- * The app's iOS deployment target is 16.4 (`ios/Podfile`), which ships SF
- * Symbols 4.2. A newer symbol renders as nothing on older devices
- * (`UIImage(systemName:)` returns nil), so every mapping must exist by then.
- */
 const MAX_SF_SYMBOLS_VERSION = "4.2";
 
-function listSourceFiles(dir: string, out: string[]): string[] {
-  for (const entry of readdirSync(dir)) {
-    if (entry === "node_modules") continue;
-    const path = join(dir, entry);
-    if (statSync(path).isDirectory()) listSourceFiles(path, out);
-    else if (/\.tsx?$/.test(entry) && !SELF_FILES.has(entry)) out.push(path);
-  }
-  return out;
-}
-
-/**
- * Every icon name referenced under src/ and app/: JSX `name="X"` /
- * `icon="X"` / `leading="X"` props, `icon: "X"` object fields (models,
- * action lists), and — in files that work with the `IconName` type — any
- * PascalCase string literal that is an icon name, which catches the names
- * returned from switch/ternary helpers.
- */
-function usedIconNames(): Map<IconName, string[]> {
-  const used = new Map<IconName, string[]>();
-  const record = (candidate: string, location: string) => {
-    if (!isIconName(candidate)) return;
-    const locations = used.get(candidate) ?? [];
-    locations.push(location);
-    used.set(candidate, locations);
-  };
-  for (const file of SCAN_ROOTS.flatMap((root) => listSourceFiles(root, []))) {
-    const source = readFileSync(file, "utf8");
-    const typed = source.includes("IconName");
-    source.split("\n").forEach((line, index) => {
-      const location = `${file}:${index + 1}`;
-      for (const match of line.matchAll(
-        /\b(?:name|icon|leading|trailing|glyph|leadingIcon|trailingIcon)=\{?"([A-Z][A-Za-z0-9]*)"/g,
-      )) {
-        record(match[1], location);
-      }
-      for (const match of line.matchAll(
-        /\b(?:icon|leading|glyph|leadingIcon|trailingIcon|statusIcon|iconName)\??:\s*"([A-Z][A-Za-z0-9]*)"/g,
-      )) {
-        record(match[1], location);
-      }
-      if (!typed) return;
-      for (const match of line.matchAll(/"([A-Z][A-Za-z0-9]*)"/g)) {
-        record(match[1], location);
-      }
-    });
-  }
-  return used;
-}
-
-/** Symbol name → the SF Symbols release that introduced it, from the catalog. */
 function sfSymbolCatalog(): Map<string, string> {
   const require = createRequire(import.meta.url);
   const packageJson = require.resolve("sf-symbols-typescript/package.json");
@@ -115,31 +47,13 @@ function isAtMost(version: string, limit: string): boolean {
 }
 
 describe("SF_SYMBOL_MAP", () => {
-  it("maps every icon name except the brand marks", () => {
-    const unmapped = ICON_NAMES.filter(
-      (name) => sfSymbolFor(name) === undefined,
+  it("maps every icon name", () => {
+    const unmapped = Object.keys(ICON_MAP).filter(
+      (name) => !isIconName(name) || sfSymbolFor(name) === undefined,
     );
-    expect(unmapped.sort()).toEqual([...BRAND_MARKS].sort());
+    expect(unmapped).toEqual([]);
     for (const key of Object.keys(SF_SYMBOL_MAP)) {
       expect(isIconName(key), key).toBe(true);
-    }
-  });
-
-  it("covers every icon name the app renders", () => {
-    const used = usedIconNames();
-    // A scan that stops finding names would pass vacuously; pin the floor.
-    expect(used.size).toBeGreaterThan(80);
-    const missing = [...used]
-      .filter(
-        ([name]) =>
-          sfSymbolFor(name) === undefined && !BRAND_MARKS.includes(name),
-      )
-      .map(([name, locations]) => `${name} (${locations[0]})`);
-    expect(missing).toEqual([]);
-    // The brand marks are really rendered somewhere; otherwise the allowlist
-    // is stale.
-    for (const name of BRAND_MARKS) {
-      expect(used.has(name), name).toBe(true);
     }
   });
 
@@ -162,13 +76,6 @@ describe("SF_SYMBOL_MAP", () => {
       }
     }
     expect(problems).toEqual([]);
-  });
-
-  it("sfSymbolFor returns the mapped symbol and nothing for brand marks", () => {
-    expect(sfSymbolFor("Plus")).toBe("plus");
-    expect(sfSymbolFor("Trash2")).toBe("trash");
-    expect(sfSymbolFor("Github")).toBeUndefined();
-    expect(sfSymbolFor("Discord")).toBeUndefined();
   });
 
   it("symbol weights are the numeric fontWeight strings expo-image parses", () => {

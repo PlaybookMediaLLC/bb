@@ -1,4 +1,7 @@
 import type {
+  MachineEnvironmentReplace,
+  MachineEnvironmentSet,
+  ProjectMachineEnvironmentList,
   CommandListResponse,
   CopyProjectAttachmentsRequest,
   CreateProjectRequest,
@@ -28,7 +31,6 @@ import { signalRequestArgs, type CreateSdkAreaArgs } from "./common.js";
 
 export interface ProjectListArgs {
   include?: ProjectListQuery["include"];
-  /** Include the singleton personal project. Defaults to false for compatibility. */
   includePersonal?: boolean;
   signal?: AbortSignal;
 }
@@ -57,7 +59,6 @@ export interface ProjectPromptHistoryArgs extends PromptHistoryQuery {
   signal?: AbortSignal;
 }
 
-/** Select one project workspace source, or omit both for the primary host. */
 export type ProjectWorkspaceRoutingArgs =
   | { environmentId: string; hostId?: never }
   | { environmentId?: never; hostId: string }
@@ -114,15 +115,10 @@ export type ProjectAttachmentUploadFile =
   | Uint8Array;
 
 interface ProjectAttachmentUploadArgsBase {
-  /** MIME override. Omit to use the File/Blob type, when available. */
   mimeType?: string;
   projectId: string;
 }
 
-/**
- * Upload bytes owned by this SDK client. A bare Blob/byte buffer needs an
- * explicit filename; File-like values can supply their own name.
- */
 export type ProjectAttachmentUploadArgs = ProjectAttachmentUploadArgsBase &
   (
     | {
@@ -168,11 +164,9 @@ export interface ProjectAttachmentReadResult {
 export type ProjectAttachmentUploadResult = UploadedPromptAttachment;
 export type ProjectCommandsResult = CommandListResponse;
 export type ProjectCreateResult = ProjectResponse;
-export type ProjectDefaultExecutionOptionsResult =
-  ProjectExecutionDefaults | null;
+export type ProjectDefaultExecutionOptionsResult = ProjectExecutionDefaults | null;
 export type ProjectDeleteResult = { ok: true };
 export interface ProjectFileContentResult {
-  /** UTF-8 text or base64, as selected by `contentEncoding`. */
   content: string;
   contentEncoding: "utf8" | "base64";
   mimeType: string;
@@ -207,6 +201,19 @@ export interface ProjectAttachmentsArea {
 }
 
 export interface ProjectsArea {
+  machineEnvironment(args: {
+    projectId: string;
+  }): Promise<ProjectMachineEnvironmentList>;
+  replaceMachineEnvironment(
+    args: { projectId: string } & MachineEnvironmentReplace,
+  ): Promise<ProjectMachineEnvironmentList>;
+  setMachineEnvironmentVariable(
+    args: { projectId: string } & MachineEnvironmentSet,
+  ): Promise<ProjectMachineEnvironmentList>;
+  deleteMachineEnvironmentVariable(args: {
+    projectId: string;
+    name: string;
+  }): Promise<ProjectMachineEnvironmentList>;
   attachments: ProjectAttachmentsArea;
   branches(args: ProjectBranchesArgs): Promise<ProjectBranchesResult>;
   commands(args: ProjectCommandsArgs): Promise<ProjectCommandsResult>;
@@ -224,11 +231,6 @@ export interface ProjectsArea {
     args: ProjectPromptHistoryArgs,
   ): Promise<ProjectPromptHistoryResult>;
   reorder(args: ProjectReorderArgs): Promise<ProjectReorderResult>;
-  /**
-   * One round-trip navigation snapshot: thread sections, every project with
-   * its live threads and resolved thread-creation defaults, and the personal
-   * project. Backs the sidebar of the web and native apps.
-   */
   sidebarBootstrap(
     args?: ProjectSidebarBootstrapArgs,
   ): Promise<ProjectSidebarBootstrapResult>;
@@ -374,9 +376,6 @@ export function createProjectsArea(args: CreateSdkAreaArgs): ProjectsArea {
       const filename = resolveAttachmentFilename(input);
       const mimeType =
         input.mimeType ?? embeddedAttachmentMimeType(input.clientFile) ?? "";
-      // A Blob/File whose type already matches streams straight into the
-      // form; copying it through arrayBuffer() first doubles the memory of a
-      // multi-megabyte photo on the main thread for nothing.
       const file =
         input.clientFile instanceof Blob && input.clientFile.type === mimeType
           ? input.clientFile
@@ -516,6 +515,37 @@ export function createProjectsArea(args: CreateSdkAreaArgs): ProjectsArea {
           },
           ...signalRequestArgs(signal),
         ),
+      );
+    },
+    async machineEnvironment(input) {
+      return transport.readJson(
+        transport.api.v1.projects[":id"]["machine-environment"].$get({
+          param: { id: input.projectId },
+        }),
+      );
+    },
+    async replaceMachineEnvironment(input) {
+      return transport.readJson(
+        transport.api.v1.projects[":id"]["machine-environment"].$put({
+          param: { id: input.projectId },
+          json: { variables: input.variables },
+        }),
+      );
+    },
+    async setMachineEnvironmentVariable(input) {
+      return transport.readJson(
+        transport.api.v1.projects[":id"]["machine-environment"].$post({
+          param: { id: input.projectId },
+          json: { name: input.name, value: input.value, note: input.note },
+        }),
+      );
+    },
+    async deleteMachineEnvironmentVariable(input) {
+      return transport.readJson(
+        transport.api.v1.projects[":id"]["machine-environment"].$delete({
+          param: { id: input.projectId },
+          json: { name: input.name },
+        }),
       );
     },
     async get(input) {

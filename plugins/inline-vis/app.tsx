@@ -1,34 +1,83 @@
-// bb-plugin-inline-vis frontend — assistant message directive that previews
-// a workspace HTML file through the same path-shaped, sandboxed iframe route
-// as bb's sidebar HTML preview. Scripts, relative assets, and normal web
-// resources work inside an opaque origin that cannot access the host page.
 import { useEffect, useState, type ReactNode } from "react";
-import { Icon } from "@bb/shared-ui/icon";
-import { Skeleton } from "@bb/shared-ui/skeleton";
+import { Icon } from "@/components/ui/icon";
+import { Skeleton } from "@/components/ui/skeleton";
 import {
   definePluginApp,
+  Markdown,
+  useBbNavigate,
   useRpc,
   type PluginMessageDirectiveProps,
+  type MarkdownProps,
 } from "@get-bb/plugin-sdk/app";
 import type { inlineVisRpcContract } from "./server.js";
+
+type PreviewSource = "workspace" | "thread-storage";
+
+type PreviewTarget = NonNullable<
+  MarkdownProps["experimental_document"]
+>["target"];
+
+const PREVIEW_ROUTE = {
+  workspace: "worktree/files",
+  "thread-storage": "thread-storage/files",
+} as const satisfies Record<PreviewSource, string>;
 
 type LoadState =
   | { status: "missing-file" }
   | { status: "invalid-height"; message: string }
   | { status: "loading"; file: string }
-  | { status: "ready"; file: string }
+  | {
+      status: "ready";
+      kind: "html";
+      file: string;
+      source: PreviewSource;
+      target: PreviewTarget;
+    }
+  | {
+      status: "ready";
+      kind: "markdown";
+      file: string;
+      source: PreviewSource;
+      target: PreviewTarget;
+      rootPath: string;
+      content: string;
+    }
   | { status: "error"; file: string; message: string };
 
 const DEFAULT_HEIGHT_PX = 224;
 const MIN_HEIGHT_PX = 120;
 const MAX_HEIGHT_PX = 1_200;
+const COLLAPSED_STORAGE_KEY = "bb.inline-vis.collapsed";
+
+function readCollapsedPreference(): boolean {
+  try {
+    return (
+      typeof window !== "undefined" &&
+      window.localStorage.getItem(COLLAPSED_STORAGE_KEY) === "true"
+    );
+  } catch {
+    return false;
+  }
+}
+
+function writeCollapsedPreference(collapsed: boolean): void {
+  try {
+    window.localStorage.setItem(COLLAPSED_STORAGE_KEY, String(collapsed));
+  } catch {
+    return;
+  }
+}
 
 function encodePathSegments(file: string): string {
   return file.split("/").map(encodeURIComponent).join("/");
 }
 
-function buildWorktreePreviewUrl(threadId: string, file: string): string {
-  return `/api/v1/threads/${encodeURIComponent(threadId)}/worktree/files/${encodePathSegments(file)}`;
+function buildPreviewUrl(
+  threadId: string,
+  file: string,
+  source: PreviewSource,
+): string {
+  return `/api/v1/threads/${encodeURIComponent(threadId)}/${PREVIEW_ROUTE[source]}/${encodePathSegments(file)}`;
 }
 
 function parsePreviewHeight(value: string | undefined): number | null {
@@ -43,28 +92,45 @@ function parsePreviewHeight(value: string | undefined): number | null {
     : null;
 }
 
-// Shared card chrome for the loading and ready states. Both states must render
-// identical geometry: the thread timeline is bottom-anchored, so any height
-// change when the iframe replaces the loader scrolls earlier content away.
 function PreviewCard({
   file,
   action,
+  collapsed,
+  onCollapsedChange,
   children,
 }: {
   file: string;
   action: ReactNode;
+  collapsed: boolean;
+  onCollapsedChange: (collapsed: boolean) => void;
   children: ReactNode;
 }) {
   return (
     <div className="my-2 overflow-hidden rounded-lg border border-border bg-background">
-      <div className="flex items-center gap-2 border-b border-border px-3 py-1.5 text-xs text-muted-foreground">
+      <div
+        className={`flex items-center gap-2 px-3 py-1.5 text-xs text-muted-foreground ${collapsed ? "" : "border-b border-border"}`}
+      >
         <div className="flex min-w-0 flex-1 items-center gap-2">
           <span className="shrink-0 font-semibold">inline-vis</span>
           <span className="truncate opacity-70">{file}</span>
         </div>
         {action}
+        <button
+          type="button"
+          aria-expanded={!collapsed}
+          aria-label={`${collapsed ? "Expand" : "Collapse"} visualization ${file}`}
+          title={collapsed ? "Expand visualization" : "Collapse visualization"}
+          className="inline-flex size-5 shrink-0 cursor-pointer items-center justify-center rounded-md text-muted-foreground hover:bg-state-hover hover:text-foreground focus-visible:outline-none focus-visible:ring-1 focus-visible:ring-ring"
+          onClick={() => onCollapsedChange(!collapsed)}
+        >
+          <Icon
+            name={collapsed ? "ChevronRight" : "ChevronDown"}
+            aria-hidden
+            className="size-3"
+          />
+        </button>
       </div>
-      {children}
+      {collapsed ? null : children}
     </div>
   );
 }
@@ -73,10 +139,11 @@ function InlineVisDirective({
   attributes,
   source,
   message,
-  openWorkspaceFile,
 }: PluginMessageDirectiveProps) {
   const rpc = useRpc<typeof inlineVisRpcContract>();
+  const navigate = useBbNavigate();
   const fileAttr = attributes.file?.trim() ?? "";
+  const sourceAttr = attributes.source;
   const heightAttr = attributes.height;
   const previewHeight = parsePreviewHeight(heightAttr);
   const heightError =
@@ -90,6 +157,12 @@ function InlineVisDirective({
         ? { status: "loading", file: fileAttr }
         : { status: "missing-file" },
   );
+  const [collapsed, setCollapsed] = useState(readCollapsedPreference);
+
+  const handleCollapsedChange = (nextCollapsed: boolean) => {
+    setCollapsed(nextCollapsed);
+    writeCollapsedPreference(nextCollapsed);
+  };
 
   useEffect(() => {
     if (heightError) {
@@ -100,21 +173,18 @@ function InlineVisDirective({
       setState({ status: "missing-file" });
       return;
     }
-
     let cancelled = false;
     setState({ status: "loading", file: fileAttr });
 
     void (async () => {
       try {
-        const result = await rpc.call("prepareHtmlPreview", {
+        const result = await rpc.call("preparePreview", {
           threadId: message.threadId,
           file: fileAttr,
+          ...(sourceAttr === undefined ? {} : { source: sourceAttr }),
         });
         if (cancelled) return;
-        setState({
-          status: "ready",
-          file: result.file,
-        });
+        setState({ status: "ready", ...result });
       } catch (error) {
         if (cancelled) return;
         setState({
@@ -128,7 +198,7 @@ function InlineVisDirective({
     return () => {
       cancelled = true;
     };
-  }, [fileAttr, heightError, message.threadId, rpc]);
+  }, [fileAttr, heightError, message.threadId, rpc, sourceAttr]);
 
   if (state.status === "missing-file") {
     return (
@@ -159,11 +229,9 @@ function InlineVisDirective({
     return (
       <PreviewCard
         file={state.file}
-        action={
-          openWorkspaceFile === null ? null : (
-            <span aria-hidden className="size-5 shrink-0" />
-          )
-        }
+        action={<span aria-hidden className="size-5 shrink-0" />}
+        collapsed={collapsed}
+        onCollapsedChange={handleCollapsedChange}
       >
         <div
           role="status"
@@ -190,36 +258,51 @@ function InlineVisDirective({
     );
   }
 
-  const previewUrl = buildWorktreePreviewUrl(message.threadId, state.file);
-
   return (
     <PreviewCard
       file={state.file}
+      collapsed={collapsed}
+      onCollapsedChange={handleCollapsedChange}
       action={
-        openWorkspaceFile === null ? null : (
-          <button
-            type="button"
-            aria-label={`Open ${state.file} in sidebar`}
-            title="Open in sidebar"
-            className="inline-flex size-5 shrink-0 cursor-pointer items-center justify-center rounded-md text-muted-foreground hover:bg-state-hover hover:text-foreground focus-visible:outline-none focus-visible:ring-1 focus-visible:ring-ring"
-            onClick={() => {
-              openWorkspaceFile(state.file);
-            }}
-          >
-            <Icon name="ExternalLink" aria-hidden className="size-3" />
-          </button>
-        )
+        <button
+          type="button"
+          aria-label={`Open ${state.file} in sidebar`}
+          title="Open in sidebar"
+          className="inline-flex size-5 shrink-0 cursor-pointer items-center justify-center rounded-md text-muted-foreground hover:bg-state-hover hover:text-foreground focus-visible:outline-none focus-visible:ring-1 focus-visible:ring-ring"
+          onClick={() => {
+            navigate.experimental_openFilePreview({
+              target: state.target,
+              location: null,
+            });
+          }}
+        >
+          <Icon name="ExternalLink" aria-hidden className="size-3" />
+        </button>
       }
     >
-      <iframe
-        title={`inline-vis: ${state.file}`}
-        src={previewUrl}
-        // Scripts run, but without allow-same-origin they get an opaque origin
-        // and cannot access the bb page, its cookies/storage, forms, or popups.
-        sandbox="allow-scripts"
-        style={{ height: previewHeight ?? DEFAULT_HEIGHT_PX }}
-        className="block w-full border-0 bg-background"
-      />
+      {state.kind === "markdown" ? (
+        <div
+          style={{ height: previewHeight ?? DEFAULT_HEIGHT_PX }}
+          className="overflow-auto p-3"
+        >
+          <Markdown
+            content={state.content}
+            experimental_document={{
+              threadId: message.threadId,
+              rootPath: state.rootPath,
+              target: state.target,
+            }}
+          />
+        </div>
+      ) : (
+        <iframe
+          title={`inline-vis: ${state.file}`}
+          src={buildPreviewUrl(message.threadId, state.file, state.source)}
+          sandbox="allow-scripts"
+          style={{ height: previewHeight ?? DEFAULT_HEIGHT_PX }}
+          className="block w-full border-0 bg-background"
+        />
+      )}
     </PreviewCard>
   );
 }

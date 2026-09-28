@@ -1,3 +1,7 @@
+import {
+  createDesktopBrowsersArea,
+  type ExperimentalDesktopBrowsersArea,
+} from "./areas/desktop-browsers.js";
 import type { BbSdkContext, BbSdkTransport } from "./transport.js";
 import {
   createEnvironmentsArea,
@@ -6,6 +10,10 @@ import {
 import { createFilesArea, type FilesArea } from "./areas/files.js";
 import type { GuideArea } from "./areas/guide.js";
 import { createHostsArea, type HostsArea } from "./areas/hosts.js";
+import {
+  createServerArea,
+  type ExperimentalServerArea,
+} from "./areas/server.js";
 import { createProjectsArea, type ProjectsArea } from "./areas/projects.js";
 import { createProvidersArea, type ProvidersArea } from "./areas/providers.js";
 import { createPluginsArea, type PluginsArea } from "./areas/plugins.js";
@@ -23,8 +31,6 @@ import {
 } from "./areas/thread-sections.js";
 
 export type * from "./public-types.js";
-// Structured prompt input for the provider's plan action; pass it as
-// `input` to `threads.spawn` / `threads.send` (the CLI's `--plan`).
 export { createBuiltinPlanCommandTextInput } from "@bb/domain";
 
 export interface CreateBbSdkArgs {
@@ -36,12 +42,9 @@ export interface CreateBbSdkWithGuideArgs extends CreateBbSdkArgs {
   guide: GuideArea;
 }
 
-/**
- * Every server-backed SDK area. The Node SDK adds the local `guide` area on
- * top of this; the browser SDK omits it so the generated guide templates
- * (~112 KB of markdown) stay out of the web app's boot chunk.
- */
 export interface BbSdkAreas extends BbRealtime {
+  experimental_desktopBrowsers: ExperimentalDesktopBrowsersArea;
+  experimental_server: ExperimentalServerArea;
   environments: EnvironmentsArea;
   files: FilesArea;
   hosts: HostsArea;
@@ -71,6 +74,8 @@ export function createBbSdk(
     transport: args.transport,
   });
   const areas: BbSdkAreas = {
+    experimental_desktopBrowsers: createDesktopBrowsersArea(sdkContext),
+    experimental_server: createServerArea(sdkContext),
     environments: createEnvironmentsArea(sdkContext),
     files: createFilesArea(sdkContext),
     hosts: createHostsArea(sdkContext),

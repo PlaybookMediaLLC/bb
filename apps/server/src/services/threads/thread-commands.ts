@@ -24,8 +24,11 @@ import {
   LIVE_DAEMON_COMMAND_TIMEOUT_MS,
   startLiveHostCommand,
 } from "../hosts/live-command.js";
-import { getLastProviderThreadId } from "./thread-events.js";
-import type { ThreadForkDescriptor } from "./thread-provisioning-context.js";
+import {
+  getLastProviderThreadId,
+  requireDispatchableProviderThreadId,
+} from "./thread-events.js";
+import type { ThreadForkDescriptor } from "./thread-startup-store.js";
 import {
   resolveThreadRuntimeCommandConfig,
   type ResolvedThreadRuntimeCommandConfig,
@@ -68,8 +71,6 @@ interface ThreadUnarchiveCommandEnvironment {
 export interface ThreadStartCommandArgs {
   environment: ThreadRuntimeCommandEnvironment;
   execution: ResolvedThreadExecutionOptions;
-  // Non-null ⇒ clone the parent's provider session at its branch point (native
-  // fork) instead of starting fresh. null ⇒ a normal start.
   fork: ThreadForkDescriptor | null;
   permissionEscalation: PermissionEscalation;
   input: PromptInput[];
@@ -131,7 +132,6 @@ interface RuntimeExecutionOptionsArgs {
 }
 
 interface BuildExecutionOptionsArgs {
-  /** Machine the work lands on; omit to read it from the thread's environment. */
   hostId?: string | null;
   projectDefaults?: ProjectExecutionDefaults | null;
   threadId: string;
@@ -160,8 +160,6 @@ function providerSupportsThreadRename(
 ): boolean {
   const registration = registry.get(providerId);
   if (!registration) {
-    // Unregistered ids (dynamic/custom ACP agents) keep receiving renames,
-    // exactly as they did before the registry.
     return true;
   }
   return registration.info.capabilities.supportsThreadRename;
@@ -178,11 +176,6 @@ function providerSupportsThreadArchiveForwarding(
   return registration.info.capabilities.supportsThreadArchive;
 }
 
-/**
- * The BB prompt mode this prompt entered, if any. Plan mode is entered through
- * the provider's declared `plan` composer action, so a provider that declares
- * none never sees `promptMode` — the `/plan` text stays an ordinary mention.
- */
 function resolvePromptMode(
   registry: ProviderRegistryService,
   args: { input: PromptInput[]; providerId: string },
@@ -197,11 +190,6 @@ function resolvePromptMode(
     : undefined;
 }
 
-/**
- * Last-mile clamp before the daemon runs the turn. The execution plan already
- * clamps, but a queued message carries the mode it was enqueued with, so the
- * machine's current ceiling is re-applied here.
- */
 function toRuntimeExecutionOptions(
   args: RuntimeExecutionOptionsArgs,
 ): RuntimeThreadExecutionOptions {
@@ -214,10 +202,6 @@ function toRuntimeExecutionOptions(
     input: args.input,
     providerId: args.providerId,
   });
-  // The owning plugin derives its provider-scoped options per command; an
-  // unregistered id (a provider whose plugin is disabled mid-thread) derives
-  // none. A hook that throws fails the command with the plugin named rather
-  // than running the turn with default knobs.
   const providerOptions =
     args.deps.providerRegistry.get(args.providerId)?.deriveProviderOptions({
       threadId: args.threadId,
@@ -281,9 +265,6 @@ export async function buildThreadStartCommand(
   deps: LoggedWorkSessionDeps,
   args: ThreadStartCommandArgs,
 ): Promise<Extract<HostDaemonCommand, { type: "thread.start" }>> {
-  // A graduated provider only has a bridge while its plugin is registered, and
-  // plugins load after the listener starts serving. Wait, or a turn submitted
-  // during that window has no bridgeLaunch to carry and is refused.
   await deps.providerRegistry.whenRegistrationsSettled();
   const runtimeContext = await resolveThreadRuntimeCommandConfig(deps, {
     thread: args.thread,
@@ -297,7 +278,6 @@ export async function buildThreadStartCommand(
     threadId: args.thread.id,
     workspaceContext: workspaceContextFromPath({
       path: runtimeContext.workspacePath,
-      workspaceProvisionType: runtimeContext.workspaceProvisionType,
     }),
     projectId: args.projectId,
     providerId: args.providerId,
@@ -316,6 +296,7 @@ export async function buildThreadStartCommand(
     }),
     instructions: runtimeContext.instructions,
     dynamicTools: runtimeContext.dynamicTools,
+    contributedEnv: runtimeContext.contributedEnv,
     injectedSkillSources: runtimeContext.injectedSkillSources,
     instructionMode: runtimeContext.instructionMode,
     threadStoragePath: runtimeContext.threadStoragePath,
@@ -349,7 +330,6 @@ function buildPreparedTurnSubmitCommandPayload(
     resumeContext: {
       workspaceContext: workspaceContextFromPath({
         path: args.runtimeContext.workspacePath,
-        workspaceProvisionType: args.runtimeContext.workspaceProvisionType,
       }),
       projectId: args.runtimeContext.projectId,
       providerId: args.runtimeContext.providerId,
@@ -357,6 +337,7 @@ function buildPreparedTurnSubmitCommandPayload(
       providerThreadId: args.providerThreadId,
       instructions: args.runtimeContext.instructions,
       dynamicTools: args.runtimeContext.dynamicTools,
+      contributedEnv: args.runtimeContext.contributedEnv,
       injectedSkillSources: args.runtimeContext.injectedSkillSources,
       instructionMode: args.runtimeContext.instructionMode,
     },
@@ -378,7 +359,8 @@ export async function prepareTurnSubmitCommandPayload(
 ): Promise<PreparedTurnSubmitCommandPayload> {
   await deps.providerRegistry.whenRegistrationsSettled();
   const providerThreadId = requireProviderThreadId(
-    args.providerThreadId ?? getLastProviderThreadId(deps, args.thread.id),
+    args.providerThreadId ??
+      requireDispatchableProviderThreadId(deps, args.thread.id),
     args.thread.id,
   );
   const runtimeContext = await resolveThreadRuntimeCommandConfig(deps, {
@@ -533,13 +515,8 @@ export function dispatchArchivedThreadProviderArchiveCommand(
   }
   const workspaceContext = workspaceContextFromPath({
     path: environment.path,
-    workspaceProvisionType: environment.workspaceProvisionType,
   });
 
-  // Archive can have to spawn the provider bridge from scratch (fresh daemon,
-  // reaped idle session), so it carries the same launch spec as thread.start.
-  // Forwarding is best-effort: with no bridge there is nothing to mirror the
-  // archive onto, so skip rather than dispatch a command the daemon rejects.
   const bridgeLaunch = resolveBridgeLaunchForProviderId(
     deps,
     thread.providerId,
@@ -586,9 +563,6 @@ export function dispatchThreadUnarchiveCommand(
     return false;
   }
 
-  // Unarchive always runs on a fresh provider-maintenance runtime, so it can
-  // never reuse a live process and must carry its own launch spec. Same
-  // best-effort rule as archive: no bridge, nothing to unarchive on.
   const bridgeLaunch = resolveBridgeLaunchForProviderId(
     deps,
     args.thread.providerId,
@@ -625,6 +599,17 @@ export function buildThreadStopCommand(
     type: "thread.stop",
     environmentId: args.environmentId,
     intent: args.intent,
+    threadId: args.threadId,
+  };
+}
+
+export function buildThreadStorageDeleteCommand(args: {
+  environmentId: string;
+  threadId: string;
+}): Extract<HostDaemonCommand, { type: "thread.storage.delete" }> {
+  return {
+    type: "thread.storage.delete",
+    environmentId: args.environmentId,
     threadId: args.threadId,
   };
 }

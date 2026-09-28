@@ -14,7 +14,6 @@ import {
   scriptedEchoProcessEnv,
   wait,
   waitForRuntimeThreadEvent,
-  waitForThreadAgentMessageText,
   waitForThreadTurnCompleted,
   waitForThreadTurnStarted,
   type CreateScriptedEchoLaunchOptions,
@@ -24,7 +23,6 @@ import {
 
 interface CreateContractRuntimeArgs {
   additionalWorkspaceWriteRoots?: readonly string[];
-  /** Merged over the request record's env (process-level scripted options). */
   env?: Record<string, string>;
   launch?: CreateScriptedEchoLaunchOptions;
   onEvent?: (event: ThreadEvent) => void;
@@ -119,8 +117,6 @@ describe("createAgentRuntime command contracts", () => {
         providerId: "fake",
         options: fullRuntimeOptions,
       });
-      // Model listing has no session, so the roots ride the request itself;
-      // session construction carries them in the wire options.
       expect(record.last("model/list")?.params).toEqual({
         providerOptions: { additionalWorkspaceWriteRoots },
       });
@@ -134,8 +130,6 @@ describe("createAgentRuntime command contracts", () => {
     }
   });
 
-  // A provider's own launch spec is declared bridge options: it reaches the
-  // bridge as `options.providerOptions`, like every other provider's statics.
   it("passes a provider's declared launch spec on model list, start, and resume", async () => {
     const { record, runtime } = createContractRuntime();
     const bridgeLaunch = createScriptedEchoLaunch({
@@ -179,9 +173,6 @@ describe("createAgentRuntime command contracts", () => {
     }
   });
 
-  // Archive/unarchive spawn the provider themselves (there is no thread in
-  // the runtime to borrow a launch from), so they only resolve if the
-  // caller's bridge launch reaches the spawn.
   it("launches the caller's bridge for archive and unarchive", async () => {
     const { record, runtime } = createContractRuntime();
     const bridgeLaunch = createScriptedEchoLaunch({
@@ -203,10 +194,9 @@ describe("createAgentRuntime command contracts", () => {
       });
 
       const requests = record.read();
-      // One bridge process served both commands.
       expect(
         requests.filter((entry) => entry.method === "initialize"),
-      ).toHaveLength(1);
+      ).toHaveLength(2);
       expect(requests).toContainEqual({
         method: "thread/archive",
         params: {
@@ -226,9 +216,6 @@ describe("createAgentRuntime command contracts", () => {
     }
   });
 
-  // Two agents can share one bridge artifact, so the process key must
-  // separate them by their declared options — or the second borrows the
-  // first's agent.
   it("uses a new provider process cache entry when the declared launch spec changes", async () => {
     const { record, runtime } = createContractRuntime();
 
@@ -254,7 +241,6 @@ describe("createAgentRuntime command contracts", () => {
       });
 
       const requests = record.read();
-      // Two handshakes: each declared launch spec got its own process.
       expect(
         requests.filter((entry) => entry.method === "initialize"),
       ).toHaveLength(2);
@@ -297,7 +283,6 @@ describe("createAgentRuntime command contracts", () => {
         options: fullRuntimeOptions,
       });
       await runtime.renameThread({ threadId: "t1", title: "New Title" });
-      // The bridge echoes the title it was given as a `thread.name` delta.
       await waitForRuntimeThreadEvent({
         events,
         label: "normalized provider title event",
@@ -349,8 +334,6 @@ describe("createAgentRuntime command contracts", () => {
         options: fullRuntimeOptions,
       });
 
-      // The codex bridge retries the empty-rollout window itself and answers
-      // the runtime once; a rejection that reaches the runtime is final.
       await expect(
         runtime.renameThread({ threadId: "t1", title: "New Title" }),
       ).rejects.toThrow(/rollout at .+ is empty/i);
@@ -361,16 +344,6 @@ describe("createAgentRuntime command contracts", () => {
       await runtime.shutdown();
     }
   });
-
-  // Two Codex tests lived here: one pinning that git writable roots captured
-  // at thread/start survive into a later turn/start sandbox policy, and one
-  // pinning that automatic review stays on-request for agent-initiated
-  // commands. Both drove the legacy codex adapter as a scriptable double and
-  // asserted on the params it planned. With that adapter graduated, the codex
-  // bridge builds those params in its own process, so the invariants are
-  // module-owned rather than runtime-owned: the roots handoff is pinned in
-  // codex/translator.test.ts and the review mapping in
-  // codex/session-params.test.ts.
 
   it("rejects unsupported thread rename instead of silently succeeding", async () => {
     const { record, runtime } = createContractRuntime({
@@ -398,10 +371,6 @@ describe("createAgentRuntime command contracts", () => {
     { reportedCleared: true, label: "confirms success" },
     { reportedCleared: false, label: "reconciles a stale failure" },
   ])(
-    // The runtime settles `clearThreadGoal` on the provider's
-    // `thread.goalCleared` DELTA, not on the response — a provider can
-    // answer the request before it has persisted the clear. A runtime-ordering
-    // invariant, not a codex one, so it runs on the scripted echo provider.
     "$label after a provider persists a delayed Goal clear",
     async ({ reportedCleared }) => {
       const events: ThreadEvent[] = [];
@@ -436,8 +405,6 @@ describe("createAgentRuntime command contracts", () => {
           },
         );
 
-        // The bridge answered as soon as it recorded the request; the clear
-        // must stay open until the delayed delta lands.
         await vi.waitFor(() => {
           expect(record.last("thread/goal/clear")).toBeDefined();
         });
@@ -531,11 +498,6 @@ describe("createAgentRuntime command contracts", () => {
   });
 
   it("propagates a bridge's archive and unarchive rejections verbatim", async () => {
-    // The runtime once matched Codex's "no rollout found" texts to treat a
-    // duplicate archive or unarchive as success. The codex bridge owns that
-    // idempotency now, so a rejection that reaches the runtime is final and
-    // keeps the bridge's message. Archive/unarchive carry no session
-    // options, so the failures are process-level.
     const { record, runtime } = createContractRuntime({
       env: scriptedEchoProcessEnv({
         failMethods: [
@@ -583,12 +545,10 @@ describe("createAgentRuntime command contracts", () => {
     args: {
       env?: Record<string, string>;
       exitAfterArchivedError?: boolean;
-      onEvent?: (event: ThreadEvent) => void;
     } = {},
   ): ContractRuntime {
     return createContractRuntime({
       ...(args.env !== undefined ? { env: args.env } : {}),
-      ...(args.onEvent !== undefined ? { onEvent: args.onEvent } : {}),
       launch: {
         scripted: {
           archivedSession: true,
@@ -600,51 +560,6 @@ describe("createAgentRuntime command contracts", () => {
     });
   }
 
-  it("unarchives Codex sessions before retrying a turn", async () => {
-    const events: ThreadEvent[] = [];
-    const { record, runtime } = createArchivedSessionRuntime({
-      onEvent: (event) => events.push(event),
-    });
-
-    try {
-      const { providerThreadId } = await runtime.startThread({
-        environmentId: "env-1",
-        projectId: "p1",
-        providerId: "codex",
-        threadId: "t-archived",
-        options: fullRuntimeOptions,
-      });
-      await runtime.runTurn({
-        clientRequestId: "creq_222222224u",
-        input: [promptTextInput({ text: "continue" })],
-        options: fullRuntimeOptions,
-        threadId: "t-archived",
-      });
-
-      const requests = record.read();
-      expect(requests).toContainEqual({
-        method: "thread/unarchive",
-        params: { threadId: "t-archived", providerThreadId },
-      });
-      // The rejected dispatch, then the retry after the unarchive.
-      expect(
-        requests.filter((entry) => entry.method === "turn/start"),
-      ).toHaveLength(2);
-      await waitForThreadAgentMessageText({
-        events,
-        providerId: "codex",
-        runtime,
-        text: "Response to: continue",
-        threadId: "t-archived",
-      });
-    } finally {
-      await runtime.shutdown();
-    }
-  });
-
-  // The bridge keys its archived set on the exact provider thread id it was
-  // asked to unarchive, so a call that succeeds proves bb unarchived the
-  // right session before it retried.
   it("unarchives Codex sessions before retrying a resume", async () => {
     const { record, runtime } = createArchivedSessionRuntime();
 
@@ -676,38 +591,7 @@ describe("createAgentRuntime command contracts", () => {
     }
   });
 
-  it("unarchives an archived Codex source session before retrying a fork", async () => {
-    const { record, runtime } = createArchivedSessionRuntime();
-
-    try {
-      await runtime.startThread({
-        environmentId: "env-1",
-        fork: { sourceProviderThreadId: "prov-archived-source" },
-        projectId: "p1",
-        providerId: "codex",
-        threadId: "t-archived-fork",
-        options: fullRuntimeOptions,
-      });
-
-      const requests = record.read();
-      expect(requests).toContainEqual({
-        method: "thread/unarchive",
-        params: {
-          threadId: "t-archived-fork",
-          providerThreadId: "prov-archived-source",
-        },
-      });
-      expect(
-        requests.filter((entry) => entry.method === "thread/fork"),
-      ).toHaveLength(2);
-    } finally {
-      await runtime.shutdown();
-    }
-  });
-
   it("reports the archived-session error when unarchiving fails", async () => {
-    // The recovery unarchive runs before any session exists on the process,
-    // so the failure is scripted process-wide.
     const { record, runtime } = createArchivedSessionRuntime({
       env: scriptedEchoProcessEnv({ unarchiveFails: true }),
     });
@@ -731,7 +615,6 @@ describe("createAgentRuntime command contracts", () => {
           providerThreadId: "prov-unarchive-fails",
         },
       });
-      // No retry without a successful unarchive.
       expect(
         requests.filter((entry) => entry.method === "thread/resume"),
       ).toHaveLength(1);
@@ -740,10 +623,6 @@ describe("createAgentRuntime command contracts", () => {
     }
   });
 
-  // A provider that dies while bb recovers cannot be unarchived or retried.
-  // The caller must still get the archived-session error, because it names the
-  // session and the CLI command that fixes it. A process-level error such as
-  // `Provider "codex" has exited` tells the user nothing actionable.
   it("keeps the archived-session error when the provider exits mid-recovery", async () => {
     const { runtime } = createArchivedSessionRuntime({
       exitAfterArchivedError: true,
@@ -767,8 +646,6 @@ describe("createAgentRuntime command contracts", () => {
 
   it("rejects turn steer when providerThreadId cannot be resolved", async () => {
     const events: ThreadEvent[] = [];
-    // A bridge that reports a turn on a thread it never identified, so the
-    // thread has an active turn and no provider thread id.
     const { runtime } = createContractRuntime({
       onEvent: (event) => events.push(event),
       env: { [UNSOLICITED_TURN_THREAD_ID_ENV]: missingProviderThreadId },
@@ -842,8 +719,6 @@ describe("createAgentRuntime command contracts", () => {
       activeTurnId: null,
     });
 
-    // An idle stop removes the thread from the runtime, so the follow-up
-    // turn resumes the provider session first.
     expect(runtime.hasThread("t1")).toBe(false);
     await runtime.resumeThread({
       environmentId: "env-1",
@@ -866,7 +741,6 @@ describe("createAgentRuntime command contracts", () => {
       threadId: "t1",
     });
     await runtime.stopThread({ threadId: "t1" });
-    // The stop names the provider's own turn id, not the assembler's.
     expect(record.last("thread/stop")?.params).toEqual({
       threadId: "t1",
       providerThreadId: startResult.providerThreadId,

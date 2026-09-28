@@ -1,15 +1,18 @@
 import { changedMessageSchema, type ThreadChangedMessage } from "@bb/domain";
 import { getThread, markThreadDeleted } from "@bb/db";
+import { HOST_RECONNECT_GRACE_MS } from "../../src/constants.js";
 import { describe, expect, it, vi } from "vitest";
 import {
   handleDaemonSocketClosed,
   handleHostRemoved,
 } from "../../src/internal/session-owner-side-effects.js";
 import { createMockHubSocket } from "../helpers/mock-hub-socket.js";
+import { onDaemonSocketOpen } from "../../src/ws/daemon-protocol.js";
 import {
   seedEnvironment,
   seedHostSession,
   seedProjectWithSource,
+  seedSession,
   seedThread,
 } from "../helpers/seed.js";
 import { withTestHarness, type TestAppHarness } from "../helpers/test-app.js";
@@ -79,11 +82,6 @@ function seedHostThreads(
   );
 }
 
-/**
- * Drizzle and the raw data helpers prepare every statement through the
- * better-sqlite3 client, so the number of `prepare` calls is the number of
- * SQL statements `work` issued.
- */
 function countPreparedStatements(
   harness: TestAppHarness,
   work: () => void,
@@ -111,6 +109,20 @@ function statusChangedMessagesFor(
   });
 }
 
+function hostDisconnectedMessagesFor(
+  messages: readonly string[],
+  hostId: string,
+): string[] {
+  return messages.filter((raw) => {
+    const message = changedMessageSchema.parse(JSON.parse(raw));
+    return (
+      message.entity === "host" &&
+      message.id === hostId &&
+      message.changes.includes("host-disconnected")
+    );
+  });
+}
+
 function lastStatusChange(
   messages: readonly string[],
   threadId: string,
@@ -124,39 +136,123 @@ function lastStatusChange(
 }
 
 describe("host thread runtime status notifications", () => {
-  it("carries a statusChange snapshot for the active host threads when the daemon socket closes", async () => {
+  it("keeps a closed daemon socket hidden until the reconnect grace ends, without interrupting the thread", async () => {
     await withTestHarness(async (harness) => {
       const fixture = seedHostThreadsFixture(harness, 1);
       const socket = createMockHubSocket();
       harness.hub.subscribe(socket, { kind: "thread-list" });
+      harness.hub.subscribe(socket, { kind: "host-list" });
 
-      handleDaemonSocketClosed(harness.deps, { sessionId: fixture.sessionId });
-      // The disconnect schedules the grace callbacks with real timers; drop
-      // them so the harness does not fire interruptions after cleanup.
-      harness.hub.cancelPendingDaemonDisconnect(fixture.sessionId);
+      vi.useFakeTimers();
+      try {
+        handleDaemonSocketClosed(harness.deps, {
+          sessionId: fixture.sessionId,
+        });
+        expect(
+          lastStatusChange(socket.messages, fixture.activeThreadId).metadata
+            ?.statusChange,
+        ).toMatchObject({
+          status: "active",
+          runtime: { displayStatus: "active" },
+        });
+        expect(
+          lastStatusChange(socket.messages, fixture.idleThreadId).metadata
+            ?.statusChange,
+        ).toBeUndefined();
+        const hostChangesBeforeGraceEnd = hostDisconnectedMessagesFor(
+          socket.messages,
+          fixture.hostId,
+        ).length;
 
-      // Host connectivity only changes an active row's displayed runtime. A
-      // bare notification there would make every client refetch every active
-      // thread list; the snapshot is what lets them patch the row in place.
-      const activeMessage = lastStatusChange(
-        socket.messages,
-        fixture.activeThreadId,
-      );
-      expect(activeMessage.metadata?.statusChange).toMatchObject({
-        status: "active",
-        runtime: {
-          displayStatus: "host-reconnecting",
-          hostReconnectGraceExpiresAt: expect.any(Number),
-        },
+        vi.advanceTimersByTime(HOST_RECONNECT_GRACE_MS);
+
+        expect(
+          lastStatusChange(socket.messages, fixture.activeThreadId).metadata
+            ?.statusChange,
+        ).toMatchObject({
+          status: "active",
+          runtime: {
+            displayStatus: "waiting-for-host",
+          },
+        });
+        expect(
+          hostDisconnectedMessagesFor(socket.messages, fixture.hostId),
+        ).toHaveLength(hostChangesBeforeGraceEnd + 1);
+        expect(getThread(harness.db, fixture.activeThreadId)?.status).toBe(
+          "active",
+        );
+      } finally {
+        harness.hub.cancelPendingDaemonDisconnect(fixture.sessionId);
+        vi.useRealTimers();
+      }
+    });
+  });
+
+  it("tells clients a disconnected host's threads are active again when its daemon reconnects", async () => {
+    await withTestHarness(async (harness) => {
+      const fixture = seedHostThreadsFixture(harness, 6);
+      const socket = createMockHubSocket();
+      harness.hub.subscribe(socket, { kind: "thread-list" });
+
+      vi.useFakeTimers();
+      try {
+        handleDaemonSocketClosed(harness.deps, {
+          sessionId: fixture.sessionId,
+        });
+        vi.advanceTimersByTime(HOST_RECONNECT_GRACE_MS);
+      } finally {
+        vi.useRealTimers();
+      }
+      expect(
+        lastStatusChange(socket.messages, fixture.activeThreadId).metadata
+          ?.statusChange?.runtime.displayStatus,
+      ).toBe("waiting-for-host");
+
+      const reconnected = seedSession(harness.deps, fixture.hostId);
+      onDaemonSocketOpen(harness.deps, {
+        hostId: fixture.hostId,
+        sessionId: reconnected.id,
+        socket: createMockHubSocket(),
       });
-      // An idle row renders the same whether or not its host is connected, so
-      // it keeps the bare notification it always received rather than a
-      // snapshot that costs per-thread queries and bytes on every disconnect.
-      const idleMessage = lastStatusChange(
-        socket.messages,
-        fixture.idleThreadId,
-      );
-      expect(idleMessage.metadata?.statusChange).toBeUndefined();
+
+      expect(
+        lastStatusChange(socket.messages, fixture.activeThreadId).metadata
+          ?.statusChange,
+      ).toMatchObject({
+        status: "active",
+        runtime: { displayStatus: "active" },
+      });
+    });
+  });
+
+  it("never shows a disconnect for a daemon that reconnects within the reconnect grace", async () => {
+    await withTestHarness(async (harness) => {
+      const fixture = seedHostThreadsFixture(harness, 5);
+      const socket = createMockHubSocket();
+      harness.hub.subscribe(socket, { kind: "thread-list" });
+
+      vi.useFakeTimers();
+      try {
+        handleDaemonSocketClosed(harness.deps, {
+          sessionId: fixture.sessionId,
+        });
+        vi.advanceTimersByTime(HOST_RECONNECT_GRACE_MS - 1_000);
+        const reconnected = seedSession(harness.deps, fixture.hostId);
+        harness.hub.registerDaemon(
+          reconnected.id,
+          fixture.hostId,
+          createMockHubSocket(),
+        );
+        vi.advanceTimersByTime(HOST_RECONNECT_GRACE_MS);
+      } finally {
+        vi.useRealTimers();
+      }
+
+      expect(
+        statusChangedMessagesFor(socket.messages, fixture.activeThreadId).map(
+          (message) => message.metadata?.statusChange?.runtime.displayStatus,
+        ),
+      ).toEqual(["active"]);
     });
   });
 
@@ -177,7 +273,6 @@ describe("host thread runtime status notifications", () => {
         fixture: large,
         status: "idle",
       });
-      // Joined to the host like any other row, but never rendered: no snapshot.
       const deletedActiveThread = seedThread(harness.deps, {
         projectId: large.projectId,
         environmentId: large.environmentId,
@@ -201,9 +296,6 @@ describe("host thread runtime status notifications", () => {
       );
       harness.hub.cancelPendingDaemonDisconnect(small.sessionId);
 
-      // The daemon WebSocket close handler runs this synchronously on the
-      // event loop: the snapshot inputs must come from a fixed handful of
-      // batched statements, not ~6 statements per thread on the host.
       expect(largeStatements).toBe(smallStatements);
 
       for (const threadId of largeActiveThreadIds) {
@@ -211,7 +303,7 @@ describe("host thread runtime status notifications", () => {
           lastStatusChange(largeMessages, threadId).metadata?.statusChange,
         ).toMatchObject({
           status: "active",
-          runtime: { displayStatus: "host-reconnecting" },
+          runtime: { displayStatus: "active" },
         });
       }
       for (const threadId of [...largeIdleThreadIds, deletedActiveThread.id]) {
@@ -236,10 +328,6 @@ describe("host thread runtime status notifications", () => {
         sessionId: fixture.sessionId,
       });
 
-      // Removal interrupts the active thread (run.failed) before the runtime
-      // fan-out. The interruption publishes the settled error snapshot; by the
-      // time the fan-out runs the row is no longer active, so it gets the same
-      // bare notification as every other non-active thread on the host.
       const activeSnapshots = statusChangedMessagesFor(
         socket.messages,
         fixture.activeThreadId,
@@ -248,11 +336,11 @@ describe("host thread runtime status notifications", () => {
       );
       expect(activeSnapshots.length).toBeGreaterThan(0);
       expect(getThread(harness.db, fixture.activeThreadId)?.status).toBe(
-        "error",
+        "idle",
       );
       expect(activeSnapshots.at(-1)).toMatchObject({
-        status: "error",
-        runtime: { displayStatus: "error" },
+        status: "idle",
+        runtime: { displayStatus: "idle" },
       });
       expect(
         lastStatusChange(socket.messages, fixture.idleThreadId).metadata

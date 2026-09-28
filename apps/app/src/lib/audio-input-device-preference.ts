@@ -12,8 +12,7 @@ function isStoredAudioInputDeviceId(
   value: string,
 ): value is NonNullable<PreferredAudioInputDeviceId> {
   return (
-    value.trim().length > 0 &&
-    value.length <= MAX_AUDIO_INPUT_DEVICE_ID_LENGTH
+    value.trim().length > 0 && value.length <= MAX_AUDIO_INPUT_DEVICE_ID_LENGTH
   );
 }
 
@@ -53,6 +52,30 @@ export function buildAudioInputConstraints(
       deviceId: { exact: preferredDeviceId },
     },
   };
+}
+
+export async function requestAudioInputStream(
+  mediaDevices: Pick<MediaDevices, "getUserMedia">,
+  preferredDeviceId: PreferredAudioInputDeviceId,
+): Promise<MediaStream> {
+  try {
+    return await mediaDevices.getUserMedia(
+      buildAudioInputConstraints(preferredDeviceId),
+    );
+  } catch (error) {
+    if (
+      preferredDeviceId === null ||
+      !(error instanceof DOMException) ||
+      ![
+        "OverconstrainedError",
+        "NotFoundError",
+        "DevicesNotFoundError",
+      ].includes(error.name)
+    ) {
+      throw error;
+    }
+    return mediaDevices.getUserMedia({ audio: true });
+  }
 }
 
 export function useAudioInputDevicePreference() {

@@ -1,24 +1,43 @@
 import { describe, expect, it } from "vitest";
-import { turnScope } from "@bb/domain";
 import {
   TURN_1,
   createClaudeDeltaHarness,
   loadFixture,
+  turnScope,
 } from "./delta-test-harness.js";
 
-/**
- * Token usage, context-window usage, and fixture-driven translation on the
- * delta path — the claude event-translation usage shard, ported through
- * deltas and a real assembler. Cumulative token accumulation moved to the
- * assembler; per-segment usage rides the `usage.turn` delta, so the running
- * totals asserted here now come out of central accumulation.
- *
- * The fixture cases additionally keep src/__fixtures__/*.json reachable;
- * without them those fixtures would be orphaned.
- */
-
 describe("claude usage and fixture translation (delta path)", () => {
-  // -- translate: real SDK fixtures ------------------------------------------
+  it.each([
+    [{}, {}],
+    [{ cache_read_input_tokens: 0 }, { cacheReadInputTokens: 0 }],
+    [{ cache_creation_input_tokens: 0 }, { cacheWriteInputTokens: 0 }],
+    [{ cache_read_input_tokens: 31 }, { cacheReadInputTokens: 31 }],
+    [{ cache_creation_input_tokens: 9 }, { cacheWriteInputTokens: 9 }],
+  ])(
+    "preserves independently omitted Claude cache counts %j",
+    (counts, expected) => {
+      const harness = createClaudeDeltaHarness();
+      harness.translate(loadFixture("assistant-text.json"));
+      const fixture = loadFixture("result-success.json");
+      const events = harness.translate({
+        ...fixture,
+        usage: { input_tokens: 80, output_tokens: 20, ...counts },
+      });
+      const event = events.find(
+        (event) => event.type === "thread/tokenUsage/updated",
+      );
+      expect(event).toBeDefined();
+      expect(event?.tokenUsage.last).toMatchObject(expected);
+      expect(
+        Object.keys(event?.tokenUsage.last ?? {})
+          .filter(
+            (key) =>
+              key === "cacheReadInputTokens" || key === "cacheWriteInputTokens",
+          )
+          .sort(),
+      ).toEqual(Object.keys(expected).sort());
+    },
+  );
 
   it("fixture: assistant-text produces turn/started + item/completed agentMessage", () => {
     const harness = createClaudeDeltaHarness();
@@ -41,11 +60,134 @@ describe("claude usage and fixture translation (delta path)", () => {
     );
   });
 
+  it("emits context-window usage on a top-level assistant message", () => {
+    const harness = createClaudeDeltaHarness();
+    const threadId = "bb-thread-1";
+
+    harness.translator.setClaudeModelContextWindowHint(
+      threadId,
+      "claude-opus-4-7[1m]",
+    );
+    const events = harness.translate(
+      {
+        type: "assistant",
+        message: {
+          type: "message",
+          role: "assistant",
+          content: [],
+          usage: {
+            input_tokens: 1,
+            cache_read_input_tokens: 49_000,
+            cache_creation_input_tokens: 999,
+            output_tokens: 120,
+          },
+        },
+      },
+      { threadId },
+    );
+
+    expect(events).toContainEqual(
+      expect.objectContaining({
+        type: "thread/contextWindowUsage/updated",
+        contextWindowUsage: {
+          usedTokens: 50_000,
+          modelContextWindow: 1_000_000,
+          estimated: true,
+        },
+      }),
+    );
+    expect(events).not.toContainEqual(
+      expect.objectContaining({ type: "turn/completed" }),
+    );
+  });
+
+  it("does not use nested assistant usage as the parent context window", () => {
+    const harness = createClaudeDeltaHarness();
+    const threadId = "bb-thread-1";
+
+    harness.translator.setClaudeModelContextWindowHint(
+      threadId,
+      "claude-opus-4-7[1m]",
+    );
+    harness.translate(
+      {
+        type: "assistant",
+        message: {
+          type: "message",
+          role: "assistant",
+          content: [],
+          usage: {
+            input_tokens: 1,
+            cache_read_input_tokens: 49_000,
+            cache_creation_input_tokens: 999,
+            output_tokens: 120,
+          },
+        },
+      },
+      { threadId },
+    );
+
+    const nestedEvents = harness.translate(
+      {
+        type: "assistant",
+        message: {
+          type: "message",
+          role: "assistant",
+          content: [],
+          usage: {
+            input_tokens: 1,
+            cache_read_input_tokens: 4_000,
+            cache_creation_input_tokens: 999,
+            output_tokens: 20,
+          },
+        },
+      },
+      { threadId, parentToolCallId: "parent-tool-1" },
+    );
+    expect(nestedEvents).not.toContainEqual(
+      expect.objectContaining({
+        type: "thread/contextWindowUsage/updated",
+      }),
+    );
+
+    const resultEvents = harness.translate(
+      {
+        type: "result",
+        subtype: "success",
+        duration_ms: 1,
+        duration_api_ms: 1,
+        is_error: false,
+        num_turns: 1,
+        result: "ok",
+        stop_reason: "end_turn",
+        total_cost_usd: 0,
+        usage: {
+          input_tokens: 1,
+          cache_read_input_tokens: 49_000,
+          cache_creation_input_tokens: 999,
+          output_tokens: 120,
+        },
+        session_id: "session-1",
+      },
+      { threadId },
+    );
+
+    expect(resultEvents).toContainEqual(
+      expect.objectContaining({
+        type: "thread/contextWindowUsage/updated",
+        contextWindowUsage: {
+          usedTokens: 50_000,
+          modelContextWindow: 1_000_000,
+          estimated: true,
+        },
+      }),
+    );
+  });
+
   it("fixture: assistant-tool-use produces agentMessage + commandExecution item", () => {
     const harness = createClaudeDeltaHarness();
     const events = harness.translate(loadFixture("assistant-tool-use.json"));
 
-    // Should have turn/started, item/completed (text), item/started (tool)
     expect(events).toContainEqual(
       expect.objectContaining({ type: "turn/started" }),
     );
@@ -91,13 +233,10 @@ describe("claude usage and fixture translation (delta path)", () => {
 
   it("fixture: stream-text-delta produces agentMessage delta", () => {
     const harness = createClaudeDeltaHarness();
-    // Start a turn first
     harness.translate(loadFixture("assistant-text.json"));
 
     const events = harness.translate(loadFixture("stream-text-delta.json"));
 
-    // The canonical grammar opens a delta-first assistant item with a
-    // synthetic item/started before its first delta.
     expect(events).toContainEqual(
       expect.objectContaining({
         type: "item/started",
@@ -114,7 +253,6 @@ describe("claude usage and fixture translation (delta path)", () => {
 
   it("fixture: user-tool-result produces commandExecution completed", () => {
     const harness = createClaudeDeltaHarness();
-    // Start a turn first
     harness.translate(loadFixture("assistant-text.json"));
 
     const events = harness.translate(loadFixture("user-tool-result.json"));
@@ -132,7 +270,6 @@ describe("claude usage and fixture translation (delta path)", () => {
 
   it("fixture: user-tool-result-generic produces toolCall completed", () => {
     const harness = createClaudeDeltaHarness();
-    // Start a turn first
     harness.translate(loadFixture("assistant-text.json"));
 
     const events = harness.translate(
@@ -150,11 +287,8 @@ describe("claude usage and fixture translation (delta path)", () => {
     );
   });
 
-  // -- usage and context window ---------------------------------------------
-
   it("fixture: result-success produces request context usage, token usage, and turn/completed", () => {
     const harness = createClaudeDeltaHarness();
-    // Start a turn first
     harness.translate(loadFixture("assistant-text.json"));
 
     const events = harness.translate(loadFixture("result-success.json"));
@@ -363,23 +497,21 @@ describe("claude usage and fixture translation (delta path)", () => {
       inputTokens: 8420,
       outputTokens: 1253,
       cachedInputTokens: 7012,
+      cacheReadInputTokens: 6500,
+      cacheWriteInputTokens: 512,
     });
     expect(secondTokenUsage?.tokenUsage.total).toMatchObject({
       totalTokens: 33370,
       inputTokens: 16840,
       outputTokens: 2506,
       cachedInputTokens: 14024,
+      cacheReadInputTokens: 13000,
+      cacheWriteInputTokens: 1024,
     });
     expect(secondTokenUsage?.tokenUsage.last).toEqual(
       firstTokenUsage?.tokenUsage.last,
     );
   });
-
-  // The four cases below pin the translator's use of sdk-extraction.ts's
-  // resolveClaudeModelContextWindowHint. The canonical bridge calls
-  // setClaudeModelContextWindowHint from session construction and from the
-  // live model change; that the bridge really calls it is pinned separately
-  // in bridge/__tests__/bridge.test.ts.
 
   it("falls back to a model-based context window when Claude omits modelUsage.contextWindow", () => {
     const harness = createClaudeDeltaHarness();

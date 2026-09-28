@@ -5,6 +5,7 @@ import {
   HEARTBEAT_REQUEST,
   HEARTBEAT_RESPONSE,
   TUNNEL_PROTOCOL_QUERY_PARAM,
+  TUNNEL_REPLACED_CLOSE_REASON,
   decodeFrame,
   encodeFrame,
   type Frame,
@@ -20,34 +21,25 @@ export interface Env {
   BETTER_AUTH_SECRET: string;
   ACCOUNT_APP_URL?: string;
   CLOUD_DEV?: string;
-  /**
-   * Android signing-cert SHA-256 fingerprints for `/.well-known/assetlinks.json`
-   * (comma-separated). Unset → the file serves an empty list (iOS universal
-   * links are unaffected).
-   */
   ASSETLINKS_SHA256_FINGERPRINTS?: string;
 }
 
 const TUNNEL_TAG = "tunnel";
+const TUNNEL_OPENED_AT_KEY = "tunnelOpenedAt";
+const TUNNEL_CLOSED_AT_KEY = "tunnelClosedAt";
+const TUNNEL_LOST_AT_KEY = "tunnelLostAt";
+const VANISHED_TUNNEL_GRACE_MS = 5_000;
+const TUNNEL_RETURN_GRACE_MS = 15_000;
 const RESP_HEAD_TIMEOUT_MS = 30_000;
-// Refresh the server's last_seen_at while a tunnel is connected so the
-// dashboard shows accurate presence. Alarm-driven (auto-response pings don't
-// run JS), kept under the 90s offline window.
 const PRESENCE_INTERVAL_MS = 50_000;
+const CLEAN_CLOSE_CODE = 1000;
 
-// Standard WebSocket readyState numbering (workerd's READY_STATE_OPEN; the
-// constant itself is Cloudflare-only, so tests in Node use the number).
 const WS_READY_STATE_OPEN = 1;
 
-/**
- * DO → gate marker on the offline 503. Lets the gate distinguish "no tunnel
- * connected" (infra offline — render the styled page for browser navigations)
- * from an origin app that happens to answer 503 through a live tunnel. The 503
- * body stays plain text; this is a routing hint only.
- */
 export const TUNNEL_OFFLINE_HEADER = "x-bb-tunnel-offline";
+export const TUNNEL_RESTART_REASON =
+  "the tunnel socket disappeared without a close; restarting this object";
 
-/** Headers that must not be forwarded in either direction. */
 const HOP_HEADERS = new Set([
   "connection",
   "keep-alive",
@@ -74,7 +66,6 @@ function readTunnelTarget(headers: Headers): string | undefined {
   return value !== null && value !== "" ? value : undefined;
 }
 
-/** Parse client protocol version from dial query; missing/unparsable → 0. */
 export function parseClientProtocolVersion(raw: string | null): number {
   if (raw === null || raw === "") return 0;
   const n = Number.parseInt(raw, 10);
@@ -87,33 +78,21 @@ const PORT_SHARE_TOO_OLD =
 
 interface PendingHttp {
   resolve: (response: Response) => void;
-  /** Set once resp-head arrives and the body stream exists. */
   writer: WritableStreamDefaultWriter<Uint8Array> | null;
-  /** Serializes body writes so chunk order is preserved without blocking the socket handler. */
   writeChain: Promise<void>;
   timeout: ReturnType<typeof setTimeout>;
 }
 
-/**
- * One TunnelDO instance per routing label. The tunnel client
- * holds one WebSocket tagged `tunnel`; each visitor WebSocket is tagged
- * `visitor:<streamId>` with the id also in its attachment so the mapping
- * survives hibernation. In-flight HTTP requests live in instance memory only —
- * an in-flight request keeps the DO active, so that state cannot be lost to
- * hibernation while it matters.
- */
 export class TunnelDO {
   private readonly pendingHttp = new Map<number, PendingHttp>();
+  private readonly tunnelWaiters = new Set<() => void>();
   private nextStreamId: number;
-  /** Client protocol version from the dial (`?v=`); 0 = pre-port-sharing. */
   private clientProtocolVersion = 0;
 
   constructor(
     private readonly state: DurableObjectState,
     private readonly env: Env,
   ) {
-    // Resume stream-id allocation above any visitor sockets that survived
-    // hibernation so ids are never reused while a socket still holds one.
     let maxSeen = 0;
     for (const ws of this.state.getWebSockets()) {
       const attachment = ws.deserializeAttachment() as {
@@ -126,7 +105,6 @@ export class TunnelDO {
     this.state.setWebSocketAutoResponse(
       new WebSocketRequestResponsePair(HEARTBEAT_REQUEST, HEARTBEAT_RESPONSE),
     );
-    // Restore protocol version after hibernation (in-memory is wiped).
     this.state.blockConcurrencyWhile(async () => {
       const stored = await this.state.storage.get<number>("protocolVersion");
       if (
@@ -156,24 +134,35 @@ export class TunnelDO {
         ),
       );
     }
-    // Internal control channel — only reachable via the cross-script DO binding
-    // (the gate rejects external /__ paths). Used to sever a live tunnel the
-    // instant the owner revokes, without waiting for a reconnect.
     if (url.pathname === "/__control/close") {
+      void this.state.storage.put(TUNNEL_CLOSED_AT_KEY, Date.now());
+      void this.state.storage.delete(TUNNEL_LOST_AT_KEY);
       for (const ws of this.state.getWebSockets(TUNNEL_TAG))
         ws.close(1000, "revoked by owner");
       void this.state.storage.delete("serverId");
       void this.state.storage.delete("machineId");
       void this.state.storage.delete("protocolVersion");
       this.clientProtocolVersion = 0;
+      this.wakeTunnelWaiters();
       return new Response(null, { status: 204 });
     }
 
     const tunnel = this.tunnelSocket();
     if (!tunnel) {
-      return this.offlineResponse();
+      return this.awaitReturningTunnel().then((returned) =>
+        returned
+          ? this.forwardVisitor(request, url, returned)
+          : this.offlineResponse(),
+      );
     }
+    return this.forwardVisitor(request, url, tunnel);
+  }
 
+  private forwardVisitor(
+    request: Request,
+    url: URL,
+    tunnel: WebSocket,
+  ): Response | Promise<Response> {
     const target = readTunnelTarget(request.headers);
     if (target !== undefined && this.clientProtocolVersion < 1) {
       return new Response(`bb connect: ${PORT_SHARE_TOO_OLD}\n`, {
@@ -189,12 +178,6 @@ export class TunnelDO {
   }
 
   private tunnelSocket(): WebSocket | null {
-    // A tunnel socket can die without webSocketClose ever being delivered
-    // (abrupt network drop), leaving it tagged but unusable — send() on it
-    // throws. And after a reconnect the runtime can briefly list both the
-    // stale socket and the replacement. Pick the most recently accepted OPEN
-    // socket; a dead-but-lingering socket must read as "offline", never be
-    // proxied to (that turns every visitor request into an uncaught 1101).
     const sockets = this.state.getWebSockets(TUNNEL_TAG);
     for (let i = sockets.length - 1; i >= 0; i--) {
       if (sockets[i].readyState === WS_READY_STATE_OPEN) return sockets[i];
@@ -202,11 +185,6 @@ export class TunnelDO {
     return null;
   }
 
-  /**
-   * send() throws once the socket is closing/closed, and that can race any
-   * liveness check. Returns false instead of throwing so callers degrade to
-   * their offline path rather than crashing the request.
-   */
   private trySend(
     tunnel: WebSocket,
     data: ArrayBuffer | ArrayBufferView | string,
@@ -232,7 +210,6 @@ export class TunnelDO {
     );
   }
 
-  /** Bump the connected server or machine's last_seen_at. */
   private async markPresence(): Promise<void> {
     const serverId = await this.state.storage.get<string>("serverId");
     const machineId = await this.state.storage.get<string>("machineId");
@@ -252,13 +229,54 @@ export class TunnelDO {
           .where(eq(server.id, serverId))
           .run();
       }
-    } catch {
-      // presence is best-effort; never break the tunnel over it
-    }
+    } catch {}
   }
 
-  /** Alarm loop: refresh presence while the tunnel is connected. */
+  private async restartIfTunnelVanished(): Promise<void> {
+    if (this.tunnelSocket() !== null) return;
+    const openedAt = await this.state.storage.get<number>(TUNNEL_OPENED_AT_KEY);
+    const closedAt = await this.state.storage.get<number>(TUNNEL_CLOSED_AT_KEY);
+    const vanished =
+      openedAt === undefined
+        ? closedAt === undefined &&
+          ((await this.state.storage.get<string>("serverId")) !== undefined ||
+            (await this.state.storage.get<string>("machineId")) !== undefined)
+        : (closedAt === undefined || closedAt < openedAt) &&
+          Date.now() - openedAt > VANISHED_TUNNEL_GRACE_MS;
+    if (!vanished) return;
+    const now = Date.now();
+    await this.state.storage.put({
+      [TUNNEL_CLOSED_AT_KEY]: now,
+      [TUNNEL_LOST_AT_KEY]: now,
+    });
+    await this.state.storage.sync();
+    this.state.abort(TUNNEL_RESTART_REASON);
+  }
+
+  private async awaitReturningTunnel(): Promise<WebSocket | null> {
+    await this.restartIfTunnelVanished();
+    const lostAt = await this.state.storage.get<number>(TUNNEL_LOST_AT_KEY);
+    const remainingMs =
+      lostAt === undefined ? 0 : lostAt + TUNNEL_RETURN_GRACE_MS - Date.now();
+    if (remainingMs <= 0) return this.tunnelSocket();
+    await new Promise<void>((resolve) => {
+      const settle = () => {
+        clearTimeout(timer);
+        this.tunnelWaiters.delete(settle);
+        resolve();
+      };
+      const timer = setTimeout(settle, remainingMs);
+      this.tunnelWaiters.add(settle);
+    });
+    return this.tunnelSocket();
+  }
+
+  private wakeTunnelWaiters(): void {
+    for (const settle of [...this.tunnelWaiters]) settle();
+  }
+
   async alarm(): Promise<void> {
+    await this.restartIfTunnelVanished();
     if (!this.tunnelSocket()) {
       await this.state.storage.delete("serverId");
       await this.state.storage.delete("machineId");
@@ -270,27 +288,21 @@ export class TunnelDO {
     await this.state.storage.setAlarm(Date.now() + PRESENCE_INTERVAL_MS);
   }
 
-  private acceptTunnel(
+  private async acceptTunnel(
     request: Request,
     serverId: string | null,
     machineId: string | null,
     protocolVersion: number,
-  ): Response {
+  ): Promise<Response> {
     if (request.headers.get("upgrade")?.toLowerCase() !== "websocket") {
       return new Response("expected websocket", { status: 426 });
     }
-    // Single tunnel per label: a reconnect replaces the previous socket.
+    await this.restartIfTunnelVanished();
     for (const existing of this.state.getWebSockets(TUNNEL_TAG)) {
       try {
-        existing.close(1000, "replaced by a new tunnel connection");
-      } catch {
-        // Already dead — must not block the replacement from connecting.
-      }
+        existing.close(CLEAN_CLOSE_CODE, TUNNEL_REPLACED_CLOSE_REASON);
+      } catch {}
     }
-    // Streams opened over a replaced (or hibernated-away) tunnel belong to
-    // the old client session — the connecting client has no state for them,
-    // so their frames will never arrive. Fail them now: a mid-body response
-    // has no timeout and would otherwise hang its visitor forever.
     this.abandonStreams("tunnel reconnected mid-request", "tunnel reconnected");
     this.clientProtocolVersion = protocolVersion;
     void this.state.storage.put("protocolVersion", protocolVersion);
@@ -305,8 +317,11 @@ export class TunnelDO {
       void this.markPresence();
       void this.state.storage.setAlarm(Date.now() + PRESENCE_INTERVAL_MS);
     }
+    void this.state.storage.put(TUNNEL_OPENED_AT_KEY, Date.now());
+    void this.state.storage.delete(TUNNEL_LOST_AT_KEY);
     const pair = new WebSocketPair();
     this.state.acceptWebSocket(pair[1], [TUNNEL_TAG]);
+    setTimeout(() => this.wakeTunnelWaiters(), 0);
     return new Response(null, { status: 101, webSocket: pair[0] });
   }
 
@@ -324,9 +339,6 @@ export class TunnelDO {
         .map((p) => p.trim())
         .filter(Boolean) ?? [];
 
-    // Send the open frame before accepting the visitor socket: if the tunnel
-    // died since the liveness check, answer 503 offline instead of leaving an
-    // accepted visitor socket with no stream behind it.
     const opened = this.trySend(
       tunnel,
       encodeFrame({
@@ -346,9 +358,6 @@ export class TunnelDO {
 
     const responseHeaders = new Headers();
     if (protocols.length > 0) {
-      // TODO(M2): carry the origin's negotiated subprotocol back through
-      // ws-open-ack before answering the upgrade. The spike echoes the first
-      // offer, which is correct for every current bb client (they offer one).
       responseHeaders.set("sec-websocket-protocol", protocols[0]);
     }
     return new Response(null, {
@@ -420,8 +429,6 @@ export class TunnelDO {
       for (;;) {
         const { done, value } = await reader.read();
         if (done) break;
-        // Frames cap at MAX_CHUNK_BYTES; reader chunks are far smaller in
-        // practice, but split defensively.
         for (let offset = 0; offset < value.length; offset += 1024 * 1024) {
           const sent = this.trySend(
             tunnel,
@@ -431,8 +438,6 @@ export class TunnelDO {
               data: value.subarray(offset, offset + 1024 * 1024),
             }),
           );
-          // Tunnel died mid-body: nothing left to notify — the client session
-          // behind this socket is gone and the stream dies with it.
           if (!sent) return;
         }
       }
@@ -450,7 +455,6 @@ export class TunnelDO {
     }
   }
 
-  /** Fail every in-flight stream: pending HTTP answers `status` 502, visitor sockets close. */
   private abandonStreams(httpReason: string, wsReason: string): void {
     for (const streamId of [...this.pendingHttp.keys()]) {
       this.failHttpStream(streamId, 502, httpReason);
@@ -459,9 +463,7 @@ export class TunnelDO {
       if (!this.state.getTags(visitor).includes(TUNNEL_TAG)) {
         try {
           visitor.close(1001, wsReason);
-        } catch {
-          // already closed
-        }
+        } catch {}
       }
     }
   }
@@ -510,11 +512,10 @@ export class TunnelDO {
   webSocketMessage(ws: WebSocket, message: ArrayBuffer | string): void {
     const tags = this.state.getTags(ws);
     if (tags.includes(TUNNEL_TAG)) {
-      if (typeof message === "string") return; // heartbeats are auto-responded; ignore other text
+      if (typeof message === "string") return;
       this.onTunnelFrame(decodeFrame(message));
       return;
     }
-    // Visitor socket → wrap into a ws-data frame toward the tunnel client.
     const attachment = ws.deserializeAttachment() as { streamId: number };
     const tunnel = this.tunnelSocket();
     if (!tunnel) {
@@ -545,12 +546,6 @@ export class TunnelDO {
         const headers = frame.headers.filter(
           ([name]) => !HOP_HEADERS.has(name.toLowerCase()),
         );
-        // Null-body statuses must resolve bodiless: Response throws on a
-        // stream body for 204/205/304, and a throw here would strand the
-        // visitor's request unresolved forever (its timeout is already
-        // cleared). Dev servers answer 304 to every ETag revalidation, so
-        // this is the common path on a reload, not an edge case. The entry
-        // stays until the client's trailing body-end frame clears it.
         if (
           frame.status === 204 ||
           frame.status === 205 ||
@@ -567,8 +562,6 @@ export class TunnelDO {
         try {
           response = relayedResponse(readable, frame.status, headers);
         } catch {
-          // Any other unconstructable response (e.g. an out-of-range status):
-          // answer 502 rather than leaving the request pending.
           this.pendingHttp.delete(frame.streamId);
           entry.resolve(
             new Response(
@@ -594,7 +587,6 @@ export class TunnelDO {
       case "body-chunk": {
         const entry = this.pendingHttp.get(frame.streamId);
         if (!entry?.writer) return;
-        // Copy out of the transient message buffer before queueing the write.
         const copy = frame.data.slice();
         entry.writeChain = entry.writeChain
           .then(() => entry.writer!.write(copy))
@@ -623,9 +615,7 @@ export class TunnelDO {
               safeCloseCode(frame.code),
               frame.reason,
             );
-          } catch {
-            // already closed
-          }
+          } catch {}
         }
         return;
       }
@@ -636,17 +626,13 @@ export class TunnelDO {
           visitor.send(
             frame.isBinary ? frame.data : new TextDecoder().decode(frame.data),
           );
-        } catch {
-          // Visitor socket died; its close handler tells the client.
-        }
+        } catch {}
         return;
       }
       case "ws-open-ack":
-        // The upgrade was already answered (see openVisitorWebSocket TODO).
         return;
       case "open-http":
       case "open-ws":
-        // Streams are only opened by the relay side; ignore.
         return;
     }
   }
@@ -658,10 +644,14 @@ export class TunnelDO {
   webSocketClose(ws: WebSocket, code: number, reason: string): void {
     const tags = this.state.getTags(ws);
     if (tags.includes(TUNNEL_TAG)) {
-      // Only react if this socket is still the active tunnel (a replaced
-      // socket closing must not tear down the new tunnel's visitors —
-      // acceptTunnel already abandoned the old socket's streams).
       if (this.tunnelSocket() !== null) return;
+      const now = Date.now();
+      void this.state.storage.put(TUNNEL_CLOSED_AT_KEY, now);
+      if (code === CLEAN_CLOSE_CODE) {
+        void this.state.storage.delete(TUNNEL_LOST_AT_KEY);
+      } else {
+        void this.state.storage.put(TUNNEL_LOST_AT_KEY, now);
+      }
       this.abandonStreams(
         "tunnel disconnected mid-request",
         "tunnel disconnected",
@@ -681,13 +671,9 @@ export class TunnelDO {
         }),
       );
     }
-    // Complete the close handshake on the visitor socket (a client-initiated
-    // close is delivered to this handler without the runtime echoing it).
     try {
       ws.close(safeCloseCode(code), reason);
-    } catch {
-      // already closed
-    }
+    } catch {}
   }
 
   webSocketError(ws: WebSocket): void {
@@ -695,7 +681,6 @@ export class TunnelDO {
   }
 }
 
-/** Clamp arbitrary close codes to ones close() is allowed to send. */
 function safeCloseCode(code: number): number {
   return code === 1000 || (code >= 3000 && code <= 4999) ? code : 1000;
 }

@@ -46,7 +46,10 @@ type ClaudeCredentials = z.infer<
 
 const claudeAccountSchema = z.object({
   oauthAccount: z
-    .object({ emailAddress: z.string().email().nullish() })
+    .object({
+      emailAddress: z.string().email().nullish(),
+      accountUuid: z.string().uuid().nullish(),
+    })
     .nullish(),
 });
 
@@ -252,46 +255,59 @@ async function readKeychainCredentials(): Promise<string | null> {
         timeout: 10_000,
       });
       if (stdout.trim()) return stdout.trim();
-    } catch {
-      // Fall through to the next keychain form, then the credentials file.
-    }
+    } catch {}
+  }
+  return null;
+}
+
+function parseCredentials(raw: string): ClaudeCredentials | null {
+  const trimmed = raw.trim();
+  const candidates = [trimmed];
+  if (/^(?:[0-9a-f]{2})+$/iu.test(trimmed)) {
+    candidates.push(Buffer.from(trimmed, "hex").toString("utf8"));
+  }
+  for (const candidate of candidates) {
+    try {
+      const parsed = claudeCredentialsSchema.safeParse(JSON.parse(candidate));
+      if (parsed.success) return parsed.data.claudeAiOauth;
+    } catch {}
   }
   return null;
 }
 
 async function readCredentials(): Promise<ClaudeCredentials | null> {
-  let raw = await readKeychainCredentials();
-  if (raw === null) {
-    try {
-      raw = await fs.readFile(
-        path.join(os.homedir(), ".claude", ".credentials.json"),
-        "utf8",
-      );
-    } catch {
-      return null;
-    }
+  const keychainCredentials = await readKeychainCredentials();
+  if (keychainCredentials !== null) {
+    const parsed = parseCredentials(keychainCredentials);
+    if (parsed !== null) return parsed;
   }
   try {
-    const parsed = claudeCredentialsSchema.safeParse(JSON.parse(raw));
-    return parsed.success ? parsed.data.claudeAiOauth : null;
+    return parseCredentials(
+      await fs.readFile(
+        path.join(os.homedir(), ".claude", ".credentials.json"),
+        "utf8",
+      ),
+    );
   } catch {
     return null;
   }
 }
 
-async function readAccountEmail(): Promise<string | null> {
+async function readAccount() {
   try {
     const parsed = claudeAccountSchema.safeParse(
       JSON.parse(
         await fs.readFile(path.join(os.homedir(), ".claude.json"), "utf8"),
       ),
     );
-    return parsed.success
-      ? (parsed.data.oauthAccount?.emailAddress ?? null)
-      : null;
+    return parsed.success ? (parsed.data.oauthAccount ?? null) : null;
   } catch {
     return null;
   }
+}
+
+async function readAccountEmail(): Promise<string | null> {
+  return (await readAccount())?.emailAddress ?? null;
 }
 
 function planLabel(credentials: ClaudeCredentials): string | null {
@@ -399,10 +415,12 @@ function resetIso(value: string | null | undefined): string | null {
 function usageWindow(
   value: z.infer<typeof claudeUsageWindowSchema> | null | undefined,
   label: string,
+  kind: "five-hour" | "weekly",
 ): ProviderUsageWindow | null {
   if (!value || value.utilization == null) return null;
   return {
     label,
+    kind,
     usedPercent: clampPercent(value.utilization),
     resetsAt: resetIso(value.resets_at),
   };
@@ -429,6 +447,8 @@ function scopedWindows(
     }
     seen.add(label.toLowerCase());
     windows.push({
+      kind: "weekly",
+      model: label.toLowerCase(),
       label,
       usedPercent: clampPercent(limit.percent),
       resetsAt: resetIso(limit.resets_at),
@@ -452,16 +472,22 @@ function normalizeUsage(
     };
   }
   const windows = [
-    usageWindow(parsed.data.five_hour, "Current session"),
-    usageWindow(parsed.data.seven_day, "Weekly limit"),
+    usageWindow(parsed.data.five_hour, "Current session", "five-hour"),
+    usageWindow(parsed.data.seven_day, "Weekly limit", "weekly"),
     ...scopedWindows(parsed.data.limits),
-  ].filter(
-    (window): window is ProviderUsageWindow => window !== null,
-  );
+  ].filter((window): window is ProviderUsageWindow => window !== null);
   return {
     status: "ok",
     accountEmail: email,
     planLabel: planLabel(credentials),
+    plan: credentials.subscriptionType
+      ? {
+          id: credentials.subscriptionType.toLowerCase(),
+          multiplier:
+            Number(credentials.rateLimitTier?.match(/max_(\d+)x/u)?.[1]) ||
+            null,
+        }
+      : null,
     windows,
   };
 }
@@ -471,10 +497,11 @@ export async function getClaudeProviderUsage(): Promise<ProviderUsageResult> {
   if ((await resolveExecutablePath(command)) === null) {
     return { supported: true, usage: { status: "not_installed" } };
   }
-  const [credentials, email] = await Promise.all([
+  const [credentials, account] = await Promise.all([
     readCredentials(),
-    readAccountEmail(),
+    readAccount(),
   ]);
+  const email = account?.emailAddress ?? null;
   if (!credentials) {
     return { supported: true, usage: { status: "unauthenticated" } };
   }
@@ -503,7 +530,7 @@ export async function getClaudeProviderUsage(): Promise<ProviderUsageResult> {
           status: "error",
           message:
             response.status === 429
-              ? "Claude usage is rate limited right now. Try again shortly."
+              ? "Anthropic temporarily throttled this usage check. This does not mean your Claude limit is exhausted. Try again later."
               : `Claude usage request failed (HTTP ${response.status}).`,
           ...known,
         },
@@ -511,7 +538,12 @@ export async function getClaudeProviderUsage(): Promise<ProviderUsageResult> {
     }
     return {
       supported: true,
-      usage: normalizeUsage(await response.json(), credentials, email),
+      usage: {
+        ...normalizeUsage(await response.json(), credentials, email),
+        accountKey: account?.accountUuid
+          ? `anthropic:account:${account.accountUuid}`
+          : null,
+      },
     };
   } catch (error) {
     return {

@@ -10,7 +10,6 @@ import { describe, expect, it } from "vitest";
 import { ApiError } from "../../src/errors.js";
 import {
   assertValidParentThread,
-  isAgentDelegatedChildThread,
   isParentNotifiableChildThread,
 } from "../../src/services/threads/thread-parent.js";
 
@@ -21,7 +20,6 @@ function setup() {
   migrate(db);
   const host = upsertHost(db, noopNotifier, {
     name: "test-host",
-    type: "persistent",
   });
   const { project } = createProject(db, noopNotifier, {
     name: "test-project",
@@ -250,24 +248,6 @@ describe("thread parent validation", () => {
   });
 });
 
-describe("isAgentDelegatedChildThread", () => {
-  it("is true for a thread with a parent", () => {
-    expect(
-      isAgentDelegatedChildThread({
-        parentThreadId: "thr_parent",
-      }),
-    ).toBe(true);
-  });
-
-  it("is false for a fork-style root", () => {
-    expect(
-      isAgentDelegatedChildThread({
-        parentThreadId: null,
-      }),
-    ).toBe(false);
-  });
-});
-
 describe("isParentNotifiableChildThread", () => {
   it("is true for a hidden delegated child", () => {
     expect(
@@ -287,13 +267,7 @@ describe("isParentNotifiableChildThread", () => {
     ).toBe(false);
   });
 
-  it("is false for a source-derived fork and for a root thread", () => {
-    expect(
-      isParentNotifiableChildThread({
-        originKind: "fork",
-        parentThreadId: "thr_parent",
-      }),
-    ).toBe(false);
+  it("is false for a root thread", () => {
     expect(
       isParentNotifiableChildThread({
         originKind: null,

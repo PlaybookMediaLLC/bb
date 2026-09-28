@@ -4,10 +4,14 @@ import type {
   ThreadEvent,
   SystemThreadProvisioningStatus,
   SystemThreadInterruptedReason,
+  PluginInteractionLifecycle,
+  ThreadEventItemPresentation,
   UserQuestionInteractionLifecycle,
 } from "@bb/domain";
 import {
+  THREAD_CONTEXT_CLEAR_OPERATION,
   isApprovalInteractionLifecycle,
+  isPluginInteractionLifecycle,
   isUserQuestionInteractionLifecycle,
   ownershipChangeOperationMetadataSchema,
 } from "@bb/domain";
@@ -33,20 +37,16 @@ import type {
   EventProjectionThreadOperationMetadata,
   EventProjectionThreadOperationKind,
   EventProjectionThreadOperationStatus,
+  EventProjectionPluginFormLifecycle,
+  EventProjectionPluginFormLifecycleMessage,
 } from "./event-projection-types.js";
 import { getProviderModelFallbackData } from "./model-fallback-extraction.js";
 
 type ParseOperationMessageOptions = Pick<
   BuildEventProjectionMessagesOptions,
-  "includeProviderUnhandledOperations" | "providerDisplayName" | "threadName"
+  "includeDiagnosticOperations" | "providerDisplayName" | "threadName"
 >;
 
-/**
- * Prefix a thread name onto a bare action verb, e.g. ("Fix auth bug",
- * "assigned to parent") → "Fix auth bug assigned to parent". Falls back to
- * capitalizing the verb when the thread has no name so the title is never an
- * orphaned fragment.
- */
 function withThreadName(threadName: string, verb: string): string {
   const name = threadName.trim();
   return name.length > 0 ? `${name} ${verb}` : capitalize(verb);
@@ -57,12 +57,6 @@ type InteractionLifecycleEvent = Extract<
   { type: "system/interaction/lifecycle" }
 >;
 
-/**
- * The server resolves the display name from the provider registry (or the
- * dynamic ACP tier) and passes it in. A hardcoded four-provider table used to
- * shadow it, which produced the same strings for those four and the raw id for
- * everyone else.
- */
 function providerDisplayName(
   providerId: string,
   projectedDisplayName: string | undefined,
@@ -121,13 +115,20 @@ function createThreadOperationMetadata(
   };
 }
 
-function threadInterruptedTitle(reason: SystemThreadInterruptedReason): string {
+function threadInterruptedTitle(
+  reason: SystemThreadInterruptedReason,
+  cause?: "host-connection-lost",
+): string {
+  if (cause === "host-connection-lost") {
+    return "Stopped — connection to host was lost";
+  }
   switch (reason) {
+    case "host-removed":
+      return "Stopped because the machine was removed";
     case "manual-stop":
       return "Stopped manually";
     case "host-daemon-restarted":
       return "Stopped — host daemon restarted";
-    // Legacy persisted watchdog interruption; no current producer.
     case "provider-turn-idle":
       return "Stopped — provider turn stopped responding";
     default:
@@ -135,10 +136,6 @@ function threadInterruptedTitle(reason: SystemThreadInterruptedReason): string {
   }
 }
 
-/**
- * Compose "{thread} {verb} {parent}", falling back to "{thread} {verb} parent"
- * when the parent thread name is null (deleted/renamed/untitled parent).
- */
 function ownershipTitleWithParent(
   threadName: string,
   verb: string,
@@ -200,6 +197,12 @@ function threadOperationTitle(
     case "ownership_change":
       return ownershipChangeOperationTitle(meta, threadName);
     case "other":
+      if (
+        meta.rawOperation === THREAD_CONTEXT_CLEAR_OPERATION &&
+        meta.status === "completed"
+      ) {
+        return "Context cleared";
+      }
       return `${capitalize(meta.rawOperation.replace(/_/g, " "))} ${
         meta.rawStatus
       }`;
@@ -379,23 +382,98 @@ function buildUserQuestionLifecycleMessage(
   };
 }
 
-/**
- * The row an interaction's lifecycle event contributes. A permission grant
- * and a user question get a row of their own. Every other interaction shows
- * elsewhere — a command or file-change approval on the provider's item, a
- * plan review on its plan tool call, a tool use on its tool call, a plugin
- * request on the plugin's form — so its event contributes no row.
- */
+function pluginFormLifecycle(
+  interaction: PluginInteractionLifecycle,
+): EventProjectionPluginFormLifecycle {
+  switch (interaction.status) {
+    case "pending":
+    case "resolving":
+      return "pending";
+    case "resolved":
+      return "submitted";
+    case "interrupted":
+      return "cancelled";
+    default:
+      return assertNever(interaction.status);
+  }
+}
+
+function pluginFormLifecycleStatus(
+  lifecycle: EventProjectionPluginFormLifecycle,
+): EventProjectionPluginFormLifecycleMessage["status"] {
+  switch (lifecycle) {
+    case "pending":
+      return "pending";
+    case "submitted":
+      return "completed";
+    case "cancelled":
+      return "interrupted";
+    default:
+      return assertNever(lifecycle);
+  }
+}
+
+function pluginFormPresentation(
+  interaction: PluginInteractionLifecycle,
+): ThreadEventItemPresentation {
+  const base = interaction.payload.presentation ?? {
+    label: {
+      pending: `Waiting for ${interaction.payload.title}`,
+      completed: `Submitted ${interaction.payload.title}`,
+    },
+    icon: { glyph: "Toolbox" },
+  };
+  const description = interaction.resolution?.description;
+  return {
+    ...base,
+    ...(description?.title === undefined ? {} : { title: description.title }),
+    ...(description?.detail === undefined
+      ? {}
+      : { detail: description.detail }),
+  };
+}
+
+function buildPluginFormLifecycleMessage(
+  decoded: InteractionLifecycleEvent,
+  interaction: PluginInteractionLifecycle,
+  meta: EventMeta,
+): EventProjectionPluginFormLifecycleMessage {
+  const lifecycle = pluginFormLifecycle(interaction);
+  return {
+    kind: "plugin-form-lifecycle",
+    id: messageId(decoded.threadId, "form", interaction.id),
+    threadId: decoded.threadId,
+    sourceSeqStart: meta.seq,
+    sourceSeqEnd: meta.seq,
+    createdAt: meta.createdAt,
+    startedAt: meta.createdAt,
+    scope: decoded.scope,
+    interactionId: interaction.id,
+    lifecycle,
+    status: pluginFormLifecycleStatus(lifecycle),
+    pluginId: interaction.origin.pluginId,
+    rendererId: interaction.origin.rendererId,
+    title: interaction.payload.title,
+    statusReason: interaction.statusReason,
+    presentation: pluginFormPresentation(interaction),
+    payload: interaction.resolution?.description?.payload ?? null,
+  };
+}
+
 function buildInteractionLifecycleMessage(
   decoded: InteractionLifecycleEvent,
   meta: EventMeta,
 ):
   | EventProjectionPermissionGrantLifecycleMessage
   | EventProjectionUserQuestionLifecycleMessage
+  | EventProjectionPluginFormLifecycleMessage
   | null {
   const { interaction } = decoded;
   if (isUserQuestionInteractionLifecycle(interaction)) {
     return buildUserQuestionLifecycleMessage(decoded, interaction, meta);
+  }
+  if (isPluginInteractionLifecycle(interaction)) {
+    return buildPluginFormLifecycleMessage(decoded, interaction, meta);
   }
   if (!isApprovalInteractionLifecycle(interaction)) {
     return null;
@@ -406,7 +484,6 @@ function buildInteractionLifecycleMessage(
     : null;
 }
 
-/** Build the common scaffolding shared by all operation messages. */
 function op(
   decoded: ThreadEvent,
   meta: EventMeta,
@@ -460,6 +537,7 @@ export function parseOperationMessage(
   | EventProjectionOperationMessage
   | EventProjectionPermissionGrantLifecycleMessage
   | EventProjectionUserQuestionLifecycleMessage
+  | EventProjectionPluginFormLifecycleMessage
   | null {
   const threadName = options?.threadName ?? "";
   const modelFallback = getProviderModelFallbackData(decoded);
@@ -473,7 +551,7 @@ export function parseOperationMessage(
   }
 
   if (decoded.type === "provider/unhandled") {
-    if (options?.includeProviderUnhandledOperations !== true) {
+    if (options?.includeDiagnosticOperations !== true) {
       return null;
     }
 
@@ -484,6 +562,32 @@ export function parseOperationMessage(
         options?.providerDisplayName,
       )} event`,
       detail: buildProviderUnhandledDetail(decoded),
+      status: "completed",
+    });
+  }
+
+  if (decoded.type === "provider.env-resolved") {
+    if (options?.includeDiagnosticOperations !== true) {
+      return null;
+    }
+
+    const detail = decoded.entries
+      .map((entry) => {
+        const source =
+          entry.source === "shell"
+            ? "shell"
+            : "plugin" in entry.source
+              ? entry.source.plugin
+              : entry.source.core;
+        const value = typeof entry.value === "string" ? entry.value : "••••••";
+        const reason = entry.reason ? ` — ${entry.reason}` : "";
+        return `${entry.name}=${value} (${source})${reason}`;
+      })
+      .join("\n");
+    return op(decoded, meta, "provider-environment", {
+      opType: "provider-environment",
+      title: "Provider environment resolved",
+      detail: detail || undefined,
       status: "completed",
     });
   }
@@ -515,13 +619,12 @@ export function parseOperationMessage(
   if (decoded.type === "system/thread/interrupted") {
     return op(decoded, meta, "thread-interrupted", {
       opType: "thread-interrupted",
-      title: threadInterruptedTitle(decoded.reason),
+      title: threadInterruptedTitle(decoded.reason, decoded.cause),
       status: "interrupted",
     });
   }
 
   if (decoded.type === "system/provider-turn-watchdog") {
-    // Legacy persisted watchdog diagnostic; no current producer.
     return op(decoded, meta, "provider-turn-watchdog", {
       opType: "operation",
       title: "Provider turn stopped responding",
@@ -544,7 +647,7 @@ export function parseOperationMessage(
       title: provisioningTitleForStatus(operationStatus),
       status: operationStatus,
       provisioning: {
-        environmentId,
+        ...(environmentId !== null ? { environmentId } : {}),
         provisioningId,
         ...(transcript ? { transcript } : {}),
       },
@@ -556,10 +659,6 @@ export function parseOperationMessage(
   }
 
   if (decoded.type === "system/operation") {
-    // `plugin_interaction` is the legacy persisted form of a plugin
-    // interaction's lifecycle (now `system/interaction/lifecycle`, which
-    // contributes no row either): its generic operation row would duplicate
-    // the plugin form and linger as "Plugin interaction pending".
     if (
       decoded.operation === "plugin_interaction" ||
       decoded.operation === "edit_message"

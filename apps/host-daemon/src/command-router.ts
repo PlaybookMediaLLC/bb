@@ -25,19 +25,18 @@ import {
   type CommandDispatchOptions,
 } from "./command-dispatch.js";
 import { isExpectedOnlineRpcFailureError } from "./command-dispatch-support.js";
-import { roundDurationMs } from "./event-loop-stall-monitor.js";
+import { roundDurationMs } from "@bb/process-utils";
 import type { HostDaemonLogger } from "./logger.js";
 import { RuntimeManager } from "./runtime-manager.js";
 import type { PluginHostManager } from "./plugin-host-manager.js";
+import { runInSerialLane } from "./serial-lane.js";
 
 type CommandRouterLogger = Pick<HostDaemonLogger, "debug" | "warn">;
 
 type EnvironmentLaneMode = HostDaemonCommandEnvironmentLane;
 
 interface ReadWriteLaneState {
-  /** All admitted read and write work. Writes wait on this tail. */
   tail: Promise<void>;
-  /** Last admitted write. Reads wait on this tail, then join `tail`. */
   writeTail: Promise<void>;
 }
 
@@ -45,12 +44,6 @@ interface ReadWriteLaneArgs<T> {
   key: string;
   lanes: Map<string, ReadWriteLaneState>;
   mode: EnvironmentLaneMode;
-  work: () => Promise<T>;
-}
-
-interface SerialLaneArgs<T> {
-  key: string;
-  lanes: Map<string, Promise<void>>;
   work: () => Promise<T>;
 }
 
@@ -64,12 +57,13 @@ interface ReadWriteLaneIdleArgs {
 type CommandRouterTask = Promise<HostDaemonCommandResultForCommand>;
 
 export interface CommandRouterOptions {
+  emitEnvironmentHookProgress?: CommandDispatchOptions["emitEnvironmentHookProgress"];
+  desktopBrowserBroker?: CommandDispatchOptions["desktopBrowserBroker"];
   dataDir: CommandDispatchOptions["dataDir"];
   fetchProjectAttachment: CommandDispatchOptions["fetchProjectAttachment"];
   fetchSkillTree?: CommandDispatchOptions["fetchSkillTree"];
   fetchPluginHostArtifact?: CommandDispatchOptions["fetchPluginHostArtifact"];
   runtimeManager: RuntimeManager;
-  terminalManager?: CommandDispatchOptions["terminalManager"];
   eventSink: CommandDispatchOptions["eventSink"];
   listModels: CommandDispatchOptions["listModels"];
   providerHealth: CommandDispatchOptions["providerHealth"];
@@ -80,6 +74,7 @@ export interface CommandRouterOptions {
   resolveInteractiveRequest?: CommandDispatchOptions["resolveInteractiveRequest"];
   pluginHostManager?: PluginHostManager;
   ensureConnectTunnelIdentity?: CommandDispatchOptions["ensureConnectTunnelIdentity"];
+  serverMove?: CommandDispatchOptions["serverMove"];
   threadStorageRootPath: string;
   logger: CommandRouterLogger;
 }
@@ -93,15 +88,7 @@ function elapsedMs(startedAtMs: number): number {
 export class CommandRouter {
   private readonly logger;
   private readonly environmentLanes = new Map<string, ReadWriteLaneState>();
-  // Per-thread barrier keyed by threadId. A turn submission
-  // (turn.submit/thread.start) waits for an in-flight thread.unarchive of the
-  // same thread so it cannot resume a still-archived provider session.
   private readonly threadUnarchiveBarriers = new Map<string, Promise<void>>();
-  // Thread lanes serialize the commands that drive one thread's provider
-  // session within an environment (start, turn, stop, archive, interactive
-  // resolution, plan cancel, goal clear), keyed per (environment, thread).
-  // One bridge process serves every thread of a provider and dispatches
-  // concurrently, so commands on different threads never wait on each other.
   private readonly threadLaneTails = new Map<string, Promise<void>>();
   private readonly threadTurnLaneTails = new Map<string, Promise<void>>();
 
@@ -224,8 +211,6 @@ export class CommandRouter {
     command: HostDaemonCommand,
   ): Promise<HostDaemonCommandResultForCommand> {
     const result = await dispatchCommand(command, this.createDispatchOptions());
-    // Commands that emit thread events before completing preserve the previous
-    // event-before-result ordering under live RPC.
     if (shouldFlushEventsBeforeReportingCommandResult(command)) {
       await this.options.eventSink.flush();
     }
@@ -254,12 +239,7 @@ export class CommandRouter {
     const threadWork =
       threadLaneKey === null
         ? work
-        : () =>
-            this.runInSerialLane({
-              key: threadLaneKey,
-              lanes: this.threadLaneTails,
-              work,
-            });
+        : () => runInSerialLane(this.threadLaneTails, threadLaneKey, work);
     if (!environmentLaneMode) {
       return threadWork();
     }
@@ -280,11 +260,7 @@ export class CommandRouter {
     if (command.type !== "thread.start" && command.type !== "turn.submit") {
       return work();
     }
-    return this.runInSerialLane({
-      key: command.threadId,
-      lanes: this.threadTurnLaneTails,
-      work,
-    });
+    return runInSerialLane(this.threadTurnLaneTails, command.threadId, work);
   }
 
   private createDispatchOptions(): CommandDispatchOptions {
@@ -293,7 +269,7 @@ export class CommandRouter {
       fetchSkillTree: this.options.fetchSkillTree,
       fetchPluginHostArtifact: this.options.fetchPluginHostArtifact,
       runtimeManager: this.options.runtimeManager,
-      terminalManager: this.options.terminalManager,
+      desktopBrowserBroker: this.options.desktopBrowserBroker,
       dataDir: this.options.dataDir,
       eventSink: this.options.eventSink,
       listModels: this.options.listModels,
@@ -302,8 +278,10 @@ export class CommandRouter {
       providerInstallationStatus: this.options.providerInstallationStatus,
       providerInstallationRun: this.options.providerInstallationRun,
       refreshShellEnv: this.options.refreshShellEnv,
+      emitEnvironmentHookProgress: this.options.emitEnvironmentHookProgress,
       resolveInteractiveRequest: this.options.resolveInteractiveRequest,
       ensureConnectTunnelIdentity: this.options.ensureConnectTunnelIdentity,
+      serverMove: this.options.serverMove,
       threadStorageRootPath: this.options.threadStorageRootPath,
       logger: this.options.logger,
     };
@@ -349,12 +327,6 @@ export class CommandRouter {
     return state;
   }
 
-  /**
-   * Order a turn submission after any in-flight unarchive for the same thread.
-   * thread.unarchive runs on the provider maintenance runtime while turn.submit
-   * resumes the thread runtime, so the two are otherwise unordered and a turn
-   * can reach the provider before the session is unarchived.
-   */
   private async runAfterThreadUnarchiveBarrier<T>(
     command: HostDaemonCommand,
     work: () => Promise<T>,
@@ -388,26 +360,6 @@ export class CommandRouter {
     });
   }
 
-  private runInSerialLane<T>({
-    key,
-    lanes,
-    work,
-  }: SerialLaneArgs<T>): Promise<T> {
-    const previousTail = lanes.get(key) ?? Promise.resolve();
-    const next = previousTail.catch(() => undefined).then(work);
-    const done = next.then(
-      () => undefined,
-      () => undefined,
-    );
-    lanes.set(key, done);
-    void done.then(() => {
-      if (lanes.get(key) === done) {
-        lanes.delete(key);
-      }
-    });
-    return next;
-  }
-
   private runInReadWriteLane<T>({
     key,
     lanes,
@@ -423,8 +375,6 @@ export class CommandRouter {
         () => undefined,
       );
       const previousTail = state.tail;
-      // Reads only wait for earlier writes, so adjacent reads can run together.
-      // They still join the full tail so later writes wait for every active read.
       const tail = Promise.all([
         previousTail.catch(() => undefined),
         done,
@@ -458,13 +408,6 @@ export class CommandRouter {
     });
   }
 
-  /**
-   * The lane a thread-scoped command runs in, or null for commands that
-   * drive no thread's provider session. A thread.stop for a thread the
-   * runtime does not know yet (its thread.start still in flight) lands on
-   * the same key as that start, so it is ordered after the handoff without
-   * any registry of in-flight constructions.
-   */
   private resolveThreadLaneKey(command: HostDaemonCommand): string | null {
     switch (command.type) {
       case "thread.start":
@@ -472,6 +415,7 @@ export class CommandRouter {
       case "thread.archive":
       case "interactive.resolve":
       case "thread.stop":
+      case "thread.storage.delete":
       case "thread.plan.cancel":
       case "thread.goal.clear":
         return `${command.environmentId}\0thread:${command.threadId}`;

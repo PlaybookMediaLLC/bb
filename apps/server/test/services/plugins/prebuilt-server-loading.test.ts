@@ -1,14 +1,20 @@
-import { mkdtemp, mkdir, rm, writeFile } from "node:fs/promises";
+import { mkdtemp, mkdir, readdir, rm, stat, writeFile } from "node:fs/promises";
+import { createRequire } from "node:module";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
 import {
   createConnection,
   migrate,
+  setExperiments,
   upsertInstalledPlugin,
   type DbConnection,
 } from "@bb/db";
-import { PLUGIN_SDK_MAJOR, PLUGIN_SDK_VERSION } from "@bb/domain";
+import {
+  defaultExperiments,
+  PLUGIN_SDK_MAJOR,
+  PLUGIN_SDK_VERSION,
+} from "@bb/domain";
 import type { Logger } from "@bb/logger";
 import { createAiServiceRegistry } from "../../../src/services/ai/ai-service-registry.js";
 import {
@@ -43,14 +49,6 @@ function gitPersistence(url: string, requestedRef: string) {
     activeArtifactId: null,
   };
 }
-
-/**
- * Prebuilt backend distribution (design §3 loader amendment, §6): managed
- * (git:/npm:) installs prefer a fresh, SDK-compatible dist/server.js;
- * path installs always load from source. Pre-1.0, minor SDK bumps are
- * breaking, so compatibility means the exact SDK version. The fixture's
- * source entry THROWS, so whichever half runs is unambiguous.
- */
 
 const THROWING_SERVER_TS = `throw new Error("source must not load");\n`;
 
@@ -101,6 +99,7 @@ describe("prebuilt server bundle loading", () => {
       JSON.stringify({
         name,
         version: "0.1.0",
+        type: "commonjs",
         bb: {
           name: "Prebuilt server fixture",
           description: "Prebuilt plugin server fixture.",
@@ -121,10 +120,8 @@ describe("prebuilt server bundle loading", () => {
     return rootDir;
   }
 
-  it("prefers a fresh dist/server.js for git installs (source never evaluated)", async () => {
+  it("loads a compatible ESM prebuild from a CommonJS plugin package", async () => {
     const rootDir = await writePrebuiltPlugin("bb-plugin-gitdist");
-    // Managed-source registration without the clone step (materialization is
-    // not under test); the row's git: source is what flips the loader path.
     upsertInstalledPlugin(db, {
       ...gitPersistence("https://github.com/acme/bb-plugin-gitdist", "v1"),
       id: "gitdist",
@@ -145,6 +142,11 @@ describe("prebuilt server bundle loading", () => {
     expect((globalThis as Record<string, unknown>).__prebuiltDistLoads).toBe(
       before + 1,
     );
+
+    await service.reload("gitdist");
+    expect((globalThis as Record<string, unknown>).__prebuiltDistLoads).toBe(
+      before + 2,
+    );
   });
 
   it("never prefers dist for path installs — edited source must win", async () => {
@@ -152,6 +154,133 @@ describe("prebuilt server bundle loading", () => {
     const entry = await service.installPath(rootDir);
     expect(entry.status).toBe("error");
     expect(entry.statusDetail).toContain("source must not load");
+  });
+
+  it("compiles path source into a reusable cache and rebuilds after edits", async () => {
+    const rootDir = await writePrebuiltPlugin("bb-plugin-pathcache");
+    const sourcePath = join(rootDir, "server.ts");
+    await writeFile(
+      sourcePath,
+      `const value: string = "first";
+export default function plugin() {
+  globalThis.__pathCacheValue = value;
+  globalThis.__pathCacheLoads = (globalThis.__pathCacheLoads ?? 0) + 1;
+}
+`,
+    );
+
+    const installed = await service.installPath(rootDir);
+    expect(installed.status).toBe("running");
+    expect((globalThis as Record<string, unknown>).__pathCacheValue).toBe(
+      "first",
+    );
+
+    const cacheRoot = join(workDir, "data", "plugins", "runtime", "server");
+    const firstFiles = await readdir(cacheRoot, { recursive: true });
+    const firstServer = firstFiles.find((file) => file.endsWith("server.cjs"));
+    expect(firstServer).toBeDefined();
+    const firstServerPath = join(cacheRoot, firstServer!);
+    const firstMtime = (await stat(firstServerPath)).mtimeMs;
+
+    await service.reload("pathcache");
+    expect((await stat(firstServerPath)).mtimeMs).toBe(firstMtime);
+    expect((globalThis as Record<string, unknown>).__pathCacheLoads).toBe(2);
+
+    await writeFile(
+      sourcePath,
+      `const value: string = "second";
+export default function plugin() {
+  globalThis.__pathCacheValue = value;
+  globalThis.__pathCacheLoads = (globalThis.__pathCacheLoads ?? 0) + 1;
+}
+`,
+    );
+    await service.reload("pathcache");
+
+    expect((globalThis as Record<string, unknown>).__pathCacheValue).toBe(
+      "second",
+    );
+    expect((globalThis as Record<string, unknown>).__pathCacheLoads).toBe(3);
+    const updatedFiles = await readdir(cacheRoot, { recursive: true });
+    expect(
+      updatedFiles.filter((file) => file.endsWith("server.cjs")),
+    ).toHaveLength(2);
+  });
+
+  it("uses JITI on the next load when the legacy loader experiment is enabled", async () => {
+    const rootDir = await writePrebuiltPlugin("bb-plugin-legacy-loader");
+    const sourcePath = join(rootDir, "server.ts");
+    await writeFile(
+      sourcePath,
+      `const value: string = "native";
+export default function plugin() {
+  globalThis.__loaderExperimentValue = value;
+}
+`,
+    );
+
+    const installed = await service.installPath(rootDir);
+    expect(installed.status).toBe("running");
+    expect(
+      (globalThis as Record<string, unknown>).__loaderExperimentValue,
+    ).toBe("native");
+    const cacheRoot = join(workDir, "data", "plugins", "runtime", "server");
+    const before = (await readdir(cacheRoot, { recursive: true })).filter(
+      (file) => file.endsWith("server.cjs"),
+    );
+    expect(before).toHaveLength(1);
+
+    setExperiments(db, {
+      ...defaultExperiments,
+      legacyJitiPluginLoader: true,
+    });
+    await writeFile(
+      sourcePath,
+      `const value: string = "jiti";
+export default function plugin() {
+  globalThis.__loaderExperimentValue = value;
+}
+`,
+    );
+    expect(
+      (globalThis as Record<string, unknown>).__loaderExperimentValue,
+    ).toBe("native");
+
+    await service.reload("legacy-loader");
+    expect(
+      (globalThis as Record<string, unknown>).__loaderExperimentValue,
+    ).toBe("jiti");
+    const after = (await readdir(cacheRoot, { recursive: true })).filter(
+      (file) => file.endsWith("server.cjs"),
+    );
+    expect(after).toEqual(before);
+  });
+
+  it("bounds compiled artifacts and evicts loaded source modules", async () => {
+    const rootDir = await writePrebuiltPlugin("bb-plugin-reload-retention");
+    const sourcePath = join(rootDir, "server.ts");
+    const cacheRoot = join(workDir, "data", "plugins", "runtime", "server");
+    for (let generation = 0; generation < 8; generation += 1) {
+      await writeFile(
+        sourcePath,
+        `export default function plugin() { globalThis.__reloadRetention = ${generation}; }\n`,
+      );
+      if (generation === 0) await service.installPath(rootDir);
+      else await service.reload("reload-retention");
+    }
+
+    expect((globalThis as Record<string, unknown>).__reloadRetention).toBe(7);
+    const files = await readdir(cacheRoot, { recursive: true });
+    expect(files.filter((file) => file.endsWith("server.cjs"))).toHaveLength(4);
+    const cache = createRequire(import.meta.url).cache;
+    expect(
+      Object.keys(cache).filter((path) => path.startsWith(cacheRoot)),
+    ).toEqual([]);
+    expect(
+      Object.values(cache)
+        .flatMap((entry) => entry?.children ?? [])
+        .filter((entry) => entry.filename.startsWith(cacheRoot)),
+    ).toEqual([]);
   });
 
   it("pre-1.0: falls back to source when the dist SDK version differs within major 0", async () => {
@@ -170,7 +299,6 @@ describe("prebuilt server bundle loading", () => {
     await service.reload("minordist");
 
     const entry = service.list().find((plugin) => plugin.id === "minordist");
-    // The throwing source ran — proof the 0.x-stale dist was NOT imported.
     expect(entry?.status).toBe("error");
     expect(entry?.statusDetail).toContain("source must not load");
   });
@@ -191,7 +319,6 @@ describe("prebuilt server bundle loading", () => {
     await service.reload("staledist");
 
     const entry = service.list().find((plugin) => plugin.id === "staledist");
-    // The throwing source ran — proof the stale dist was NOT imported.
     expect(entry?.status).toBe("error");
     expect(entry?.statusDetail).toContain("source must not load");
   });

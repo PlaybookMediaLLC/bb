@@ -30,29 +30,30 @@ import {
   type PluginUpdateResolution,
 } from "./update-resolver.js";
 import { PluginActivationRolledBackError } from "./plugin-activation.js";
+import type { SafeModeActivationRefusalArgs } from "./plugin-runtime.js";
 import type { createPluginActivation } from "./plugin-activation.js";
 import {
   createListedRegistryNpmResolverRun,
   type createManagedPluginArtifacts,
 } from "./managed-plugin-artifacts.js";
 import { MARKETPLACE_FETCH_TIMEOUT_MS } from "../plugin-catalog/marketplace-http.js";
-import { pluginUpdateCheckEntrySchema } from "./plugin-service-internal.js";
+import {
+  SERVER_MOVE_FROZEN_RETRY_MS,
+  isServerMoveFrozen,
+} from "../server-move/freeze-state.js";
+import {
+  pluginUpdateCheckEntrySchema,
+  type PluginSourceDetail,
+  type PluginUpdateCheckEntry,
+} from "@bb/server-contract";
 import type {
   PluginApplyUpdateOutcome,
   PluginServiceDeps,
-  PluginSourceView,
-  PluginUpdateCheckEntry,
 } from "./plugin-service-internal.js";
 
 const PLUGIN_UPDATE_CHECK_INTERVAL_MS = 6 * 60 * 60 * 1_000;
-/** A git range check can stage several clones per plugin; bound the fan-out. */
 const UPDATE_CHECK_CONCURRENCY = 4;
 
-/**
- * A catalog listing named its registry, so its rows use the guarded
- * marketplace transport exactly as installation did. Direct `npm:` installs
- * keep the user's registry on the default transport, time-boxed.
- */
 function npmRunForRow(row: InstalledPluginRow): NpmResolverRun {
   const registry = row.provenance === "catalog" ? row.sourceNpmRegistry : null;
   return registry === null
@@ -68,12 +69,10 @@ function npmRunForRow(row: InstalledPluginRow): NpmResolverRun {
 
 export interface PluginUpdates {
   checkForUpdates(id?: string): Promise<PluginUpdateCheckEntry[]>;
-  /** Sweep every plugin on a fixed interval, due from the stalest check. */
   startPeriodicUpdateChecks(): void;
-  /** Cancels the next sweep and waits for one in flight to finish. */
   stopPeriodicUpdateChecks(): Promise<void>;
   listUpdateResults(): PluginUpdateCheckEntry[];
-  getSource(id: string): Promise<PluginSourceView | undefined>;
+  getSource(id: string): Promise<PluginSourceDetail | undefined>;
   applyUpdate(id: string): Promise<PluginApplyUpdateOutcome>;
 }
 
@@ -92,6 +91,9 @@ interface PluginUpdatesContext {
     "applyNpmCandidate" | "stageGitCandidate"
   >;
   runArtifactGc: ReturnType<typeof createPluginActivation>["runArtifactGc"];
+  safeModeActivationRefusal: (
+    args: SafeModeActivationRefusalArgs,
+  ) => string | null;
 }
 
 export function createPluginUpdates(
@@ -107,10 +109,9 @@ export function createPluginUpdates(
     npmIntentForRow,
     managedArtifacts: { applyNpmCandidate, stageGitCandidate },
     runArtifactGc,
+    safeModeActivationRefusal,
   } = context;
   const now = deps.now ?? Date.now;
-  // A commit is immutable. Keep its manifest compatibility result for this
-  // server process so the six-hour sweep does not clone the same releases.
   const gitCandidateProbeCache = new Map<string, GitCandidateProbeResult>();
 
   function problemMessages(problems: CompatibilityProblem[]): string[] {
@@ -169,12 +170,6 @@ export function createPluginUpdates(
     }
   }
 
-  /**
-   * What the install-time clone says a legacy ref was. `git clone` copies
-   * every ref, so the cached checkout still holds the tags and branches the
-   * remote published when bb installed the plugin. "unknown" means the
-   * checkout or its refs are gone, which is not evidence of anything.
-   */
   async function legacyGitRefEvidence(args: {
     url: string;
     commit: string | null;
@@ -214,10 +209,6 @@ export function createPluginUpdates(
     return "unknown";
   }
 
-  /**
-   * The git intent of a row, classifying a legacy ref that was persisted
-   * before bb recorded whether it names a branch, a tag, or a commit.
-   */
   async function classifiedGitIntentForRow(
     row: InstalledPluginRow,
   ): Promise<
@@ -236,12 +227,6 @@ export function createPluginUpdates(
     const ref = row.sourceGitRequestedRef;
     const classified = await resolveGitRef({ url, ref });
     if (classified.outcome === "unavailable") return classified;
-    // A tag is a pin; a branch tracks whatever the remote later publishes.
-    // The remote alone cannot decide which one a legacy row installed: an
-    // attacker who deletes a tag and pushes a same-name branch would turn the
-    // pin into tracking and get the next update installed as trusted code.
-    // The install-time clone is the local evidence, and it is not on the
-    // network.
     if (classified.refKind === "branch") {
       const evidence = await legacyGitRefEvidence({
         url,
@@ -274,14 +259,6 @@ export function createPluginUpdates(
     };
   }
 
-  /**
-   * The selector to persist when a git candidate activates. The resolution
-   * carries the exact tag it selected and displayed, so activation stores
-   * that pair. A second tag query here would be a window: a higher tag added
-   * to the same commit between approval and activation would be recorded as
-   * the installed release, and the stored release would differ from the one
-   * the user approved.
-   */
   function activationSelectorForCandidate(args: {
     selector: PluginGitSelector;
     candidateCommit: string;
@@ -304,10 +281,6 @@ export function createPluginUpdates(
     if (args.row.sourceKind === "path" || args.row.sourceKind === "builtin") {
       return { outcome: "pinned", current: installed };
     }
-    // Rows installed through the retired GitHub-Release marketplace carry a
-    // synthetic api.github.com registry URL no npm resolver can serve. The
-    // plugin keeps running from its cached artifact; updates now ride app
-    // releases, so point the user at a store reinstall instead of erroring.
     if (
       args.row.sourceKind === "npm" &&
       args.row.sourceNpmRegistry?.includes("bb-source=github-release")
@@ -315,7 +288,7 @@ export function createPluginUpdates(
       return {
         outcome: "unavailable",
         detail:
-          "installed from the retired remote marketplace — remove it and reinstall from Extensions → Plugins → Browse to switch to the bundled copy",
+          "installed from the retired remote marketplace — remove it and reinstall from Plugins → Browse plugins to switch to the bundled copy",
       };
     }
     if (args.row.sourceKind === "npm") {
@@ -357,22 +330,16 @@ export function createPluginUpdates(
               packagedBuildProblems: probed.packagedBuildProblems,
             }
           : probed;
-      // A transient clone or parse failure can recover. Compatibility is a
-      // property of this immutable commit and the running bb version.
       if (result.outcome !== "invalid") {
         gitCandidateProbeCache.set(cacheKey, result);
       }
       return result;
     };
-    // A range tracks whatever release this bb can run, so the resolver walks
-    // its matching tags. A ref names one commit, so it is staged once here.
     const remote = await resolveGitUpdate({
       url: intent.url,
       intent: intent.selector,
       currentCommit: args.row.gitResolvedCommit,
-      ...(intent.selector.kind === "range"
-        ? { probeCandidate: probeGitCandidate }
-        : {}),
+      probeCandidate: probeGitCandidate,
     });
     if (remote.outcome !== "update-available") return remote;
     if (intent.selector.kind === "range") return remote;
@@ -413,7 +380,6 @@ export function createPluginUpdates(
   let periodicChecksStopped = true;
   let inFlightSweep: Promise<PluginUpdateCheckEntry[]> | null = null;
 
-  /** Delay until the stalest network-reachable plugin is due; null rows are due now. */
   function periodicCheckDelay(): number {
     const stamps = listInstalledPlugins(deps.db)
       .filter(
@@ -426,23 +392,27 @@ export function createPluginUpdates(
     return Math.max(0, PLUGIN_UPDATE_CHECK_INTERVAL_MS - (now() - oldest));
   }
 
-  function runPeriodicCheck(): void {
+  async function runPeriodicCheck(): Promise<void> {
     if (periodicChecksStopped) return;
-    void updates
-      .checkForUpdates()
-      .catch((error: unknown) => {
-        deps.logger.warn({ err: error }, "periodic plugin update check failed");
-      })
-      .finally(() => {
-        // A full interval, not periodicCheckDelay(): a failed sweep persists
-        // nothing and would otherwise retry at once.
-        if (!periodicChecksStopped) {
-          cancelPeriodicCheck = scheduleUpdateCheck(
-            PLUGIN_UPDATE_CHECK_INTERVAL_MS,
-            runPeriodicCheck,
-          );
-        }
-      });
+    if (isServerMoveFrozen(deps.db)) {
+      cancelPeriodicCheck = scheduleUpdateCheck(
+        SERVER_MOVE_FROZEN_RETRY_MS,
+        runPeriodicCheck,
+      );
+      return;
+    }
+    try {
+      await updates.checkForUpdates();
+    } catch (error: unknown) {
+      deps.logger.warn({ err: error }, "periodic plugin update check failed");
+    } finally {
+      if (!periodicChecksStopped) {
+        cancelPeriodicCheck = scheduleUpdateCheck(
+          PLUGIN_UPDATE_CHECK_INTERVAL_MS,
+          runPeriodicCheck,
+        );
+      }
+    }
   }
 
   async function checkRows(
@@ -500,7 +470,6 @@ export function createPluginUpdates(
       periodicChecksStopped = true;
       cancelPeriodicCheck?.();
       cancelPeriodicCheck = null;
-      // Let a sweep drain so plugin shutdown does not queue behind its locks.
       await inFlightSweep?.catch(() => undefined);
     },
 
@@ -510,7 +479,6 @@ export function createPluginUpdates(
         if (!row) throw new Error(`unknown plugin "${id}"`);
         return checkRows([row]);
       }
-      // Concurrent full sweeps join the one in flight instead of re-fetching.
       inFlightSweep ??= checkRows(listInstalledPlugins(deps.db)).finally(() => {
         inFlightSweep = null;
       });
@@ -596,6 +564,16 @@ export function createPluginUpdates(
       return withPluginOperationLock(REGISTRATION_MUTATION_KEY, async () => {
         const row = getInstalledPlugin(deps.db, id);
         if (!row) return { ok: false, error: `unknown plugin "${id}"` };
+        const safeModeRefusal = safeModeActivationRefusal({
+          pluginId: id,
+          provenance: row.provenance,
+          builtinName:
+            row.sourceKind === "builtin" ? row.sourceBuiltinName : null,
+          action: "update",
+        });
+        if (safeModeRefusal !== null) {
+          return { ok: false, error: safeModeRefusal };
+        }
         const from = installedUpdateVersion(row);
         const npmRun = npmRunForRow(row);
         const selectionNpmIntent =
@@ -674,8 +652,6 @@ export function createPluginUpdates(
             if (activationRow === undefined) {
               throw new Error(`plugin "${id}" disappeared before activation`);
             }
-            // resolveUpdateForRow classified the row a moment ago, so this
-            // reads the persisted intent rather than reaching the network.
             const intent = await classifiedGitIntentForRow(activationRow);
             if (intent.outcome === "unavailable") {
               return { ok: false, error: intent.detail };

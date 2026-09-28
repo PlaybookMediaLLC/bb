@@ -39,7 +39,6 @@ const REMOTE_HOST_NAME = "Sawyer Air";
 
 function createConnectFakeHost(options?: {
   remoteIdentity?: { label: string; baseDomain: string };
-  /** The `mobileApp` experiment (defaults on so pairing paths are exercised). */
   mobileApp?: boolean;
 }): FakePluginHost {
   return createFakePluginHost({
@@ -459,8 +458,6 @@ describe("ShareRegistry", () => {
     expect(registry.snapshot()).toEqual([
       expect.objectContaining({ hostId: "server", port: 3000 }),
     ]);
-    // Idempotent re-expose after the server host resolves must replace the
-    // placeholder row, not sit beside it.
     await registry.add(3000, {
       id: SERVER_HOST_ID,
       name: SERVER_HOST_NAME,
@@ -510,7 +507,6 @@ describe("ShareRegistry", () => {
     await registry.load();
     expect(registry.hasServerPort(3000)).toBe(true);
     await registry.declareMachineShares(() => true);
-    // The stored entry gains the concrete server host id and canonical key.
     expect(kv.get(SHARES_KV_KEY)).toEqual({
       [`${SERVER_HOST_ID}:3000`]: {
         hostId: SERVER_HOST_ID,
@@ -523,6 +519,168 @@ describe("ShareRegistry", () => {
       removed: true,
       hostId: SERVER_HOST_ID,
     });
+    await fakeHost.harness.dispose();
+  });
+
+  it("prunes shares of removed hosts at activation but still fails on live-host declaration errors", async () => {
+    const kv = new Map<string, unknown>([
+      [
+        SHARES_KV_KEY,
+        {
+          "host-deleted:3000": {
+            hostId: "host-deleted",
+            port: 3000,
+            createdAt: 1,
+          },
+          [`${REMOTE_HOST_ID}:4000`]: {
+            hostId: REMOTE_HOST_ID,
+            port: 4000,
+            createdAt: 2,
+          },
+        },
+      ],
+    ]);
+    const fakeHost = createConnectFakeHost();
+    const pluginBb = fakeHost.bb as unknown as Parameters<typeof plugin>[0];
+    const declared: Array<{ hostId: string; ports: readonly number[] }> = [];
+    let remoteFailure: Error | null = null;
+    const registry = new ShareRegistry({
+      kv: {
+        async get<T>(key: string) {
+          return kv.get(key) as T | undefined;
+        },
+        async set(key: string, value: unknown) {
+          kv.set(key, value);
+        },
+        async delete(key: string) {
+          kv.delete(key);
+        },
+      },
+      hosts: {
+        declareSharedPorts(hostId, ports) {
+          if (hostId === "host-deleted") {
+            throw new Error(
+              `cannot declare shared ports for unknown host ${hostId}`,
+            );
+          }
+          if (remoteFailure !== null) throw remoteFailure;
+          declared.push({ hostId, ports });
+        },
+        ensureSharedPortTunnel: pluginBb.hosts.ensureSharedPortTunnel,
+      },
+      hostResolver: new ShareHostResolver(() => pluginBb.sdk),
+      getLoopbackBaseUrl: () => "http://127.0.0.1:38886",
+      getCredential: () => ({
+        serverUrl: "https://sawyer.getbb.app",
+        handle: "sawyer",
+        credential: "bbcred_x",
+      }),
+      log: pluginBb.log,
+    });
+
+    await registry.load();
+    await expect(registry.declareMachineShares(() => true)).resolves.toBe(
+      undefined,
+    );
+    expect(declared).toEqual([{ hostId: REMOTE_HOST_ID, ports: [4000] }]);
+    expect(kv.get(SHARES_KV_KEY)).toEqual({
+      [`${REMOTE_HOST_ID}:4000`]: {
+        hostId: REMOTE_HOST_ID,
+        port: 4000,
+        createdAt: 2,
+      },
+    });
+    expect(registry.snapshot()).toEqual([
+      expect.objectContaining({ hostId: REMOTE_HOST_ID, port: 4000 }),
+    ]);
+    expect(fakeHost.harness.logEntries).not.toEqual(
+      expect.arrayContaining([
+        expect.objectContaining({
+          message: expect.stringContaining("host-deleted"),
+        }),
+      ]),
+    );
+
+    remoteFailure = new Error("temporary declaration failure");
+    await expect(registry.declareMachineShares(() => true)).rejects.toBe(
+      remoteFailure,
+    );
+    await fakeHost.harness.dispose();
+  });
+
+  it("retries pruning a removed host after storage fails", async () => {
+    const savedShares = {
+      "host-deleted:3000": {
+        hostId: "host-deleted",
+        port: 3000,
+        createdAt: 1,
+      },
+      [`${REMOTE_HOST_ID}:4000`]: {
+        hostId: REMOTE_HOST_ID,
+        port: 4000,
+        createdAt: 2,
+      },
+    };
+    const kv = new Map<string, unknown>([[SHARES_KV_KEY, savedShares]]);
+    const fakeHost = createConnectFakeHost();
+    const pluginBb = fakeHost.bb as unknown as Parameters<typeof plugin>[0];
+    let failWrite = true;
+    const registry = new ShareRegistry({
+      kv: {
+        async get<T>(key: string) {
+          return kv.get(key) as T | undefined;
+        },
+        async set(key: string, value: unknown) {
+          if (failWrite) throw new Error("storage unavailable");
+          kv.set(key, value);
+        },
+        async delete(key: string) {
+          kv.delete(key);
+        },
+      },
+      hosts: {
+        declareSharedPorts(hostId) {
+          if (hostId === "host-deleted") {
+            throw new Error(
+              `cannot declare shared ports for unknown host ${hostId}`,
+            );
+          }
+        },
+        ensureSharedPortTunnel: pluginBb.hosts.ensureSharedPortTunnel,
+      },
+      hostResolver: new ShareHostResolver(() => pluginBb.sdk),
+      getLoopbackBaseUrl: () => "http://127.0.0.1:38886",
+      getCredential: () => ({
+        serverUrl: "https://sawyer.getbb.app",
+        handle: "sawyer",
+        credential: "bbcred_x",
+      }),
+      log: pluginBb.log,
+    });
+
+    await registry.load();
+    await expect(registry.declareMachineShares(() => true)).rejects.toThrow(
+      "storage unavailable",
+    );
+    expect(kv.get(SHARES_KV_KEY)).toEqual(savedShares);
+    expect(registry.snapshot()).toEqual(
+      expect.arrayContaining([
+        expect.objectContaining({ hostId: "host-deleted", port: 3000 }),
+        expect.objectContaining({ hostId: REMOTE_HOST_ID, port: 4000 }),
+      ]),
+    );
+    expect(registry.snapshot()).toHaveLength(2);
+
+    failWrite = false;
+    await expect(registry.declareMachineShares(() => true)).resolves.toBe(
+      undefined,
+    );
+    expect(kv.get(SHARES_KV_KEY)).toEqual({
+      [`${REMOTE_HOST_ID}:4000`]: savedShares[`${REMOTE_HOST_ID}:4000`],
+    });
+    expect(registry.snapshot()).toEqual([
+      expect.objectContaining({ hostId: REMOTE_HOST_ID, port: 4000 }),
+    ]);
     await fakeHost.harness.dispose();
   });
 
@@ -566,7 +724,6 @@ describe("ShareRegistry", () => {
     });
 
     await registry.load();
-    expect(registry.isLoaded).toBe(true);
     expect(fakeHost.harness.sdk.callsTo("hosts.get")).toEqual([]);
     expect(fakeHost.harness.sdk.callsTo("system.config")).toEqual([]);
     expect(await registry.list()).toEqual([
@@ -643,7 +800,6 @@ describe("ShareRegistry", () => {
     });
 
     await registry.load();
-    expect(registry.isLoaded).toBe(true);
     expect(ensureIdentity).not.toHaveBeenCalled();
     expect(fakeHost.harness.sdk.callsTo("hosts.get")).toEqual([]);
     expect(await registry.list()).toEqual([
@@ -788,7 +944,6 @@ describe("ConnectTunnel share activation", () => {
       hosts: pluginBb.hosts,
       hostResolver: new ShareHostResolver(() => pluginBb.sdk),
       getLoopbackBaseUrl: () => "http://127.0.0.1:38886",
-      // disconnect() cleared the pairing but kept the share kv.
       getCredential: () => null,
       log: pluginBb.log,
     });
@@ -834,10 +989,6 @@ describe("isBareBbRealtimeWs", () => {
     expect(isBareBbRealtimeWs("/api", undefined)).toBe(false);
   });
 });
-
-// ---------------------------------------------------------------------------
-// TunnelSession routing against two ephemeral local origins
-// ---------------------------------------------------------------------------
 
 async function listen(
   handler: (
@@ -931,17 +1082,14 @@ describe("TunnelSession routing", () => {
     });
     await waitForOpen(client);
     const relay = await relayReady;
-    // Session replies travel client → relay; collect on the relay side.
     const frames = collectFrames(relay);
 
     const sharedPorts = new Set([share.port]);
     const session = new TunnelSession({
       tunnel: client,
       log: {
-        debug: () => {},
         info: () => {},
         warn: () => {},
-        error: () => {},
       },
       resolveOrigin: (target) => {
         if (target === undefined) {
@@ -969,11 +1117,9 @@ describe("TunnelSession routing", () => {
     cleanups.push(() => session.dispose());
 
     const inject = (frame: Frame) => {
-      // Relay → client: TunnelSession handles inbound frames on `client`.
       relay.send(Buffer.from(encodeFrame(frame)));
     };
 
-    // Primary (no target)
     inject({
       type: "open-http",
       streamId: 1,
@@ -988,7 +1134,6 @@ describe("TunnelSession routing", () => {
     expect(primaryHits).toEqual(["GET /hello"]);
     expect(shareHits).toEqual([]);
 
-    // Shared target
     frames.length = 0;
     inject({
       type: "open-http",
@@ -1011,7 +1156,6 @@ describe("TunnelSession routing", () => {
     expect(shareHits[0]).toContain(`origin=http://127.0.0.1:${share.port}`);
     expect(primaryHits).toEqual(["GET /hello"]);
 
-    // Unregistered target → 404
     frames.length = 0;
     inject({
       type: "open-http",
@@ -1080,10 +1224,8 @@ describe("TunnelSession routing", () => {
     const session = new TunnelSession({
       tunnel: client,
       log: {
-        debug: () => {},
         info: () => {},
         warn: () => {},
-        error: () => {},
       },
       resolveOrigin: () => ({
         kind: "ok",
@@ -1171,10 +1313,8 @@ describe("TunnelSession routing", () => {
     const session = new TunnelSession({
       tunnel: client,
       log: {
-        debug: () => {},
         info: (message) => infoMessages.push(message),
         warn: () => {},
-        error: () => {},
       },
       resolveOrigin: () => ({
         kind: "ok",
@@ -1191,8 +1331,6 @@ describe("TunnelSession routing", () => {
       relay.send(Buffer.from(encodeFrame(frame)));
     };
 
-    // The visitor's compression negotiation reaches the loopback origin, and
-    // compressed bytes cross the bandwidth-sensitive tunnel unchanged.
     inject({
       type: "open-http",
       streamId: 21,
@@ -1232,7 +1370,6 @@ describe("TunnelSession routing", () => {
       ),
     ]);
 
-    // Revalidation: a 304 relays as resp-head + body-end with no chunks.
     frames.length = 0;
     inject({
       type: "open-http",
@@ -1255,12 +1392,10 @@ describe("TunnelSession routing", () => {
   });
 
   it("tracks remoteClients for bare-handle /ws streams", async () => {
-    // Origin WS server that accepts upgrades so the tunnel can open.
     const origin = await listen((_req, res) => {
       res.writeHead(404);
       res.end();
     });
-    // Attach a WS server to the same HTTP server.
     const originWss = new WebSocketServer({ server: origin.server });
     cleanups.push(
       () =>
@@ -1293,10 +1428,8 @@ describe("TunnelSession routing", () => {
     const session = new TunnelSession({
       tunnel: client,
       log: {
-        debug: () => {},
         info: () => {},
         warn: () => {},
-        error: () => {},
       },
       resolveOrigin: () => ({
         kind: "ok",
@@ -1331,7 +1464,6 @@ describe("TunnelSession routing", () => {
     expect(session.remoteClients).toBe(1);
     expect(remoteClientsSeen).toContain(1);
 
-    // Close the stream from the relay side.
     inject({
       type: "close-stream",
       streamId: 10,
@@ -1348,13 +1480,10 @@ describe("connect plugin", () => {
 
   async function loadPlugin(): Promise<FakePluginHost> {
     host = createConnectFakeHost();
-    // The fake host is typed from src; the plugin compiles against the
-    // bundled dts — same contract, nominally different modules.
     await plugin(host.bb as unknown as Parameters<typeof plugin>[0]);
     return host;
   }
 
-  /** Stop the tunnel (reconnect timers, pending sockets) before dispose. */
   async function stopTunnel(current: FakePluginHost): Promise<void> {
     const { controller, done } = current.harness.runService("tunnel");
     controller.abort();
@@ -1384,8 +1513,6 @@ describe("connect plugin", () => {
       lastRemoteActivityAt: null,
       shares: [],
     });
-    // Dashboard URL is sourced from the status payload (the apex when
-    // unpaired), never a frontend literal.
     expect(status.dashboardUrl).toBe("https://getbb.app/dashboard");
     expect(status.nextRetryAt).toBeNull();
     expect(harness.needsConfigurationMessages).toEqual([]);
@@ -1441,6 +1568,48 @@ describe("connect plugin", () => {
     );
   });
 
+  it("toggles remote instructions while preserving active and recent usage conditions", async () => {
+    const status: ConnectStatus = {
+      state: "connected",
+      paired: true,
+      handle: "test",
+      url: "https://test.getbb.app",
+      dashboardUrl: "https://getbb.app",
+      lastError: null,
+      nextRetryAt: null,
+      since: Date.now(),
+      remoteClients: 1,
+      lastRemoteActivityAt: null,
+      shares: [],
+    };
+    const statusSpy = vi
+      .spyOn(ConnectTunnel.prototype, "status")
+      .mockReturnValue(status);
+    try {
+      const { harness } = await loadPlugin();
+      const instructions = () =>
+        harness.registrations.instructionProvider?.({
+          threadId: "thr_test",
+          projectId: "proj_test",
+        });
+      expect(instructions()).toContain("bb connect expose");
+      await harness.behavior.setSettings({ sendRemoteInstructions: false });
+      expect(instructions()).toBeNull();
+      await harness.behavior.setSettings({ sendRemoteInstructions: true });
+      expect(instructions()).toContain("https://test.getbb.app");
+      statusSpy.mockReturnValue({ ...status, remoteClients: 0 });
+      expect(instructions()).toBeNull();
+      statusSpy.mockReturnValue({
+        ...status,
+        remoteClients: 0,
+        lastRemoteActivityAt: Date.now(),
+      });
+      expect(instructions()).toContain("bb connect expose");
+    } finally {
+      statusSpy.mockRestore();
+    }
+  });
+
   it("registers contributeInstructions", async () => {
     const { harness } = await loadPlugin();
     expect(harness.registrations.instructionProvider).not.toBeNull();
@@ -1463,8 +1632,6 @@ describe("connect plugin", () => {
     vi.stubGlobal("fetch", fetchMock);
     const { bb, harness } = await loadPlugin();
 
-    // Loopback serverUrl so the post-pair tunnel dial refuses instantly (no
-    // real gate contacted); explicit baseUrl drives the redeem endpoint.
     const status = (await harness.callRpc("pair", {
       code: "ABCD",
       server: "http://127.0.0.1:59321",
@@ -1478,12 +1645,10 @@ describe("connect plugin", () => {
     expect(status.paired).toBe(true);
     expect(status.handle).toBe("sawyer");
     expect(status.url).toBe("http://127.0.0.1:59321");
-    // Persisted for reconnect-on-restart.
     const stored = (await bb.storage.kv.get(CREDENTIAL_KV_KEY)) as {
       credential: string;
     };
     expect(stored.credential).toBe("bbcred_live");
-    // Status transitions rode the realtime channel (pairing → reconnecting).
     const states = harness.realtimeSignals
       .filter((signal) => signal.channel === "connect")
       .map((signal) => (signal.payload as ConnectStatus).state);
@@ -1501,10 +1666,6 @@ describe("connect plugin", () => {
     vi.stubGlobal("fetch", fetchMock);
     const { harness } = await loadPlugin();
 
-    // Loopback baseUrl keeps this hermetic (the derived host resolves to
-    // nothing, so the post-pair dial fails instantly); the panel's real
-    // paste-a-code path omits baseUrl too and falls back to the getbb.app
-    // apex the same way.
     const status = (await harness.callRpc("pair", {
       code: "ABCD",
       baseUrl: "http://localhost:59329",
@@ -1519,7 +1680,6 @@ describe("connect plugin", () => {
   });
 
   it("pair stores a non-primary routing label from redeem (multi-server)", async () => {
-    // Cloud returns the redeemed server's subdomain, not the account handle.
     const fetchMock = vi.fn(
       async () =>
         new Response(
@@ -1553,7 +1713,6 @@ describe("connect plugin", () => {
       credential: "bbcred_second",
     });
 
-    // Share URLs follow the stored label, not the account primary handle.
     const exposed = (await harness.callRpc("expose", { port: 8000 })) as {
       port: number;
       url: string;
@@ -1629,8 +1788,6 @@ describe("connect plugin", () => {
     );
     const { bb, harness } = await loadPlugin();
 
-    // The panel maps codes to human copy; the raw "Redeem failed (410)…"
-    // detail must never reach the caller — only the stable code does.
     await expect(
       harness.callRpc("pair", {
         code: "OLD",
@@ -1681,8 +1838,6 @@ describe("connect plugin", () => {
     });
 
     const { controller, done } = harness.runService("tunnel");
-    // The service read the credential and reports paired (dial refused →
-    // reconnecting, never "not paired").
     await vi.waitFor(async () => {
       const status = (await harness.callRpc("status")) as ConnectStatus;
       expect(status.paired).toBe(true);
@@ -1704,8 +1859,6 @@ describe("connect plugin", () => {
       ),
     );
     const { harness } = await loadPlugin();
-    // Handle-shaped serverUrl so share URLs look real; loopback port so the
-    // post-pair tunnel dial fails instantly (no external network).
     await harness.callRpc("pair", {
       code: "ABCD",
       server: "http://sawyer.localhost:59330",
@@ -1852,12 +2005,64 @@ describe("connect plugin", () => {
     ]);
   });
 
-  it("unexposes a persisted machine share when its declaration push fails offline", async () => {
+  it("prunes every share of a machine when it is deleted", async () => {
+    const { bb, harness } = await loadPlugin();
+    await bb.storage.kv.set(SHARES_KV_KEY, {
+      [`${SERVER_HOST_ID}:8000`]: {
+        hostId: SERVER_HOST_ID,
+        port: 8000,
+        createdAt: 1,
+      },
+      [`${REMOTE_HOST_ID}:3000`]: {
+        hostId: REMOTE_HOST_ID,
+        port: 3000,
+        createdAt: 2,
+      },
+      [`${REMOTE_HOST_ID}:4000`]: {
+        hostId: REMOTE_HOST_ID,
+        port: 4000,
+        createdAt: 3,
+      },
+    });
+
+    await harness.emitThreadEvent("experimental_host.deleted", {
+      host: {
+        id: REMOTE_HOST_ID,
+        name: REMOTE_HOST_NAME,
+        type: "ephemeral",
+        status: "disconnected",
+        machineProviderId: "modal",
+        lifecycle: {
+          phase: "destroyed",
+          suspendedAt: null,
+          message: null,
+          pendingLog: "",
+          teardown: { status: "removed", attempt: 0 },
+        },
+        maxPermissionMode: "full",
+        lastSeenAt: null,
+        lastRejectedProtocolVersion: null,
+        createdAt: 1,
+        updatedAt: 2,
+      },
+    });
+
+    expect(await bb.storage.kv.get(SHARES_KV_KEY)).toEqual({
+      [`${SERVER_HOST_ID}:8000`]: {
+        hostId: SERVER_HOST_ID,
+        port: 8000,
+        createdAt: 1,
+      },
+    });
+    expect(await harness.callRpc("listShares")).toEqual([
+      expect.objectContaining({ hostId: SERVER_HOST_ID, port: 8000 }),
+    ]);
+  });
+
+  it("unexposes a persisted machine share when its declaration update fails", async () => {
     host = createConnectFakeHost();
     const declarations = vi.fn((_hostId: string, _ports: readonly number[]) => {
-      throw Object.assign(new Error("host is offline"), {
-        body: { code: "connect_host_offline" },
-      });
+      throw new Error("temporary declaration failure");
     });
     Object.defineProperty(host.bb.hosts, "declareSharedPorts", {
       value: declarations,
@@ -1944,8 +2149,6 @@ describe("connect plugin", () => {
       { hostId: REMOTE_HOST_ID, ports: [3000, 4000] },
     ]);
 
-    // The same port is valid on the server host and does not enter the
-    // daemon's machine-tunnel declaration.
     await host.harness.callRpc("expose", { port: 3000 });
     expect(host.harness.sharedPortDeclarations).toEqual([
       { hostId: REMOTE_HOST_ID, ports: [3000, 4000] },
@@ -2082,8 +2285,6 @@ describe("connect plugin", () => {
       { hostId: REMOTE_HOST_ID, ports: [5173] },
     ]);
 
-    // Unpairing must drop the daemon's desired ports; a plain service stop
-    // relies on plugin dispose (load-scoped server-side clearing) instead.
     await host.harness.callRpc("disconnect");
     expect(host.harness.sharedPortDeclarations).toEqual([
       { hostId: REMOTE_HOST_ID, ports: [] },
@@ -2140,7 +2341,6 @@ describe("connect plugin", () => {
           handle: "sawyer",
           name: "default",
           live: true,
-          // URL base comes from the pairing credential's serverUrl apex.
           url: "http://sawyer.localhost:59340",
         },
         {
@@ -2255,6 +2455,7 @@ describe("connect plugin", () => {
     expect(call?.[1]).toEqual({
       method: "POST",
       headers: { "x-bb-connect-machine": "bbcred_durable" },
+      signal: expect.any(AbortSignal),
     });
     const result = (await harness.callRpc("createMachineCode")) as {
       expiresAt: number;
@@ -2451,7 +2652,36 @@ describe("connect CLI", () => {
     const { harness } = await loadCli();
     const result = await harness.runCli(["bogus"]);
     expect(result.exitCode).toBe(1);
-    expect(result.stderr).toContain("Unknown connect command 'bogus'");
+    expect(result.stderr).toContain("unknown command 'bogus'");
+    expect(result.stderr).toContain("bb connect status");
+  });
+
+  it("`--help` prints help on stdout at every level", async () => {
+    const { harness } = await loadCli();
+    for (const argv of [["--help"], ["-h"], ["shares", "--help"]]) {
+      const result = await harness.runCli(argv);
+      expect(result.exitCode, argv.join(" ")).toBe(0);
+      expect(result.stderr).toBe("");
+      expect(result.stdout).toContain("bb connect");
+    }
+    expect((await harness.runCli(["expose", "--help"])).stdout).toContain(
+      "<port>",
+    );
+  });
+
+  it("`bb connect list` points at shares", async () => {
+    const { harness } = await loadCli();
+    const result = await harness.runCli(["list"]);
+    expect(result.exitCode).toBe(1);
+    expect(result.stderr).toContain("(Did you mean shares?)");
+  });
+
+  it("rejects an unknown flag instead of ignoring it", async () => {
+    const { harness } = await loadCli();
+    const result = await harness.runCli(["shares", "--hosts", "bee"]);
+    expect(result.exitCode).toBe(1);
+    expect(result.stderr).toContain("unknown option '--hosts'");
+    expect(result.stderr).toContain("(Did you mean --host?)");
   });
 
   it("a failed pair surfaces the redeem error on stderr", async () => {
@@ -2613,7 +2843,6 @@ describe("connect CLI", () => {
       expiresAt: expect.any(Number),
     });
     expect(parsed.expiresAt as number).toBeGreaterThanOrEqual(before + 600_000);
-    // Minted through the apex with the server's own pairing credential.
     const call = fetchMock.mock.calls.find(
       ([input]) =>
         String(input) === "https://getbb.app/api/connect/machine-code",
@@ -2621,6 +2850,7 @@ describe("connect CLI", () => {
     expect(call?.[1]).toEqual({
       method: "POST",
       headers: { "x-bb-connect-machine": "bbcred_live" },
+      signal: expect.any(AbortSignal),
     });
   });
 

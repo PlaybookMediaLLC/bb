@@ -1,16 +1,15 @@
 import { lookup as dnsLookup } from "node:dns";
-import { request } from "node:https";
+import type { ClientRequest, IncomingMessage } from "node:http";
+import { request, type RequestOptions } from "node:https";
 import { BlockList, isIP, type LookupFunction } from "node:net";
 import { Readable } from "node:stream";
 
-/** Injected so tests drive refreshes without real network access. */
 export type MarketplaceFetch = (
   input: string,
   init: RequestInit,
 ) => Promise<Response>;
 
 export const MARKETPLACE_FETCH_TIMEOUT_MS = 10_000;
-/** Registry metadata can be large, but it must not consume unbounded memory. */
 export const MARKETPLACE_PACKUMENT_MAX_BYTES = 8 * 1024 * 1024;
 
 const deniedMarketplaceIpv4Addresses = new BlockList();
@@ -55,7 +54,6 @@ function normalizedHostname(hostname: string): string {
     .toLowerCase();
 }
 
-/** Refuse an address that does not route only through the public internet. */
 export function assertPublicMarketplaceAddress(address: string): void {
   const family = isIP(address);
   if (family === 0) {
@@ -72,7 +70,6 @@ export function assertPublicMarketplaceAddress(address: string): void {
   }
 }
 
-/** Validate the URL policy before Node opens a socket. */
 export function assertPublicMarketplaceUrl(input: string): URL {
   const url = new URL(input);
   if (url.protocol !== "https:") {
@@ -107,7 +104,6 @@ const resolveMarketplaceDns: MarketplaceDnsResolver = (hostname, callback) =>
     callback(error, addresses),
   );
 
-/** Check the DNS answer used by the socket, which also blocks DNS rebinding. */
 export function createPublicMarketplaceLookup(
   resolveDns: MarketplaceDnsResolver = resolveMarketplaceDns,
 ): LookupFunction {
@@ -148,56 +144,91 @@ export function createPublicMarketplaceLookup(
 
 const publicMarketplaceLookup = createPublicMarketplaceLookup();
 
-/**
- * Fetch one marketplace resource through a public-network-only HTTPS socket.
- * Node's request API does not follow redirects, and the caller rejects 3xx.
- */
-export const publicMarketplaceFetch: MarketplaceFetch = async (input, init) => {
-  const url = assertPublicMarketplaceUrl(input);
-  if (init.body !== undefined && init.body !== null) {
-    throw new Error("marketplace requests cannot contain a body");
-  }
-  return new Promise<Response>((resolve, reject) => {
-    const headers = Object.fromEntries(new Headers(init.headers).entries());
-    const requestSignal = init.signal ?? undefined;
-    const outgoing = request(
-      url,
-      {
-        method: init.method ?? "GET",
-        headers,
-        lookup: publicMarketplaceLookup,
-        ...(requestSignal === undefined ? {} : { signal: requestSignal }),
-      },
-      (incoming) => {
-        const status = incoming.statusCode;
-        if (status === undefined) {
-          incoming.destroy();
-          reject(new Error("marketplace response has no HTTP status"));
-          return;
-        }
-        const responseHeaders = new Headers();
-        for (let index = 0; index < incoming.rawHeaders.length; index += 2) {
-          const name = incoming.rawHeaders[index];
-          const value = incoming.rawHeaders[index + 1];
-          if (name !== undefined && value !== undefined) {
-            responseHeaders.append(name, value);
+type MarketplaceRequest = (
+  url: URL,
+  options: RequestOptions,
+  callback: (response: IncomingMessage) => void,
+) => ClientRequest;
+
+export interface PublicMarketplaceFetchDeps {
+  request?: MarketplaceRequest;
+  lookup?: LookupFunction;
+}
+
+export function createPublicMarketplaceFetch(
+  deps: PublicMarketplaceFetchDeps = {},
+): MarketplaceFetch {
+  const sendRequest = deps.request ?? request;
+  const lookup = deps.lookup ?? publicMarketplaceLookup;
+  return async (input, init) => {
+    const url = assertPublicMarketplaceUrl(input);
+    if (init.body !== undefined && init.body !== null) {
+      throw new Error("marketplace requests cannot contain a body");
+    }
+    const timeoutController = new AbortController();
+    const timeout = setTimeout(() => {
+      timeoutController.abort(
+        new DOMException(
+          "The operation was aborted due to timeout",
+          "TimeoutError",
+        ),
+      );
+    }, MARKETPLACE_FETCH_TIMEOUT_MS);
+    const stopTimeout = () => clearTimeout(timeout);
+    const callerSignal = init.signal ?? null;
+    const requestSignal =
+      callerSignal === null
+        ? timeoutController.signal
+        : AbortSignal.any([callerSignal, timeoutController.signal]);
+    return new Promise<Response>((resolve, reject) => {
+      const headers = Object.fromEntries(new Headers(init.headers).entries());
+      const outgoing = sendRequest(
+        url,
+        {
+          method: init.method ?? "GET",
+          headers,
+          lookup,
+          signal: requestSignal,
+        },
+        (incoming) => {
+          incoming.once("close", stopTimeout);
+          const status = incoming.statusCode;
+          if (status === undefined) {
+            incoming.destroy();
+            reject(new Error("marketplace response has no HTTP status"));
+            return;
           }
-        }
-        const hasNoBody = status === 204 || status === 205 || status === 304;
-        resolve(
-          new Response(
-            hasNoBody
-              ? null
-              : (Readable.toWeb(incoming) as ReadableStream<Uint8Array>),
-            { status, headers: responseHeaders },
-          ),
-        );
-      },
-    );
-    outgoing.once("error", reject);
-    outgoing.end();
-  });
-};
+          const responseHeaders = new Headers();
+          for (let index = 0; index < incoming.rawHeaders.length; index += 2) {
+            const name = incoming.rawHeaders[index];
+            const value = incoming.rawHeaders[index + 1];
+            if (name !== undefined && value !== undefined) {
+              responseHeaders.append(name, value);
+            }
+          }
+          const hasNoBody = status === 204 || status === 205 || status === 304;
+          if (hasNoBody) incoming.resume();
+          resolve(
+            new Response(
+              hasNoBody
+                ? null
+                : (Readable.toWeb(incoming) as ReadableStream<Uint8Array>),
+              { status, headers: responseHeaders },
+            ),
+          );
+        },
+      );
+      outgoing.once("error", (error) => {
+        stopTimeout();
+        reject(error);
+      });
+      outgoing.end();
+    });
+  };
+}
+
+export const publicMarketplaceFetch: MarketplaceFetch =
+  createPublicMarketplaceFetch();
 
 export function marketplaceErrorMessage(error: unknown): string {
   if (error instanceof DOMException && error.name === "TimeoutError") {
@@ -206,12 +237,6 @@ export function marketplaceErrorMessage(error: unknown): string {
   return error instanceof Error ? error.message : String(error);
 }
 
-/**
- * Read a response body with a hard byte cap. The declared length is checked
- * first so an oversize body is refused before it is downloaded, and the stream
- * is cancelled as soon as the cap is passed — a hostile server cannot stream
- * unbounded bytes into memory.
- */
 export async function boundedResponseBytes(
   response: Response,
   maxBytes: number,
@@ -252,7 +277,6 @@ export async function boundedResponseBytes(
   return body;
 }
 
-/** Parse JSON only after the shared response reader enforces its byte cap. */
 export async function boundedResponseJson(
   response: Response,
   maxBytes: number,

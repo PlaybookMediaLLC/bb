@@ -1,10 +1,9 @@
 import {
   getEnvironment,
-  getLatestSessionForHost,
   getSessionById,
   listActiveBackgroundTaskCountsByThreadIds,
+  listLatestClosedSessionsForHosts,
   listLatestThreadStateEventRowsByThreadIds,
-  listLatestSessionsForHosts,
   listOpenTurnInputAcceptedRowsByThreadIds,
   listStoredClientTurnRequestRowsByKeys,
   type DbConnection,
@@ -19,6 +18,7 @@ import type {
   ThreadActivityState,
   ThreadChangeMetadata,
   ThreadListEntry,
+  ThreadQueuedWork,
   ThreadRuntimeState,
   ThreadStatus,
   ThreadWithRuntime,
@@ -29,12 +29,16 @@ import {
   type ThreadEventWithMeta,
 } from "@bb/thread-view";
 import type { ThreadResponse } from "@bb/server-contract";
-import { DAEMON_ACTIVE_WORK_DISCONNECT_GRACE_MS } from "../../constants.js";
 import type { NotificationHub } from "../../ws/hub.js";
+import { isHostDisconnectHidden } from "../hosts/host-disconnect-display.js";
 import { resolveProviderPlanCommand } from "../providers/provider-plan-command.js";
 import type { ProviderRegistryService } from "../providers/provider-registry.js";
+import { listQueuedThreadMessageCountsByThreadIds } from "@bb/db";
+import { resolveEnvironmentWorkspaceDisplayKind } from "../environments/environment-response.js";
 import { canThreadSpawnChild } from "./thread-parent.js";
+import { canRestoreThreadEnvironment } from "./thread-environment-restore.js";
 import { toThreadEventWithMeta } from "./timeline.js";
+import { intendedThreadHostId } from "./dispatch-attempt.js";
 
 type ThreadRuntimeDisplayHub = Pick<
   NotificationHub,
@@ -46,12 +50,6 @@ interface ThreadRuntimeDisplayDeps {
   hub: ThreadRuntimeDisplayHub;
 }
 
-/**
- * The prompt-banner path additionally needs the registry, because plan-mode
- * eligibility is the provider's declared plan composer command. Kept separate
- * so the plain runtime-state callers (plugin DTOs, thread-send) are not forced
- * to carry a registry they never read.
- */
 interface ThreadPromptBannerDeps extends ThreadRuntimeDisplayDeps {
   providerRegistry: ProviderRegistryService;
 }
@@ -65,7 +63,7 @@ interface ResolveThreadRuntimeStateArgs {
 interface ResolveThreadRuntimeStateFromLatestSessionArgs {
   environmentHostId: string | null;
   hostConnected: boolean;
-  latestSession: HostDaemonSessionRow | null;
+  latestClosedSession: HostDaemonSessionRow | null;
   now?: number;
   status: ThreadStatus;
 }
@@ -87,13 +85,13 @@ interface ToThreadListEntryResponsesArgs {
 interface ToThreadListEntryResponseFromLatestSessionArgs {
   activity: ThreadActivityState;
   hostConnected: boolean;
-  latestSession: HostDaemonSessionRow | null;
+  latestClosedSession: HostDaemonSessionRow | null;
   now?: number;
+  queuedWork: ThreadQueuedWork;
   thread: ThreadWithPendingInteractionState;
 }
 
 interface BuildThreadStatusChangeMetadataByThreadIdArgs {
-  /** The host every listed thread's environment belongs to. */
   environmentHostId: string;
   threads: readonly Thread[];
 }
@@ -121,37 +119,14 @@ const EMPTY_THREAD_ACTIVITY: ThreadActivityState = {
 
 function threadStatusRuntimeState(status: ThreadStatus): ThreadRuntimeState {
   switch (status) {
+    case "pending":
     case "starting":
     case "idle":
     case "active":
     case "stopping":
     case "error":
-      return {
-        displayStatus: status,
-        hostReconnectGraceExpiresAt: null,
-      };
+      return { displayStatus: status };
   }
-}
-
-/**
- * Only computed for `active` threads: an active turn survives a daemon
- * disconnect until the active-work grace elapses, so that is the reconnect
- * window the DTO advertises. The shorter DAEMON_DISCONNECT_GRACE_MS window
- * only settles pending interactions and background tasks.
- */
-function getDaemonDisconnectGraceExpiresAt(
-  session: HostDaemonSessionRow,
-): number | null {
-  if (session.status !== "closed") {
-    return null;
-  }
-  if (session.closeReason !== "daemon-disconnect") {
-    return null;
-  }
-  if (session.closedAt === null) {
-    return null;
-  }
-  return session.closedAt + DAEMON_ACTIVE_WORK_DISCONNECT_GRACE_MS;
 }
 
 function hasOpenDaemonSessionForHost(
@@ -178,6 +153,7 @@ function toPublicThread(thread: Thread): Thread {
     status: thread.status,
     parentThreadId: thread.parentThreadId,
     sourceThreadId: thread.sourceThreadId,
+    lifecycleOwnerThreadId: thread.lifecycleOwnerThreadId,
     originKind: thread.originKind,
     originPluginId: thread.originPluginId,
     visibility: thread.visibility,
@@ -196,22 +172,26 @@ export function resolveThreadRuntimeState(
   args: ResolveThreadRuntimeStateArgs,
 ): ThreadRuntimeState {
   if (args.status !== "active" || args.environmentHostId === null) {
-    return threadStatusRuntimeState(args.status);
+    return resolveThreadRuntimeStateFromLatestSession({
+      environmentHostId: args.environmentHostId,
+      hostConnected: false,
+      latestClosedSession: null,
+      now: args.now,
+      status: args.status,
+    });
   }
 
   const hostConnected = hasOpenDaemonSessionForHost(
     deps,
     args.environmentHostId,
   );
-  const latestSession = hostConnected
-    ? null
-    : getLatestSessionForHost(deps.db, {
-        hostId: args.environmentHostId,
-      });
   return resolveThreadRuntimeStateFromLatestSession({
     environmentHostId: args.environmentHostId,
     hostConnected,
-    latestSession,
+    latestClosedSession: getLatestClosedSessionForHost(deps, {
+      hostConnected,
+      hostId: args.environmentHostId,
+    }),
     now: args.now,
     status: args.status,
   });
@@ -220,30 +200,35 @@ export function resolveThreadRuntimeState(
 function resolveThreadRuntimeStateFromLatestSession(
   args: ResolveThreadRuntimeStateFromLatestSessionArgs,
 ): ThreadRuntimeState {
+  // A `pending` thread needs no special case: it is never `active`, so it
+  // falls straight through to `threadStatusRuntimeState`, which reports it as
+  // itself. This used to short-circuit to a separate `held` display status
+  // derived from live dispatch holds — the holds are gone and `pending` is the
+  // status, so the derivation and its second vocabulary went with them.
   if (args.status !== "active" || args.environmentHostId === null) {
     return threadStatusRuntimeState(args.status);
   }
 
-  if (args.hostConnected) {
+  if (
+    args.hostConnected ||
+    isHostDisconnectHidden(args.latestClosedSession, args.now ?? Date.now())
+  ) {
     return threadStatusRuntimeState("active");
   }
+  return { displayStatus: "waiting-for-host" };
+}
 
-  const now = args.now ?? Date.now();
-  const latestSession = args.latestSession;
-  if (latestSession) {
-    const graceExpiresAt = getDaemonDisconnectGraceExpiresAt(latestSession);
-    if (graceExpiresAt !== null && graceExpiresAt > now) {
-      return {
-        displayStatus: "host-reconnecting",
-        hostReconnectGraceExpiresAt: graceExpiresAt,
-      };
-    }
+function getLatestClosedSessionForHost(
+  deps: ThreadRuntimeDisplayDeps,
+  args: { hostConnected: boolean; hostId: string },
+): HostDaemonSessionRow | null {
+  if (args.hostConnected) {
+    return null;
   }
-
-  return {
-    displayStatus: "waiting-for-host",
-    hostReconnectGraceExpiresAt: null,
-  };
+  return (
+    listLatestClosedSessionsForHosts(deps.db, { hostIds: [args.hostId] })[0] ??
+    null
+  );
 }
 
 function resolveThreadEnvironmentHostId(
@@ -256,16 +241,6 @@ function resolveThreadEnvironmentHostId(
   return getEnvironment(deps.db, thread.environmentId)?.hostId ?? null;
 }
 
-/**
- * Metadata for a `status-changed` notification: the post-transition row
- * fields plus the runtime and activity the thread's list row would render
- * with right now, built by the same helpers as the list endpoints. Clients
- * patch their cached list rows from it instead of refetching every thread
- * list. Activity rides along because the plan-mode and goal counts are gated
- * on the status and were previously only synced by that refetch. Producers
- * without a hub (writes inside a transaction that buffer notifications) send
- * the bare change kind and clients refetch as before.
- */
 export function buildThreadStatusChangeMetadata(
   deps: ThreadPromptBannerDeps,
   thread: Thread,
@@ -282,14 +257,6 @@ export function buildThreadStatusChangeMetadata(
   });
 }
 
-/**
- * `buildThreadStatusChangeMetadata` for many threads on one host in a fixed
- * number of queries: host connectivity and the latest session are resolved
- * once for the host and the activity helpers run over the whole array, as the
- * list endpoints do. The host fan-outs (daemon close, disconnect grace, host
- * removal) run synchronously on the event loop, so they must not pay one
- * snapshot's worth of queries per thread on a host with hundreds of threads.
- */
 export function buildThreadStatusChangeMetadataByThreadId(
   deps: ThreadPromptBannerDeps,
   args: BuildThreadStatusChangeMetadataByThreadIdArgs,
@@ -305,9 +272,10 @@ export function buildThreadStatusChangeMetadataByThreadId(
     deps,
     args.environmentHostId,
   );
-  const latestSession = hostConnected
-    ? null
-    : getLatestSessionForHost(deps.db, { hostId: args.environmentHostId });
+  const latestClosedSession = getLatestClosedSessionForHost(deps, {
+    hostConnected,
+    hostId: args.environmentHostId,
+  });
   return new Map(
     args.threads.map((thread) => [
       thread.id,
@@ -316,7 +284,7 @@ export function buildThreadStatusChangeMetadataByThreadId(
         runtime: resolveThreadRuntimeStateFromLatestSession({
           environmentHostId: args.environmentHostId,
           hostConnected,
-          latestSession,
+          latestClosedSession,
           status: thread.status,
         }),
         thread,
@@ -369,7 +337,14 @@ export function toThreadResponseFromThread(
       listActiveBackgroundTaskCountsByThreadIds(deps.db, {
         threadIds: [args.thread.id],
       })[0]?.activeBackgroundAgentCount ?? 0,
+    canRestoreEnvironment: canRestoreThreadEnvironment(deps, {
+      thread: args.thread,
+    }),
     canSpawnChild: canThreadSpawnChild(deps, { thread: args.thread }),
+    queuedMessageCount:
+      listQueuedThreadMessageCountsByThreadIds(deps.db, {
+        threadIds: [args.thread.id],
+      })[0]?.queuedMessageCount ?? 0,
   };
 }
 
@@ -396,8 +371,6 @@ function getThreadPromptBannerActivityState(
   };
 }
 
-// Pre-filter for the banner query: only threads whose provider declares a
-// plan command can have an active plan turn, so the rest are not event-loaded.
 function canThreadShowActivePlanMode(
   deps: ThreadPromptBannerDeps,
   thread: Thread,
@@ -485,11 +458,6 @@ export function getThreadPromptBannerActivity(
   );
 }
 
-/**
- * The list-row activity for each thread: background task counts from the
- * task rows plus the plan-mode and goal counts the prompt banner derives from
- * the event log. Threads with no activity at all are absent.
- */
 function buildThreadActivityStateByThreadId(
   deps: ThreadPromptBannerDeps,
   threads: readonly Thread[],
@@ -529,6 +497,30 @@ function buildThreadActivityStateByThreadId(
   return result;
 }
 
+/**
+ * Whether each thread has queued work, from one grouped count over live queued
+ * rows. Threads with an empty queue are absent, so the caller fills "none".
+ *
+ * A failure outranks a plain wait: a row that failed to go out is the one the
+ * reader has to do something about, and a thread can easily hold both.
+ */
+function buildThreadQueuedWorkByThreadId(
+  deps: ThreadRuntimeDisplayDeps,
+  threads: readonly Thread[],
+): Map<string, ThreadQueuedWork> {
+  const result = new Map<string, ThreadQueuedWork>();
+  for (const counts of listQueuedThreadMessageCountsByThreadIds(deps.db, {
+    threadIds: threads.map((thread) => thread.id),
+  })) {
+    if (counts.queuedMessageCount === 0) continue;
+    result.set(
+      counts.threadId,
+      counts.failedQueuedMessageCount > 0 ? "failed" : "waiting",
+    );
+  }
+  return result;
+}
+
 export function toThreadListEntryResponses(
   deps: ThreadPromptBannerDeps,
   args: ToThreadListEntryResponsesArgs,
@@ -549,27 +541,38 @@ export function toThreadListEntryResponses(
   const connectedActiveHostIds = new Set(
     activeHostIds.filter((hostId) => hasOpenDaemonSessionForHost(deps, hostId)),
   );
-  const latestSessionByHostId = new Map(
-    listLatestSessionsForHosts(deps.db, {
+  const latestClosedSessionByHostId = new Map(
+    listLatestClosedSessionsForHosts(deps.db, {
       hostIds: activeHostIds.filter(
         (hostId) => !connectedActiveHostIds.has(hostId),
       ),
     }).map((session) => [session.hostId, session]),
   );
-
+  const queuedWorkByThreadId = buildThreadQueuedWorkByThreadId(
+    deps,
+    args.threads,
+  );
   return args.threads.map((thread) => {
-    return toThreadListEntryResponseFromLatestSession({
+    const entry = toThreadListEntryResponseFromLatestSession({
       activity: activityByThreadId.get(thread.id) ?? EMPTY_THREAD_ACTIVITY,
+      queuedWork: queuedWorkByThreadId.get(thread.id) ?? "none",
       hostConnected:
         thread.environmentHostId !== null &&
         connectedActiveHostIds.has(thread.environmentHostId),
-      latestSession:
+      latestClosedSession:
         thread.environmentHostId === null
           ? null
-          : (latestSessionByHostId.get(thread.environmentHostId) ?? null),
+          : (latestClosedSessionByHostId.get(thread.environmentHostId) ?? null),
       now: args.now,
       thread,
     });
+    return thread.environmentHostId === null &&
+      (thread.status === "pending" || thread.status === "starting")
+      ? {
+          ...entry,
+          environmentHostId: intendedThreadHostId(deps, thread.id),
+        }
+      : entry;
   });
 }
 
@@ -580,17 +583,23 @@ function toThreadListEntryResponseFromLatestSession(
   return {
     ...thread,
     activity: args.activity,
+    queuedWork: args.queuedWork,
     pinSortKey: args.thread.pinSortKey,
     environmentBranchName: args.thread.environmentBranchName,
     environmentHostId: args.thread.environmentHostId,
     environmentName: args.thread.environmentName,
-    environmentWorkspaceDisplayKind:
-      args.thread.environmentWorkspaceDisplayKind,
+    environmentPath: args.thread.environmentPath,
+    environmentProviderId: args.thread.environmentProviderId,
+    environmentIsWorktree: args.thread.environmentIsWorktree,
+    environmentWorkspaceDisplayKind: resolveEnvironmentWorkspaceDisplayKind({
+      environmentProviderId: args.thread.environmentProviderId,
+      isWorktree: args.thread.environmentIsWorktree,
+    }),
     hasPendingInteraction: args.thread.hasPendingInteraction,
     runtime: resolveThreadRuntimeStateFromLatestSession({
       environmentHostId: args.thread.environmentHostId,
       hostConnected: args.hostConnected,
-      latestSession: args.latestSession,
+      latestClosedSession: args.latestClosedSession,
       now: args.now,
       status: thread.status,
     }),

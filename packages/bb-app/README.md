@@ -91,6 +91,23 @@ local host daemon, and serves the web app. It stores bb-managed state under
 launcher restarts that child without stopping the other one. Press `Ctrl+C` in
 the terminal to stop both processes and exit with status `0`.
 
+Server and host-daemon output goes directly to `logs/server-stdio.log` and
+`logs/host-daemon-stdio.log` under the data directory, including startup errors
+and console output. These files append across restarts; they are separate from
+the rotating application logs. The launcher prints status and log locations
+without forwarding service output to the terminal, so a stalled terminal cannot
+block service logging. To follow output with the default data directory:
+
+```bash
+tail -F ~/.bb/logs/server-stdio.log ~/.bb/logs/host-daemon-stdio.log
+```
+
+Launcher status output is plain when stdout is redirected, including in CI.
+Set `FORCE_COLOR=1` to request color or `NO_COLOR=1` to disable it; `NO_COLOR`
+takes precedence. In-place progress updates require a stdout TTY.
+
+The same output capture applies to `bb-server` and `bb-host-daemon`.
+
 To stop a bb that runs in another terminal or in the background:
 
 ```bash
@@ -100,6 +117,27 @@ npx bb-app stop
 `stop` reads `bb-app-runtime.json` from the data directory, confirms that the
 recorded process really is that launcher, then stops it. Pass `--data-dir` when
 the bb you want to stop does not use the default `~/.bb/`.
+
+### Updating from the app
+
+Start bb with `npx bb-app start --in-app-updates` to turn this on. When bb has
+an update, Settings → Updates then shows an **Update** button (or run
+`bb updates app apply`). bb downloads the new version into
+`~/.bb/app-versions/`, restarts into it, and reconnects the page. bb does not
+roll back: if the new version fails to start, run a newer release
+(`npx bb-app@latest`) or fix the cause. Later `npx bb-app` runs use the newer
+installed version; pass `--bundled` to run the copy npx downloaded instead.
+
+After the server moves to another machine, the old data directory keeps
+`server-moved.json`. `bb-app` there starts no server: it runs this computer's
+host daemon against the new server address in `config.json`, restarting it when
+it exits, and answers the old server port. API requests get `410 server_moved`
+with the new address; browser pages redirect to it for a direct address or link
+to it for bb connect. While a move back to this computer is in progress
+(`server-import.json`), it frees that port for the incoming server. When
+`server-moved.json` goes away, after that move completes or `bb server unlock`,
+it starts the server and co-located daemon again. `bb-server` exits with status
+`3` instead of starting, except for the incoming server of a move back.
 
 From the app, add or open a project, start a thread, and choose the provider
 you want that thread to use.
@@ -143,15 +181,15 @@ targets (see the remote-access note below). Scripts launched by bb already recei
 
 bb uses whichever providers you have configured. Common providers:
 
-| Provider       | Setup                                                                                                                                                                                     |
-| -------------- | ----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| `codex`        | Install the [Codex CLI](https://developers.openai.com/codex/cli). Then run `codex login` or configure credentials per the Codex docs.                                                     |
-| `claude-code`  | Install [Claude Code](https://docs.anthropic.com/en/docs/claude-code) and authenticate per its docs.                                                                                      |
-| `cursor`       | Install [Cursor's agent CLI](https://cursor.com/cli) (`cursor-agent`) and authenticate per Cursor's docs.                                                                                 |
-| `pi`           | Install [Pi](https://github.com/earendil-works/pi/tree/main/packages/coding-agent) with `npm install -g @earendil-works/pi-coding-agent` (0.84.0 or newer) and authenticate per its docs; BB can run the install from Settings.          |
-| `opencode`     | Install [opencode](https://opencode.ai/) and authenticate per its docs.                                                                                                                   |
-| `grok`         | Install [Grok Build](https://docs.x.ai/build/overview) and authenticate with `grok login` or `XAI_API_KEY`.                                                                               |
-| `hermes-agent` | Install [Hermes Agent](https://hermes-agent.nousresearch.com/docs/getting-started/installation), configure credentials with `hermes model`, then verify ACP with `hermes acp --check`.    |
+| Provider       | Setup                                                                                                                                                                                                                           |
+| -------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `codex`        | Install the [Codex CLI](https://developers.openai.com/codex/cli). Then run `codex login` or configure credentials per the Codex docs.                                                                                           |
+| `claude-code`  | Install [Claude Code](https://docs.anthropic.com/en/docs/claude-code) and authenticate per its docs.                                                                                                                            |
+| `cursor`       | Install [Cursor's agent CLI](https://cursor.com/cli) (`cursor-agent`) and authenticate per Cursor's docs.                                                                                                                       |
+| `pi`           | Install [Pi](https://github.com/earendil-works/pi/tree/main/packages/coding-agent) with `npm install -g @earendil-works/pi-coding-agent` (0.84.0 or newer) and authenticate per its docs; BB can run the install from Settings. |
+| `opencode`     | Install [opencode](https://opencode.ai/) and authenticate per its docs.                                                                                                                                                         |
+| `grok`         | Install [Grok Build](https://docs.x.ai/build/overview) and authenticate with `grok login` or `XAI_API_KEY`.                                                                                                                     |
+| `hermes-agent` | Install [Hermes Agent](https://hermes-agent.nousresearch.com/docs/getting-started/installation), configure credentials with `hermes model`, then verify ACP with `hermes acp --check`.                                          |
 
 BB indexes the documented native skill roots for Codex, Claude Code, Pi,
 Cursor, OpenCode, omp, Grok Build, and Hermes Agent. It includes user roots,
@@ -190,9 +228,6 @@ Use `bb-app config` for persistent non-secret package settings under
 
 ```bash
 npx bb-app config set BB_APP_URL https://<machine>.<tailnet>.ts.net
-npx bb-app config set BB_INFERENCE codex/gpt-5.6-luna
-npx bb-app config set BB_INFERENCE_FALLBACK codex/gpt-5.4-mini
-npx bb-app config set BB_TRANSCRIPTION codex/gpt-transcribe
 npx bb-app config list
 npx bb-app config refresh
 ```
@@ -232,4 +267,4 @@ behavior, see the
 - [Platform support](https://github.com/get-bb/bb/blob/main/docs/platform-support.md)
 - [Configuration](https://github.com/get-bb/bb/blob/main/docs/configuration.md)
 - [Using bb on multiple devices](https://github.com/get-bb/bb/blob/main/docs/multiple-devices.md)
-- [Worktrees and setup scripts](https://github.com/get-bb/bb/blob/main/docs/worktrees.md)
+- [Worktree setup and teardown scripts](https://github.com/get-bb/bb/blob/main/docs/worktrees.md)

@@ -76,6 +76,51 @@ describe("createAppVersionService", () => {
     expect(calls[0]?.url).toBe("https://registry.npmjs.org/bb-app/latest");
   });
 
+  it("checks the nightly dist-tag when running a nightly build", async () => {
+    const calls: FetchCall[] = [];
+    const service = createAppVersionService({
+      config: { appVersion: "0.43.5-nightly.100.1", isDevelopment: false },
+      fetchImpl: createStubFetch(
+        [{ body: { version: "0.43.5-nightly.101.1" } }],
+        calls,
+      ),
+      logger: testLogger,
+    });
+    const response = await service.getSystemVersion();
+    expect(calls[0]?.url).toBe("https://registry.npmjs.org/bb-app/nightly");
+    expect(response.updateAvailable).toBe(true);
+    expect(response.upgradeCommand).toBe("npx bb-app@nightly");
+  });
+
+  it("offers a newer stable release to a nightly build when nightly lags behind", async () => {
+    const calls: FetchCall[] = [];
+    const fetchImpl = (async (input: RequestInfo | URL) => {
+      const url = String(input);
+      calls.push({ url, signal: null });
+      const version = url.endsWith("/nightly")
+        ? "0.43.5-nightly.100.1"
+        : "0.44.0";
+      return new Response(JSON.stringify({ version }), {
+        status: 200,
+        headers: { "content-type": "application/json" },
+      });
+    }) as typeof fetch;
+    const service = createAppVersionService({
+      config: { appVersion: "0.43.5-nightly.100.1", isDevelopment: false },
+      fetchImpl,
+      logger: testLogger,
+    });
+
+    const response = await service.getSystemVersion();
+
+    expect(calls.map((call) => call.url).sort()).toEqual([
+      "https://registry.npmjs.org/bb-app/latest",
+      "https://registry.npmjs.org/bb-app/nightly",
+    ]);
+    expect(response.latestVersion).toBe("0.44.0");
+    expect(response.upgradeCommand).toBe("npx bb-app@latest");
+  });
+
   it("reports updateAvailable=false when versions are equal", async () => {
     const service = createAppVersionService({
       config: { appVersion: "0.0.6", isDevelopment: false },
@@ -224,8 +269,6 @@ describe("createAppVersionService", () => {
   });
 
   it("returns latestVersion=null after TTL expiry even if the prior cache held a value (no stale fallback)", async () => {
-    // Locks in Sawyer's iteration decision (2026-05-20): choice A —
-    // null on failure rather than serving the stale cached value.
     const calls: FetchCall[] = [];
     let currentTime = 1_000;
     const service = createAppVersionService({
@@ -251,8 +294,6 @@ describe("createAppVersionService", () => {
   });
 
   it("treats a published prerelease latest as an update when local is the stable predecessor", async () => {
-    // semver.gt("0.0.6-alpha.1", "0.0.5") === true. If npm `latest` is a
-    // prerelease, trust npm.
     const service = createAppVersionService({
       config: { appVersion: "0.0.5", isDevelopment: false },
       fetchImpl: createStubFetch([{ body: { version: "0.0.6-alpha.1" } }], []),
@@ -264,7 +305,6 @@ describe("createAppVersionService", () => {
   });
 
   it("does not flag updateAvailable when local is the stable that follows a published prerelease", async () => {
-    // semver.gt("0.0.5-alpha.1", "0.0.5") === false.
     const service = createAppVersionService({
       config: { appVersion: "0.0.5", isDevelopment: false },
       fetchImpl: createStubFetch([{ body: { version: "0.0.5-alpha.1" } }], []),
@@ -276,8 +316,6 @@ describe("createAppVersionService", () => {
   });
 
   it("ignores semver build metadata when comparing equal versions", async () => {
-    // semver.gt("0.0.5+build.1", "0.0.5") === false; build metadata is
-    // ignored by precedence rules.
     const service = createAppVersionService({
       config: { appVersion: "0.0.5", isDevelopment: false },
       fetchImpl: createStubFetch([{ body: { version: "0.0.5+build.1" } }], []),

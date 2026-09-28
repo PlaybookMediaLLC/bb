@@ -1,24 +1,18 @@
-/**
- * Discriminated state for the composer's submit affordances. Replaces the
- * previous canSendFollowUp / canQueueFollowUp / canStopRuntime / onStop
- * boolean soup. The caller computes one of these from runtimeDisplayStatus +
- * pending-interaction state and passes it down; the composer reads .kind to
- * render submit/queue/stop affordances.
- */
 export type FollowUpBlockedReason =
   | "loading-execution-options"
   | "loading-pending-interactions"
   | "pending-interaction"
-  | "provisioning"
-  | "stopping"
   | "unavailable";
 
+/**
+ * `queue-while-stopping` is its own arm rather than a `queue` with the stop
+ * button omitted. A composer in this state must not offer to stop a run that
+ * is already stopping, and must not steer on Enter — there is no turn left to
+ * steer — so the two differ in more than an affordance. What they share is the
+ * only thing that matters to the user: the message is accepted and runs next.
+ */
 export type FollowUpSubmitMode =
-  /** Idle thread — submit creates a new turn; no stop affordance. */
   | { kind: "ready" }
-  /** Runtime is active or host-reconnecting — submit queues the message; stop the runtime. */
   | { kind: "queue"; onStop: () => void }
-  /** Runtime is pre-start or waiting on the host — can't send/queue, but can stop. */
-  | { kind: "stop-only"; onStop: () => void }
-  /** Can't submit and can't stop — show why. */
+  | { kind: "queue-while-stopping" }
   | { kind: "blocked"; reason: FollowUpBlockedReason };

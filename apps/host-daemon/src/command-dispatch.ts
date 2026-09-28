@@ -1,5 +1,12 @@
+import { operationEnvironment } from "./operation-environment.js";
+import {
+  runEnvironmentHook,
+  cancelEnvironmentHook,
+} from "./command-handlers/environment-hook.js";
 import {
   providerCliInstallEventSchema,
+  type DesktopBrowserCommand,
+  type DesktopBrowserResult,
   type HostDaemonCommand,
   type HostDaemonCommandResult,
   type HostDaemonOnlineRpcCommand,
@@ -7,7 +14,9 @@ import {
   type HostDaemonOnlineRpcResult,
   type HostDaemonSettledCommandType,
   type ProviderCliInstallEvent,
+  type WorkspaceResolutionFailure,
 } from "@bb/host-daemon-contract";
+import type { AgentRuntimeBridgeLaunch } from "@bb/agent-runtime";
 import semver from "semver";
 import {
   ExpectedCommandDispatchError,
@@ -20,8 +29,8 @@ import {
   provisionEnvironment,
 } from "./command-handlers/environment.js";
 import {
+  inspectHostGitSource,
   listHostBranchOptions,
-  listHostBranches,
 } from "./command-handlers/host-branches.js";
 import {
   installGlobalSkills,
@@ -39,6 +48,7 @@ import {
   listHostFiles,
   listHostPaths,
   readHostFile,
+  readHostFileChunk,
   readHostFileMetadata,
   readHostRelativeFile,
 } from "./command-handlers/host-files.js";
@@ -60,13 +70,13 @@ import type {
 } from "@bb/provider-bridge-protocol";
 import {
   discardThreadRewind,
+  deleteThreadStorage,
   ensureThreadRuntime,
   prepareThreadRewind,
   startThread,
   submitTurn,
 } from "./command-handlers/thread.js";
-import { WorkspaceError } from "@bb/host-workspace";
-import { squashMerge } from "./command-handlers/workspace.js";
+import { WorkspaceError, type HostWorkspace } from "@bb/host-workspace";
 import {
   cloneProject,
   inspectProjectPath,
@@ -78,8 +88,52 @@ import {
   workspaceResolutionFailureFromError,
 } from "./workspace-resolution.js";
 import { userExecutableProcessOptions } from "./user-executable-env.js";
+import type { ServerMoveService } from "./server-move/service.js";
 
 const THREAD_STOP_ACTIVE_TURN_WAIT_MS = 5_000;
+
+type RuntimeStopCommand =
+  | CommandOf<"thread.stop">
+  | CommandOf<"thread.storage.delete">;
+
+async function stopThreadRuntime(
+  command: RuntimeStopCommand,
+  options: CommandDispatchOptions,
+): Promise<HostDaemonCommandResult<"thread.stop">> {
+  const released =
+    await options.runtimeManager.releaseThreadFromOtherEnvironments({
+      activeTurn: "interrupt",
+      environmentId: command.environmentId,
+      threadId: command.threadId,
+    });
+  const entry = await options.runtimeManager.getOrAwait(command.environmentId);
+  if (!entry) {
+    await options.eventSink.flush();
+    return { providerCheckpointId: released.providerCheckpointId };
+  }
+  let providerCheckpointId = released.providerCheckpointId;
+  if (entry.runtime.hasThread(command.threadId)) {
+    if (
+      command.type === "thread.stop" &&
+      command.intent === "release" &&
+      entry.runtime.getActiveTurnId(command.threadId) !== null
+    ) {
+      await options.eventSink.flush();
+      return { providerCheckpointId, activeTurnRetained: true };
+    }
+    if (command.type !== "thread.stop" || command.intent !== "release") {
+      await entry.runtime.waitForActiveTurn(command.threadId, {
+        timeoutMs: THREAD_STOP_ACTIVE_TURN_WAIT_MS,
+      });
+    }
+    const result = await entry.runtime.stopThread({
+      threadId: command.threadId,
+    });
+    providerCheckpointId = result.providerCheckpointId ?? providerCheckpointId;
+  }
+  await options.eventSink.flush();
+  return { providerCheckpointId };
+}
 
 export {
   CommandDispatchError,
@@ -291,109 +345,129 @@ async function runProviderInstallationOnHost(
   }
 }
 
-const commandHandlers: CommandHandlerMap = {
-  "thread.rewind.discard": async (command, options) => {
-    const release =
-      await options.runtimeManager.retainEnvironmentForThreadCommand(
-        command.environmentId,
-        command.threadId,
-      );
-    try {
-      return await discardThreadRewind(command, options);
-    } finally {
-      release();
-    }
-  },
-  "thread.rewind.prepare": async (command, options) => {
-    const release =
-      await options.runtimeManager.retainEnvironmentForThreadCommand(
-        command.environmentId,
-        command.threadId,
-      );
-    try {
-      return await prepareThreadRewind(command, options);
-    } finally {
-      release();
-    }
-  },
-  "thread.start": async (command, options) => {
-    const release =
-      await options.runtimeManager.retainEnvironmentForThreadCommand(
-        command.environmentId,
-        command.threadId,
-      );
-    try {
-      return await startThread(command, options);
-    } finally {
-      release();
-    }
-  },
-  "turn.submit": async (command, options) => {
-    const release =
-      await options.runtimeManager.retainEnvironmentForThreadCommand(
-        command.environmentId,
-        command.threadId,
-      );
-    try {
-      const entry = await ensureThreadRuntime(command, options);
-      return await submitTurn(command, entry, options);
-    } finally {
-      release();
-    }
-  },
-  "thread.stop": async (command, options) => {
-    // Release before the target runtime lookup. A moved thread often has no
-    // runtime in its new environment yet, and the old owner must still stop.
-    const released =
-      await options.runtimeManager.releaseThreadFromOtherEnvironments({
-        activeTurn: "interrupt",
-        environmentId: command.environmentId,
-        threadId: command.threadId,
-      });
-    const entry = await options.runtimeManager.getOrAwait(
+async function withRetainedThreadEnvironment<TResult>(
+  command: CommandOf<
+    | "thread.rewind.discard"
+    | "thread.rewind.prepare"
+    | "thread.start"
+    | "turn.submit"
+  >,
+  options: CommandDispatchOptions,
+  work: () => Promise<TResult>,
+): Promise<TResult> {
+  const release =
+    await options.runtimeManager.retainEnvironmentForThreadCommand(
       command.environmentId,
+      command.threadId,
     );
-    if (!entry) {
-      // No loaded runtime means the idempotent stop already reached its goal.
-      await options.eventSink.flush();
-      return {
-        providerCheckpointId: released.providerCheckpointId,
-      };
-    }
-    let providerCheckpointId = released.providerCheckpointId;
-    if (entry.runtime.hasThread(command.threadId)) {
-      // Stop can be dispatched while the start/submit RPC is still in flight
-      // and the turn/started event has not been observed yet. Wait for the
-      // runtime to learn the active turn (event-driven, resolves null on
-      // timeout or when the thread goes idle) so the provider stop carries
-      // the right turn id. A release does not wait: the server already
-      // settled the thread as idle, so waiting only burns the full timeout on
-      // every runtime it unloads.
-      //
-      // A release can still lose a race with a turn that started after the
-      // server read the thread. Stopping then would end accepted work and
-      // leave the server holding an active thread with no runtime, so a
-      // release skips a busy runtime instead. A later idle release unloads it.
-      if (command.intent === "release") {
-        if (entry.runtime.getActiveTurnId(command.threadId) !== null) {
-          await options.eventSink.flush();
-          return { providerCheckpointId };
-        }
-      } else {
-        await entry.runtime.waitForActiveTurn(command.threadId, {
-          timeoutMs: THREAD_STOP_ACTIVE_TURN_WAIT_MS,
-        });
-      }
-      const result = await entry.runtime.stopThread({
-        threadId: command.threadId,
-      });
-      providerCheckpointId =
-        result.providerCheckpointId ?? providerCheckpointId;
-    }
-    // Stop completion finalizes server-side thread state. Flush provider
-    // events first so buffered lifecycle events cannot arrive after that.
-    await options.eventSink.flush();
-    return { providerCheckpointId };
+  try {
+    return await work();
+  } finally {
+    release();
+  }
+}
+
+function requireServerMove(options: CommandDispatchOptions): ServerMoveService {
+  if (!options.serverMove) {
+    throw new Error("Server move is unavailable on this daemon");
+  }
+  return options.serverMove;
+}
+
+async function forwardDesktopBrowserCommand<
+  TCommand extends DesktopBrowserCommand,
+>(
+  command: TCommand,
+  options: CommandDispatchOptions,
+): Promise<DesktopBrowserResult<TCommand["type"]>> {
+  if (!options.desktopBrowserBroker)
+    throw new Error("Desktop browser broker unavailable");
+  return options.desktopBrowserBroker.request(command);
+}
+
+async function withResolvedBridgeLaunch<TResult>(
+  command: CommandOf<
+    "provider.list_models" | "provider.health" | "provider.usage"
+  >,
+  options: CommandDispatchOptions,
+  call: (args: {
+    providerId: string;
+    bridgeLaunch: AgentRuntimeBridgeLaunch;
+    cwd?: string;
+  }) => Promise<TResult>,
+): Promise<TResult> {
+  const bridgeLaunch = await resolveRuntimeBridgeLaunch(
+    command.bridgeLaunch,
+    options,
+  );
+  return call({
+    providerId: command.providerId,
+    ...(command.cwd !== undefined ? { cwd: command.cwd } : {}),
+    bridgeLaunch,
+  });
+}
+
+async function readAvailableWorkspace<TAvailable extends object>(
+  command: CommandOf<
+    | "workspace.status"
+    | "workspace.diff"
+    | "workspace.diffFiles"
+    | "workspace.diffPatch"
+  >,
+  options: CommandDispatchOptions,
+  read: (workspace: HostWorkspace) => Promise<TAvailable>,
+): Promise<
+  | ({ outcome: "available" } & TAvailable)
+  | { outcome: "unavailable"; failure: WorkspaceResolutionFailure }
+> {
+  const resolution = await resolveWorkspaceForCommand({
+    environmentId: command.environmentId,
+    requireGit: true,
+    runtimeManager: options.runtimeManager,
+    workspaceContext: command.workspaceContext,
+  });
+  if (!resolution.ok) {
+    return { outcome: "unavailable", failure: resolution.failure };
+  }
+  try {
+    return {
+      outcome: "available",
+      ...(await read(resolution.entry.workspace)),
+    };
+  } catch (error) {
+    return {
+      outcome: "unavailable",
+      failure: workspaceResolutionFailureFromError({
+        error,
+        workspacePath: command.workspaceContext.workspacePath,
+      }),
+    };
+  }
+}
+
+const commandHandlers: CommandHandlerMap = {
+  "thread.rewind.discard": (command, options) =>
+    withRetainedThreadEnvironment(command, options, () =>
+      discardThreadRewind(command, options),
+    ),
+  "thread.rewind.prepare": (command, options) =>
+    withRetainedThreadEnvironment(command, options, () =>
+      prepareThreadRewind(command, options),
+    ),
+  "thread.start": (command, options) =>
+    withRetainedThreadEnvironment(command, options, () =>
+      startThread(command, options),
+    ),
+  "turn.submit": (command, options) =>
+    withRetainedThreadEnvironment(command, options, async () => {
+      const entry = await ensureThreadRuntime(command, options);
+      return submitTurn(command, entry, options);
+    }),
+  "thread.stop": stopThreadRuntime,
+  "thread.storage.delete": async (command, options) => {
+    const result = await stopThreadRuntime(command, options);
+    await deleteThreadStorage(command, options);
+    return result;
   },
   "thread.goal.clear": async (command, options) => {
     const entry = await ensureThreadRuntime(command, options);
@@ -404,8 +478,6 @@ const commandHandlers: CommandHandlerMap = {
     return result;
   },
   "thread.plan.cancel": async (command, options) => {
-    // A moved thread keeps its turn in the environment it left, and the new
-    // environment may hold no runtime yet. Cancel where the turn runs.
     const owners = options.runtimeManager.listThreadOwnerEntries(
       command.threadId,
     );
@@ -434,8 +506,6 @@ const commandHandlers: CommandHandlerMap = {
     if (!entry) {
       return {};
     }
-    // Rename does not move the provider session, so it must not stop a turn
-    // that still runs in the environment the thread left.
     await entry.runtime.renameThread({
       threadId: command.threadId,
       title: command.title,
@@ -444,7 +514,6 @@ const commandHandlers: CommandHandlerMap = {
   },
   "thread.archive": async (command, options) => {
     const entry = await requireResolvedWorkspaceForCommand({
-      dataDir: options.dataDir,
       environmentId: command.environmentId,
       runtimeManager: options.runtimeManager,
       workspaceContext: command.workspaceContext,
@@ -453,8 +522,6 @@ const commandHandlers: CommandHandlerMap = {
       command.bridgeLaunch,
       options,
     );
-    // Archive works on stored provider state, not on the live session, so it
-    // must not stop a turn in the environment the thread left.
     await entry.runtime.archiveThread({
       threadId: command.threadId,
       providerId: command.providerId,
@@ -481,48 +548,36 @@ const commandHandlers: CommandHandlerMap = {
     return {};
   },
   "interactive.resolve": resolveInteractiveRequest,
-  "environment.provision": provisionEnvironment,
+  "environment.attach": provisionEnvironment,
   "project.clone": (command, options) =>
     cloneProject({
       dataDir: options.dataDir,
       projectSlug: command.projectSlug,
+      env: operationEnvironment(
+        command.contributedEnv,
+        {
+          ...process.env,
+          ...options.runtimeManager.getShellEnv(),
+        },
+        true,
+      ),
       remoteUrl: command.remoteUrl,
+      onProgress: (text) =>
+        options.emitEnvironmentHookProgress?.({
+          type: "environment.hook.progress",
+          operationId: command.operationId,
+          entry: { type: "output", text, status: null },
+        }),
       ...userExecutableProcessOptions(options.runtimeManager.getShellEnv()),
       ...(command.targetPath !== undefined
         ? { targetPath: command.targetPath }
         : {}),
     }),
-  "environment.provision.cancel": cancelEnvironmentProvision,
-  "environment.destroy": async (command, options) => {
-    const resolution = await resolveWorkspaceForCommand({
-      dataDir: options.dataDir,
-      environmentId: command.environmentId,
-      runtimeManager: options.runtimeManager,
-      workspaceContext: command.workspaceContext,
-    });
-    if (!resolution.ok) {
-      // Treat already-missing workspaces as successful destroy (idempotent retry).
-      if (resolution.failure.code === "path_not_found") {
-        return {};
-      }
-      throw new ExpectedCommandDispatchError(
-        resolution.failure.code,
-        resolution.failure.message,
-      );
-    }
-    await options.terminalManager?.closeEnvironmentTerminals({
-      environmentId: command.environmentId,
-      reason: "environment-destroyed",
-    });
-    await options.runtimeManager.destroyEnvironment(command.environmentId);
-    return {};
-  },
+  "environment.attach.cancel": cancelEnvironmentProvision,
   "workspace.commit": async (command, options) => {
     const entry = await requireResolvedWorkspaceForCommand({
-      dataDir: options.dataDir,
       environmentId: command.environmentId,
       requireGit: true,
-      requireManagedWorktree: true,
       runtimeManager: options.runtimeManager,
       workspaceContext: command.workspaceContext,
     });
@@ -531,51 +586,37 @@ const commandHandlers: CommandHandlerMap = {
       noVerify: true,
     });
   },
-  "workspace.squash_merge": squashMerge,
   "workspace.pull_request_action": async (command, options) => {
     const entry = await requireResolvedWorkspaceForCommand({
-      dataDir: options.dataDir,
       environmentId: command.environmentId,
       requireGit: true,
-      requireManagedWorktree: true,
       runtimeManager: options.runtimeManager,
       workspaceContext: command.workspaceContext,
     });
-    const cliOptions = userExecutableProcessOptions(
-      options.runtimeManager.getShellEnv(),
+    await entry.workspace.runPullRequestAction(
+      command.operation === "merge"
+        ? { operation: "merge", method: command.method }
+        : { operation: command.operation },
+      userExecutableProcessOptions(options.runtimeManager.getShellEnv()),
     );
-    switch (command.operation) {
-      case "ready":
-        await entry.workspace.runPullRequestAction(
-          { operation: "ready" },
-          cliOptions,
-        );
-        break;
-      case "draft":
-        await entry.workspace.runPullRequestAction(
-          { operation: "draft" },
-          cliOptions,
-        );
-        break;
-      case "merge":
-        await entry.workspace.runPullRequestAction(
-          {
-            operation: "merge",
-            method: command.method,
-          },
-          cliOptions,
-        );
-        break;
-      default: {
-        const _exhaustive: never = command;
-        throw new Error(`Unhandled pull request operation: ${_exhaustive}`);
-      }
-    }
     return {};
   },
 };
 
 const onlineRpcHandlers: OnlineRpcHandlerMap = {
+  "environment.hook.run": runEnvironmentHook,
+  "environment.hook.cancel": cancelEnvironmentHook,
+  "desktop.browser.list_instances": forwardDesktopBrowserCommand,
+  "desktop.browser.list_tabs": forwardDesktopBrowserCommand,
+  "desktop.browser.create_tab": forwardDesktopBrowserCommand,
+  "desktop.browser.reveal_tab": forwardDesktopBrowserCommand,
+  "desktop.browser.close_tab": forwardDesktopBrowserCommand,
+  "desktop.browser.capture_tab": forwardDesktopBrowserCommand,
+  "desktop.browser.acquire_control": forwardDesktopBrowserCommand,
+  "desktop.browser.open_connection": forwardDesktopBrowserCommand,
+  "desktop.browser.release_control": forwardDesktopBrowserCommand,
+  "desktop.browser.list_import_sources": forwardDesktopBrowserCommand,
+  "desktop.browser.import_cookies": forwardDesktopBrowserCommand,
   "connect-tunnel.ensure-identity": async (_command, options) => {
     if (!options.ensureConnectTunnelIdentity) {
       throw new Error("bb connect tunnel identity is unavailable");
@@ -614,45 +655,25 @@ const onlineRpcHandlers: OnlineRpcHandlerMap = {
   "host.install_global_skills": installGlobalSkills,
   "host.global_skills_status": async (command) =>
     readGlobalSkillsStatus(command, {}),
+  "host.inspect_git_source": inspectHostGitSource,
   "host.list_branch_options": listHostBranchOptions,
-  "host.list_branches": listHostBranches,
   "host.file_metadata": readHostFileMetadata,
   "host.read_file": readHostFile,
+  "host.read_file_chunk": readHostFileChunk,
   "host.read_file_relative": readHostRelativeFile,
   "host.write_file": writeHostFile,
-  "provider.list_models": async (command, options) => {
-    const bridgeLaunch = await resolveRuntimeBridgeLaunch(
-      command.bridgeLaunch,
-      options,
-    );
-    return options.listModels({
-      providerId: command.providerId,
-      ...(command.cwd !== undefined ? { cwd: command.cwd } : {}),
-      bridgeLaunch,
-    });
-  },
-  "provider.health": async (command, options) => {
-    const bridgeLaunch = await resolveRuntimeBridgeLaunch(
-      command.bridgeLaunch,
-      options,
-    );
-    return options.providerHealth({
-      providerId: command.providerId,
-      ...(command.cwd !== undefined ? { cwd: command.cwd } : {}),
-      bridgeLaunch,
-    });
-  },
-  "provider.usage": async (command, options) => {
-    const bridgeLaunch = await resolveRuntimeBridgeLaunch(
-      command.bridgeLaunch,
-      options,
-    );
-    return options.providerUsage({
-      providerId: command.providerId,
-      ...(command.cwd !== undefined ? { cwd: command.cwd } : {}),
-      bridgeLaunch,
-    });
-  },
+  "provider.list_models": (command, options) =>
+    withResolvedBridgeLaunch(command, options, (args) =>
+      options.listModels(args),
+    ),
+  "provider.health": (command, options) =>
+    withResolvedBridgeLaunch(command, options, (args) =>
+      options.providerHealth(args),
+    ),
+  "provider.usage": (command, options) =>
+    withResolvedBridgeLaunch(command, options, (args) =>
+      options.providerUsage(args),
+    ),
   "provider.installation.status": async (command, options) => {
     const bridgeLaunch = await resolveRuntimeBridgeLaunch(
       command.bridgeLaunch,
@@ -668,142 +689,45 @@ const onlineRpcHandlers: OnlineRpcHandlerMap = {
     });
   },
   "provider.installation.run": runProviderInstallationOnHost,
-  "workspace.status": async (command, options) => {
-    const resolution = await resolveWorkspaceForCommand({
-      dataDir: options.dataDir,
-      environmentId: command.environmentId,
-      requireGit: true,
-      requireManagedWorktree: true,
-      runtimeManager: options.runtimeManager,
-      workspaceContext: command.workspaceContext,
-    });
-    if (!resolution.ok) {
-      return { outcome: "unavailable", failure: resolution.failure };
-    }
-    try {
-      return {
-        outcome: "available",
-        workspaceStatus: await resolution.entry.workspace.getStatus({
-          mergeBaseBranch: command.mergeBaseBranch,
-          maxUntrackedLineStatFiles: command.maxUntrackedLineStatFiles,
-          maxUntrackedLineStatBytes: command.maxUntrackedLineStatBytes,
-        }),
-      };
-    } catch (error) {
-      return {
-        outcome: "unavailable",
-        failure: workspaceResolutionFailureFromError({
-          error,
-          workspacePath: command.workspaceContext.workspacePath,
-        }),
-      };
-    }
-  },
-  "workspace.diff": async (command, options) => {
-    const resolution = await resolveWorkspaceForCommand({
-      dataDir: options.dataDir,
-      environmentId: command.environmentId,
-      requireGit: true,
-      requireManagedWorktree: true,
-      runtimeManager: options.runtimeManager,
-      workspaceContext: command.workspaceContext,
-    });
-    if (!resolution.ok) {
-      return { outcome: "unavailable", failure: resolution.failure };
-    }
-    try {
-      return {
-        outcome: "available",
-        diff: await resolution.entry.workspace.getDiff({
-          target: command.target,
-          maxDiffBytes: command.maxDiffBytes,
-          maxFileListBytes: command.maxFileListBytes,
-          maxUntrackedFiles: command.maxUntrackedFiles,
-        }),
-      };
-    } catch (error) {
-      return {
-        outcome: "unavailable",
-        failure: workspaceResolutionFailureFromError({
-          error,
-          workspacePath: command.workspaceContext.workspacePath,
-        }),
-      };
-    }
-  },
-  "workspace.diffFiles": async (command, options) => {
-    const resolution = await resolveWorkspaceForCommand({
-      dataDir: options.dataDir,
-      environmentId: command.environmentId,
-      requireGit: true,
-      requireManagedWorktree: true,
-      runtimeManager: options.runtimeManager,
-      workspaceContext: command.workspaceContext,
-    });
-    if (!resolution.ok) {
-      return { outcome: "unavailable", failure: resolution.failure };
-    }
-    try {
-      return {
-        outcome: "available",
-        ...(await resolution.entry.workspace.diffFiles({
-          target: command.target,
-          maxFiles: command.maxFiles,
-        })),
-      };
-    } catch (error) {
-      return {
-        outcome: "unavailable",
-        failure: workspaceResolutionFailureFromError({
-          error,
-          workspacePath: command.workspaceContext.workspacePath,
-        }),
-      };
-    }
-  },
-  "workspace.diffPatch": async (command, options) => {
-    const resolution = await resolveWorkspaceForCommand({
-      dataDir: options.dataDir,
-      environmentId: command.environmentId,
-      requireGit: true,
-      requireManagedWorktree: true,
-      runtimeManager: options.runtimeManager,
-      workspaceContext: command.workspaceContext,
-    });
-    if (!resolution.ok) {
-      return { outcome: "unavailable", failure: resolution.failure };
-    }
-    try {
-      return {
-        outcome: "available",
-        patches: await resolution.entry.workspace.diffPatch({
-          target: command.target,
-          paths: command.paths,
-          maxBytesPerFile: command.maxBytesPerFile,
-        }),
-      };
-    } catch (error) {
-      return {
-        outcome: "unavailable",
-        failure: workspaceResolutionFailureFromError({
-          error,
-          workspacePath: command.workspaceContext.workspacePath,
-        }),
-      };
-    }
-  },
+  "workspace.status": (command, options) =>
+    readAvailableWorkspace(command, options, async (workspace) => ({
+      workspaceStatus: await workspace.getStatus({
+        mergeBaseBranch: command.mergeBaseBranch,
+        maxUntrackedLineStatFiles: command.maxUntrackedLineStatFiles,
+        maxUntrackedLineStatBytes: command.maxUntrackedLineStatBytes,
+      }),
+    })),
+  "workspace.diff": (command, options) =>
+    readAvailableWorkspace(command, options, async (workspace) => ({
+      diff: await workspace.getDiff({
+        target: command.target,
+        maxDiffBytes: command.maxDiffBytes,
+        maxFileListBytes: command.maxFileListBytes,
+        maxUntrackedFiles: command.maxUntrackedFiles,
+      }),
+    })),
+  "workspace.diffFiles": (command, options) =>
+    readAvailableWorkspace(command, options, (workspace) =>
+      workspace.diffFiles({
+        target: command.target,
+        maxFiles: command.maxFiles,
+      }),
+    ),
+  "workspace.diffPatch": (command, options) =>
+    readAvailableWorkspace(command, options, async (workspace) => ({
+      patches: await workspace.diffPatch({
+        target: command.target,
+        paths: command.paths,
+        maxBytesPerFile: command.maxBytesPerFile,
+      }),
+    })),
   "workspace.pull_request": async (command, options) => {
     const resolution = await resolveWorkspaceForCommand({
-      dataDir: options.dataDir,
       environmentId: command.environmentId,
       requireGit: true,
-      requireManagedWorktree: true,
       runtimeManager: options.runtimeManager,
       workspaceContext: command.workspaceContext,
     });
-    // A non-git workspace genuinely has no PR; every other resolution failure
-    // means the lookup cannot run, which must stay distinguishable from
-    // "checked and found nothing".
     if (!resolution.ok) {
       return resolution.failure.code === "not_git_repo"
         ? { outcome: "absent" }
@@ -821,6 +745,18 @@ const onlineRpcHandlers: OnlineRpcHandlerMap = {
         return { outcome: "unavailable", message: lookup.message };
     }
   },
+  "server_move.inspect": (command, options) =>
+    requireServerMove(options).inspect(command),
+  "server_move.probe": (command, options) =>
+    requireServerMove(options).probe(command),
+  "server_move.prepare": (command, options) =>
+    requireServerMove(options).prepare(command),
+  "server_move.activate": (command, options) =>
+    requireServerMove(options).activate(command),
+  "server_move.abort": (command, options) =>
+    requireServerMove(options).abort(command),
+  "server_move.delete_old_copy": (_command, options) =>
+    requireServerMove(options).deleteOldCopy(),
 };
 
 export async function dispatchCommand<

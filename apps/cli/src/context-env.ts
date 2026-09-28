@@ -1,5 +1,7 @@
 import { loadCliConfig, type CliConfig } from "@bb/config/cli";
 import { toOptionalString } from "@bb/config/strings";
+import { CliUsageError } from "./cli-usage-error.js";
+import { missingThreadIdHint } from "./context-hints.js";
 
 const VALID_ID_PATTERN = /^[a-zA-Z0-9_-]+$/;
 
@@ -68,7 +70,6 @@ export function requireThreadId(positionalId?: string): string {
 
 export interface ResolvedId {
   id: string;
-  /** "arg" when provided as a positional/flag, "env" when resolved from BB_* env. */
   source: "arg" | "env";
 }
 
@@ -76,13 +77,6 @@ interface ThreadSelfTargetOptions {
   self?: boolean;
 }
 
-/**
- * Require a thread ID for commands that support `--self`.
- *
- * - Positional `<id>` and `--self` are mutually exclusive.
- * - `--self` resolves from BB_THREAD_ID.
- * - If neither is provided, error with guidance.
- */
 export function requireThreadIdOrSelf(
   positionalId: string | undefined,
   opts: ThreadSelfTargetOptions,
@@ -100,7 +94,11 @@ export function requireThreadIdOrSelf(
   if (positionalId) {
     return validateId(positionalId, "<threadId> argument");
   }
-  throw new Error("Missing thread ID. Pass <threadId> or use --self.");
+  throw new CliUsageError({
+    code: "missing_required",
+    hint: missingThreadIdHint(),
+    message: "Missing thread ID. Pass <threadId> or use --self.",
+  });
 }
 
 export interface ContextSnapshot {

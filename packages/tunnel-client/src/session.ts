@@ -1,5 +1,3 @@
-// Transport-generic tunnel client session: proxies relayed HTTP/WS streams
-// from one live tunnel socket to per-stream loopback origins.
 import {
   request as httpRequest,
   type IncomingMessage,
@@ -23,6 +21,7 @@ import type { TunnelClientLogger } from "./logger.js";
 
 const HEARTBEAT_INTERVAL_MS = 20_000;
 const HEARTBEAT_DEADLINE_MS = 60_000;
+const HEARTBEAT_LATE_TICK_MS = HEARTBEAT_INTERVAL_MS + 5_000;
 
 const UNREGISTERED_PORT_BODY = "this port is not shared";
 const textEncoder = new TextEncoder();
@@ -37,15 +36,6 @@ interface OriginHttpRequestArgs {
   url: URL;
 }
 
-/**
- * Restore the Content-Length that the relay strips.
- *
- * Node's HTTP client does not use chunked encoding by default for GET, HEAD,
- * and DELETE. Without a Content-Length, it writes such a body with no framing
- * at all. The origin then reads a body-less request and parses the leftover
- * bytes as the next request on that connection, which answers an empty 400.
- * An explicit Content-Length frames the body for every method.
- */
 function frameBodyHeaders(
   headers: Record<string, string>,
   body: Buffer | undefined,
@@ -93,13 +83,11 @@ function roundDurationMs(durationMs: number): number {
   return Math.round(durationMs * 10) / 10;
 }
 
-/** True when this open-ws is the bb app's realtime socket via the bare handle. */
 export function isBareBbRealtimeWs(
   path: string,
   target: string | undefined,
 ): boolean {
   if (target !== undefined) return false;
-  // Spec: path starts with `/ws` and has no target.
   return path === "/ws" || path.startsWith("/ws?") || path.startsWith("/ws/");
 }
 
@@ -112,15 +100,12 @@ interface WsStream {
   socket: NodeWebSocket;
   buffered: Frame[];
   open: boolean;
-  /** Counted toward remoteClients (bare-handle /ws). */
   countsAsRemoteClient: boolean;
 }
 
 interface ResolvedStreamOrigin {
-  /** Fetch/WS base, e.g. `http://127.0.0.1:38886` or a share port. */
   origin: string;
   publicOrigin: string;
-  /** Injected Host for share streams; omitted for bare-handle. */
   host?: string;
 }
 
@@ -131,22 +116,18 @@ export type StreamOriginResult =
 interface TunnelSessionOptions {
   tunnel: NodeWebSocket;
   log: TunnelClientLogger;
-  /**
-   * Resolve a frame's optional `target` (decimal port string) to a local
-   * origin. Called for every open-http / open-ws.
-   */
   resolveOrigin: (target: string | undefined) => StreamOriginResult;
-  /** Fired when remoteClients transitions 0↔nonzero. */
   onRemoteClientsChange?: (remoteClients: number) => void;
-  /** Fired on every relayed frame (any type). */
   onActivity?: (at: number) => void;
+  monotonicNow?: () => number;
 }
 
-/** Proxies one live tunnel socket's frames to per-stream loopback origins. */
 export class TunnelSession {
   private readonly httpStreams = new Map<number, HttpStream>();
   private readonly wsStreams = new Map<number, WsStream>();
   private lastAck = Date.now();
+  private lastHeartbeatTickAt = 0;
+  private stallGraceSinceAck = false;
   private heartbeat: ReturnType<typeof setInterval> | undefined;
   private remoteClientCount = 0;
   lastRemoteActivityAt: number | null = null;
@@ -159,8 +140,21 @@ export class TunnelSession {
 
   start(): void {
     const { tunnel } = this.options;
+    const monotonicNow = this.options.monotonicNow ?? (() => performance.now());
+    this.lastAck = Date.now();
+    this.lastHeartbeatTickAt = monotonicNow();
     this.heartbeat = setInterval(() => {
-      if (Date.now() - this.lastAck > HEARTBEAT_DEADLINE_MS) {
+      const tickAt = monotonicNow();
+      const tickGapMs = tickAt - this.lastHeartbeatTickAt;
+      this.lastHeartbeatTickAt = tickAt;
+      const now = Date.now();
+      if (tickGapMs > HEARTBEAT_LATE_TICK_MS && !this.stallGraceSinceAck) {
+        this.options.log.warn(
+          `event loop stalled for ${Math.round(tickGapMs / 1000)}s; restarting the tunnel heartbeat deadline`,
+        );
+        this.lastAck = now;
+        this.stallGraceSinceAck = true;
+      } else if (now - this.lastAck > HEARTBEAT_DEADLINE_MS) {
         this.options.log.warn("tunnel heartbeat missed; reconnecting");
         tunnel.terminate();
         return;
@@ -170,7 +164,10 @@ export class TunnelSession {
 
     tunnel.on("message", (data: Buffer, isBinary: boolean) => {
       if (!isBinary) {
-        if (data.toString() === HEARTBEAT_RESPONSE) this.lastAck = Date.now();
+        if (data.toString() === HEARTBEAT_RESPONSE) {
+          this.lastAck = Date.now();
+          this.stallGraceSinceAck = false;
+        }
         return;
       }
       try {
@@ -357,8 +354,6 @@ export class TunnelSession {
         );
       }
     } catch (e) {
-      // Unreachable share ports and other fetch failures: clean close-stream,
-      // not a crash. Aborted streams are silent.
       if (!stream.abort.signal.aborted) {
         this.send({
           type: "close-stream",
@@ -446,8 +441,6 @@ export class TunnelSession {
       }
     });
     socket.on("error", (e: Error) => {
-      // Dead share ports surface as socket errors; the subsequent 'close'
-      // sends close-stream. Log only — do not throw.
       this.options.log.warn(`origin ws error on ${frame.path}: ${e.message}`);
     });
   }

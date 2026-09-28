@@ -56,18 +56,25 @@ const THREAD_CONVERSATION_OUTLINE_QUERY_KEY = "threadConversationOutline";
 const THREAD_TIMELINE_TURN_SUMMARY_DETAILS_QUERY_KEY =
   "threadTimelineTurnSummaryDetails";
 const SYSTEM_PROVIDERS_QUERY_KEY = "systemProviders";
+const SYSTEM_MACHINE_PROVIDERS_QUERY_KEY = "systemMachineProviders";
+const MACHINE_ENVIRONMENT_QUERY_KEY = "machine-environment";
 const SYSTEM_CONFIG_QUERY_KEY = "systemConfig";
+const SYSTEM_AI_SERVICES_QUERY_KEY = "systemAiServices";
+const UI_PREFERENCES_QUERY_KEY = "uiPreferences";
+const SYSTEM_THEME_QUERY_KEY = "systemTheme";
 export const SYSTEM_EXECUTION_OPTIONS_QUERY_KEY = "systemExecutionOptions";
 const SYSTEM_CLI_SKILLS_QUERY_KEY = "systemCliSkills";
 const SYSTEM_VERSION_QUERY_KEY = "systemVersion";
+const SYSTEM_APP_UPDATE_QUERY_KEY = "systemAppUpdate";
+const SERVER_MOVE_STATUS_QUERY_KEY = "serverMoveStatus";
 const HOST_PROVIDER_CLI_STATUS_QUERY_KEY = "hostProviderCliStatus";
-const SYSTEM_USAGE_LIMITS_QUERY_KEY = "systemUsageLimits";
 const SYSTEM_PROVIDER_STATES_QUERY_KEY = "systemProviderStates";
 const HOST_PATH_EXISTENCE_QUERY_KEY = "hostPathExistence";
 const PROJECT_SKILLS_QUERY_KEY = "projectSkills";
 export const SKILL_CONTENT_QUERY_KEY = "skillContent";
 export const SKILL_FILES_QUERY_KEY = "skillFiles";
 const PLUGIN_LIST_QUERY_KEY = "plugin-list";
+const PLUGIN_SAFE_MODE_QUERY_KEY = "plugin-safe-mode";
 const PLUGIN_SETTINGS_VIEW_QUERY_KEY = "plugin-settings-view";
 const PLUGIN_CONTRIBUTIONS_QUERY_KEY = "plugin-contributions";
 const PLUGIN_SDK_SETTINGS_QUERY_KEY = "plugin-settings";
@@ -77,6 +84,7 @@ const PLUGIN_CATALOG_INSTALL_PLAN_QUERY_KEY = "plugin-catalog-install-plan";
 const PLUGIN_MARKETPLACES_QUERY_KEY = "plugin-marketplaces";
 export interface ThreadListQueryFilters {
   projectId?: string;
+  hostId?: string;
   hasParent?: ThreadListFilters["hasParent"];
   parentThreadId?: string;
   sourceThreadId?: string;
@@ -99,7 +107,9 @@ export interface ArchivedThreadsListFilters {
 
 export const ARCHIVED_THREADS_LIST_KIND = "archivedList";
 
-type HostsQueryKey = readonly [typeof HOSTS_QUERY_KEY];
+type HostsQueryKey =
+  | readonly [typeof HOSTS_QUERY_KEY]
+  | readonly [typeof HOSTS_QUERY_KEY, true];
 type HostQueryId = string | null | undefined;
 type HostQueryKey = readonly [typeof HOST_QUERY_KEY, HostQueryId];
 type AllHostQueryKeyPrefix = readonly [typeof HOST_QUERY_KEY];
@@ -444,16 +454,30 @@ type SystemProvidersQueryKey = readonly [
 type AllSystemProvidersQueryKeyPrefix = readonly [
   typeof SYSTEM_PROVIDERS_QUERY_KEY,
 ];
-type SystemConfigQueryKey = readonly [typeof SYSTEM_CONFIG_QUERY_KEY];
-type SystemCliSkillsQueryKey = readonly [typeof SYSTEM_CLI_SKILLS_QUERY_KEY];
-type SystemVersionQueryKey = readonly [typeof SYSTEM_VERSION_QUERY_KEY];
-type HostProviderCliStatusQueryKey = readonly [
-  typeof HOST_PROVIDER_CLI_STATUS_QUERY_KEY,
+type SystemMachineProvidersQueryKey = readonly [
+  typeof SYSTEM_MACHINE_PROVIDERS_QUERY_KEY,
+];
+type AllSystemMachineProvidersQueryKeyPrefix = readonly [
+  typeof SYSTEM_MACHINE_PROVIDERS_QUERY_KEY,
+];
+type MachineEnvironmentQueryKey = readonly [
+  typeof MACHINE_ENVIRONMENT_QUERY_KEY,
   string | null,
 ];
-type SystemUsageLimitsQueryKey = readonly [
-  typeof SYSTEM_USAGE_LIMITS_QUERY_KEY,
-  string | null,
+type AllMachineEnvironmentQueryKeyPrefix = readonly [
+  typeof MACHINE_ENVIRONMENT_QUERY_KEY,
+];
+type SystemConfigQueryKey = readonly [typeof SYSTEM_CONFIG_QUERY_KEY];
+type SystemAiServicesQueryKey = readonly [typeof SYSTEM_AI_SERVICES_QUERY_KEY];
+type UiPreferencesQueryKey = readonly [typeof UI_PREFERENCES_QUERY_KEY];
+type SystemThemeQueryKey = readonly [typeof SYSTEM_THEME_QUERY_KEY, string];
+type AllSystemThemesQueryKeyPrefix = readonly [typeof SYSTEM_THEME_QUERY_KEY];
+type SystemCliSkillsQueryKey = readonly [typeof SYSTEM_CLI_SKILLS_QUERY_KEY];
+type SystemVersionQueryKey = readonly [typeof SYSTEM_VERSION_QUERY_KEY];
+type SystemAppUpdateQueryKey = readonly [typeof SYSTEM_APP_UPDATE_QUERY_KEY];
+type ServerMoveStatusQueryKey = readonly [typeof SERVER_MOVE_STATUS_QUERY_KEY];
+type HostProviderCliStatusQueryKey = readonly [
+  typeof HOST_PROVIDER_CLI_STATUS_QUERY_KEY,
   string | null,
 ];
 type SystemProviderStatesQueryKey = readonly [
@@ -486,8 +510,8 @@ interface ProjectDefaultExecutionOptionsQueryKeyArgs {
   projectId: string;
 }
 
-export function hostsQueryKey(): HostsQueryKey {
-  return [HOSTS_QUERY_KEY];
+export function hostsQueryKey(includeCreating = false): HostsQueryKey {
+  return includeCreating ? [HOSTS_QUERY_KEY, true] : [HOSTS_QUERY_KEY];
 }
 
 export function hostQueryKey(hostId: HostQueryId): HostQueryKey {
@@ -952,12 +976,6 @@ export function allThreadTimelineTurnSummaryDetailsQueryKeyPrefix(): AllThreadTi
   return [THREAD_TIMELINE_TURN_SUMMARY_DETAILS_QUERY_KEY];
 }
 
-/**
- * The discriminating second component of a diff query key: the merge-base
- * branch for `branch_committed`/`all`, the SHA for `commit`, and `null` for
- * `uncommitted` (and for an absent target). Shared by every environment-diff
- * query family so they key off the same target identity.
- */
 export function environmentDiffTargetKey(
   target: WorkspaceDiffTarget | null | undefined,
 ): string | null {
@@ -1076,6 +1094,24 @@ export function allSystemProvidersQueryKeyPrefix(): AllSystemProvidersQueryKeyPr
   return [SYSTEM_PROVIDERS_QUERY_KEY];
 }
 
+export function systemMachineProvidersQueryKey(): SystemMachineProvidersQueryKey {
+  return [SYSTEM_MACHINE_PROVIDERS_QUERY_KEY];
+}
+
+export function allSystemMachineProvidersQueryKeyPrefix(): AllSystemMachineProvidersQueryKeyPrefix {
+  return [SYSTEM_MACHINE_PROVIDERS_QUERY_KEY];
+}
+
+export function machineEnvironmentQueryKey(
+  projectId: string | null,
+): MachineEnvironmentQueryKey {
+  return [MACHINE_ENVIRONMENT_QUERY_KEY, projectId];
+}
+
+export function allMachineEnvironmentQueryKeyPrefix(): AllMachineEnvironmentQueryKeyPrefix {
+  return [MACHINE_ENVIRONMENT_QUERY_KEY];
+}
+
 export function systemCliSkillsQueryKey(): SystemCliSkillsQueryKey {
   return [SYSTEM_CLI_SKILLS_QUERY_KEY];
 }
@@ -1084,21 +1120,38 @@ export function systemConfigQueryKey(): SystemConfigQueryKey {
   return [SYSTEM_CONFIG_QUERY_KEY];
 }
 
+export function systemAiServicesQueryKey(): SystemAiServicesQueryKey {
+  return [SYSTEM_AI_SERVICES_QUERY_KEY];
+}
+
+export function uiPreferencesQueryKey(): UiPreferencesQueryKey {
+  return [UI_PREFERENCES_QUERY_KEY];
+}
+
+export function systemThemeQueryKey(themeId: string): SystemThemeQueryKey {
+  return [SYSTEM_THEME_QUERY_KEY, themeId];
+}
+
+export function allSystemThemesQueryKeyPrefix(): AllSystemThemesQueryKeyPrefix {
+  return [SYSTEM_THEME_QUERY_KEY];
+}
+
 export function systemVersionQueryKey(): SystemVersionQueryKey {
   return [SYSTEM_VERSION_QUERY_KEY];
+}
+
+export function systemAppUpdateQueryKey(): SystemAppUpdateQueryKey {
+  return [SYSTEM_APP_UPDATE_QUERY_KEY];
+}
+
+export function serverMoveStatusQueryKey(): ServerMoveStatusQueryKey {
+  return [SERVER_MOVE_STATUS_QUERY_KEY];
 }
 
 export function hostProviderCliStatusQueryKey(
   hostId: string | null,
 ): HostProviderCliStatusQueryKey {
   return [HOST_PROVIDER_CLI_STATUS_QUERY_KEY, hostId];
-}
-
-export function systemUsageLimitsQueryKey(
-  hostId: string | null,
-  providerId: string | null = null,
-): SystemUsageLimitsQueryKey {
-  return [SYSTEM_USAGE_LIMITS_QUERY_KEY, hostId, providerId];
 }
 
 export function systemProviderStatesQueryKey(
@@ -1163,19 +1216,16 @@ export function skillFilesQueryKey(projectId: string, skillId: string) {
   return [SKILL_FILES_QUERY_KEY, projectId, skillId] as const;
 }
 
-/**
- * Plugin management keys live here, away from the modules that fetch them.
- * `realtime-cache-registry` runs on the boot path and needs only these
- * prefixes; when it read them from `plugin-*-queries` it dragged the whole
- * plugin query layer — client, catalog search, settings forms — into the
- * boot payload for a handful of strings. Keep new plugin keys here too.
- */
 export function pluginListQueryKey(enabled: boolean) {
   return [PLUGIN_LIST_QUERY_KEY, enabled] as const;
 }
 
 export function allPluginListQueryKeyPrefix() {
   return [PLUGIN_LIST_QUERY_KEY] as const;
+}
+
+export function pluginSafeModeQueryKey() {
+  return [PLUGIN_SAFE_MODE_QUERY_KEY] as const;
 }
 
 export function pluginSettingsViewQueryKey(pluginId: string) {
@@ -1190,24 +1240,20 @@ export function pluginContributionsQueryKey() {
   return [PLUGIN_CONTRIBUTIONS_QUERY_KEY] as const;
 }
 
-/**
- * Prefix covering every contributions cache entry. The realtime
- * `plugins-changed` broadcast invalidates it so `bb plugin
- * reload/enable/disable` reaches open pages without waiting out the stale
- * time.
- */
 export function allPluginContributionsQueryKeyPrefix() {
   return [PLUGIN_CONTRIBUTIONS_QUERY_KEY] as const;
 }
 
-/** Values a plugin frontend reads through the plugin SDK's `useSettings()`. */
 export function pluginSdkSettingsQueryKey(pluginId: string) {
   return [PLUGIN_SDK_SETTINGS_QUERY_KEY, pluginId] as const;
 }
 
-/** Prefix the realtime `plugins-changed` broadcast invalidates. */
 export function allPluginSettingsQueryKeyPrefix() {
   return [PLUGIN_SDK_SETTINGS_QUERY_KEY] as const;
+}
+
+export function pluginUpdateCheckQueryKey(pluginId: string | null) {
+  return ["plugins", "update-check", pluginId] as const;
 }
 
 export function pluginSourceQueryKey(pluginId: string) {

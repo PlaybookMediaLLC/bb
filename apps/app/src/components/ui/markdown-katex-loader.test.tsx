@@ -1,9 +1,5 @@
 // @vitest-environment jsdom
 
-// Own file on purpose: the KaTeX chunk loads once per module registry, so the
-// "not loaded" assertions below only mean something when no earlier test in
-// the same file has rendered math.
-
 import { act, cleanup, render, waitFor } from "@testing-library/react";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { MarkdownPreview } from "./markdown-preview";
@@ -26,7 +22,6 @@ describe("MarkdownPreview lazy KaTeX", () => {
         content={"Plain prose with $5 and $x$ and \\$10 escaped."}
       />,
     );
-    // Flush effects and any microtasks a stray import() would schedule.
     await act(async () => {
       await Promise.resolve();
     });
@@ -38,14 +33,28 @@ describe("MarkdownPreview lazy KaTeX", () => {
   it("loads the chunk once and re-renders every mounted preview with KaTeX", async () => {
     const first = render(<MarkdownPreview content={"One: $$a^2$$"} />);
     const second = render(<MarkdownPreview content={"Two: $$b^2$$"} />);
+    const mathPieces =
+      "Intro.\n\n$$\n\\frac{1}{2}\n$$\n\nMiddle paragraph.\n\n";
+    const incremental = render(
+      <MarkdownPreview content={"Intro.\n\n"} incrementalBlocks />,
+    );
+    incremental.rerender(
+      <MarkdownPreview content={mathPieces} incrementalBlocks />,
+    );
+    expect(incremental.container.querySelector(".katex-display")).toBeNull();
 
     await waitFor(() => {
       expect(first.container.querySelector(".katex")).not.toBeNull();
       expect(second.container.querySelector(".katex")).not.toBeNull();
+      expect(
+        incremental.container.querySelector(".katex-display"),
+      ).not.toBeNull();
     });
     expect(katexChunkLoads.count).toBe(1);
+    expect(incremental.container.innerHTML).toBe(
+      render(<MarkdownPreview content={mathPieces} />).container.innerHTML,
+    );
 
-    // A later preview gets the plugin synchronously on its first render.
     const third = render(<MarkdownPreview content={"Three: $$c^2$$"} />);
     expect(third.container.querySelector(".katex")).not.toBeNull();
     expect(katexChunkLoads.count).toBe(1);

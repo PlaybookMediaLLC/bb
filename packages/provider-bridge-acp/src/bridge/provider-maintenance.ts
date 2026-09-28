@@ -5,9 +5,22 @@ import os from "node:os";
 import path from "node:path";
 import { DatabaseSync } from "node:sqlite";
 import { promisify } from "node:util";
-import type { ProviderHealthResult, ProviderInstallationRunResult, ProviderInstallationStatus, ProviderUsage, ProviderUsageResult, ProviderUsageWindow } from "@bb/provider-bridge-protocol";
-import { clampPercent, downloadedInstallerCommand, readCliVersion, resolveExecutablePath } from "@bb/provider-bridge-protocol/bridge-kit";
+import type {
+  ProviderHealthResult,
+  ProviderInstallationRunResult,
+  ProviderInstallationStatus,
+  ProviderUsage,
+  ProviderUsageResult,
+  ProviderUsageWindow,
+} from "@bb/provider-bridge-protocol";
+import {
+  clampPercent,
+  downloadedInstallerCommand,
+  readCliVersion,
+  resolveExecutablePath,
+} from "@bb/provider-bridge-protocol/bridge-kit";
 import { z } from "zod";
+import { readOpenCodeGoUsage } from "./opencode-usage.js";
 
 const execFileAsync = promisify(execFile);
 const USAGE_FETCH_TIMEOUT_MS = 15_000;
@@ -116,21 +129,10 @@ function readAccountEmail(): string | null {
   }
 }
 
-/**
- * What an agent's own dialect knows about keeping it healthy: how a user
- * signs in, whether bb can install it, and where its account and usage live.
- * ACP standardizes none of it, so a generic bridge can only report whether
- * the executable exists — everything richer belongs to the agent, and is
- * therefore the dialect's (see `dialect.ts`), never a bb provider id's.
- */
 export interface AcpMaintenanceDialect {
-  /** The shell command that signs the user in. */
   loginCommand: string;
-  /** How bb installs or updates the agent, when it can. */
   installer(): { command: string; args: string[]; displayCommand: string };
-  /** The signed-in account, or null when the agent is not signed in. */
   readAccount(): Promise<{ email: string | null } | null>;
-  /** The agent's usage windows, for the usage surfaces. */
   readUsage(): Promise<ProviderUsageResult>;
 }
 
@@ -252,7 +254,10 @@ function buildAcpProviderInstallationRun(
     action: "install" | "update";
   },
 ): ProviderInstallationRunResult {
-  if (status.installAction?.kind !== args.action || args.maintenance === undefined) {
+  if (
+    status.installAction?.kind !== args.action ||
+    args.maintenance === undefined
+  ) {
     return {
       available: false,
       message: `${args.command ?? "This ACP agent"} ${args.action} is not available on this host.`,
@@ -371,15 +376,23 @@ function fetchDashboard(
 export async function getAcpProviderUsage(args: {
   maintenance: AcpMaintenanceDialect | undefined;
   command: string | null;
+  dialectId: string;
+  env: NodeJS.ProcessEnv;
 }): Promise<ProviderUsageResult> {
-  if (args.maintenance === undefined) return { supported: false };
-  if (args.command === null || (await resolveExecutablePath(args.command)) === null) {
+  const readUsage =
+    args.dialectId === "opencode"
+      ? () => readOpenCodeGoUsage(args.env)
+      : args.maintenance?.readUsage;
+  if (readUsage === undefined) return { supported: false };
+  if (
+    args.command === null ||
+    (await resolveExecutablePath(args.command)) === null
+  ) {
     return { supported: true, usage: { status: "not_installed" } };
   }
-  return args.maintenance.readUsage();
+  return readUsage();
 }
 
-/** Cursor's own maintenance surface; the cursor dialect carries it. */
 export const CURSOR_ACP_MAINTENANCE: AcpMaintenanceDialect = {
   loginCommand: "cursor-agent login",
   installer: () => downloadedInstallerCommand(CURSOR_INSTALL_SCRIPT_URL),

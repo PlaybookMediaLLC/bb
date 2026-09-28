@@ -1,19 +1,19 @@
 import { useCallback, useRef, useState } from "react";
+import {
+  usePendingAttachmentUploads,
+  type PendingAttachmentUpload,
+} from "@/components/promptbox/usePendingAttachmentUploads";
 import { useUploadPromptAttachment } from "@/hooks/mutations/project-mutations";
 import { getMutationErrorMessage } from "@/lib/mutation-errors";
 import { BbHttpError } from "@/lib/sdk";
 import type { PromptDraftAttachment } from "@bb/client-core";
-import type { InlineQueuedMessageEditState } from "./useInlineQueuedMessageEditing";
+import type { InlineComposerDraftSession } from "./useActiveComposerDraft";
 
 interface UseComposerAttachmentUploadsArgs {
   projectId: string;
-  /** Appends an uploaded attachment to the bottom composer draft. */
   addDraftAttachment: (attachment: PromptDraftAttachment) => void;
-  inlineEditingQueuedMessage: InlineQueuedMessageEditState | null;
-  inlineEditingQueuedMessageRef: React.RefObject<InlineQueuedMessageEditState | null>;
-  commitInlineQueuedMessage: (
-    next: InlineQueuedMessageEditState | null,
-  ) => void;
+  inlineEditSessionId: number | null;
+  inlineSessionRef: React.RefObject<InlineComposerDraftSession | null>;
 }
 
 interface UseComposerAttachmentUploadsResult {
@@ -21,14 +21,15 @@ interface UseComposerAttachmentUploadsResult {
   setBottomAttachmentError: (error: string | null) => void;
   handleAttachBottomFiles: (files: File[]) => Promise<void>;
   isAttachingBottomFiles: boolean;
+  bottomPendingUploads: readonly PendingAttachmentUpload[];
   inlineAttachmentError: string | null;
   setInlineAttachmentError: (error: string | null) => void;
   handleAttachInlineFiles: (files: File[]) => Promise<void>;
   isAttachingInlineFiles: boolean;
+  inlinePendingUploads: readonly PendingAttachmentUpload[];
 }
 
 interface DraftAttachmentUploadTarget {
-  /** Changes whenever a newly mounted draft must not receive older uploads. */
   key: string;
   addAttachment: (attachment: PromptDraftAttachment) => void;
 }
@@ -43,6 +44,7 @@ interface UseDraftAttachmentUploadsResult {
   setAttachmentError: (error: string | null) => void;
   handleAttachFiles: (files: File[]) => Promise<void>;
   isAttachingFiles: boolean;
+  pendingUploads: readonly PendingAttachmentUpload[];
 }
 
 interface DraftAttachmentOperationState {
@@ -51,10 +53,6 @@ interface DraftAttachmentOperationState {
   targetKey: string | null;
 }
 
-/**
- * The server states why it refused an upload (unsupported format, size
- * limit); transport failures carry nothing a user can act on.
- */
 function uploadRejectionReason(error: unknown): string | null {
   return error instanceof BbHttpError
     ? getMutationErrorMessage({ error, fallbackMessage: "Request failed" })
@@ -71,7 +69,6 @@ function attachFailureMessage(
     : `Failed to attach ${names}: ${reason}`;
 }
 
-/** Upload state for one independently mounted composer draft. */
 export function useDraftAttachmentUploads({
   projectId,
   target,
@@ -86,6 +83,9 @@ export function useDraftAttachmentUploads({
   });
   const targetKey = target?.key ?? null;
   const isCurrentOperation = operation.targetKey === targetKey;
+  const { pendingUploads, startUploads, finishUploads } = usePendingAttachmentUploads(
+    targetKey === null ? null : `${projectId}\0${targetKey}`,
+  );
 
   const setAttachmentError = useCallback(
     (error: string | null) => {
@@ -111,22 +111,25 @@ export function useDraftAttachmentUploads({
             : 1,
         targetKey: capturedTargetKey,
       }));
+      const uploads = startUploads(files);
       const failedFiles: string[] = [];
       let rejectionReason: string | null = null;
       try {
-        for (const file of files) {
+        for (const upload of uploads) {
           try {
             const uploaded = await uploadPromptAttachment.mutateAsync({
               projectId,
-              file,
+              file: upload.file,
             });
             const currentTarget = targetRef.current;
             if (currentTarget?.key === capturedTargetKey) {
               currentTarget.addAttachment(uploaded);
             }
           } catch (error) {
-            failedFiles.push(file.name);
+            failedFiles.push(upload.file.name);
             rejectionReason ??= uploadRejectionReason(error);
+          } finally {
+            finishUploads([upload]);
           }
         }
       } finally {
@@ -145,7 +148,7 @@ export function useDraftAttachmentUploads({
         );
       }
     },
-    [projectId, uploadPromptAttachment],
+    [projectId, uploadPromptAttachment, startUploads, finishUploads],
   );
 
   return {
@@ -153,66 +156,48 @@ export function useDraftAttachmentUploads({
     setAttachmentError,
     handleAttachFiles,
     isAttachingFiles: isCurrentOperation && operation.pendingCount > 0,
+    pendingUploads,
   };
 }
 
-/**
- * Uploads dropped/picked files for either independently mounted composer. The
- * inline owner is captured per invocation so a dismissed edit session cannot
- * receive a late upload.
- */
 export function useComposerAttachmentUploads({
   projectId,
   addDraftAttachment,
-  inlineEditingQueuedMessage,
-  inlineEditingQueuedMessageRef,
-  commitInlineQueuedMessage,
+  inlineEditSessionId,
+  inlineSessionRef,
 }: UseComposerAttachmentUploadsArgs): UseComposerAttachmentUploadsResult {
   const {
     attachmentError: bottomAttachmentError,
     setAttachmentError: setBottomAttachmentError,
     handleAttachFiles: handleAttachBottomFiles,
     isAttachingFiles: isAttachingBottomFiles,
+    pendingUploads: bottomPendingUploads,
   } = useDraftAttachmentUploads({
     projectId,
     target: { key: "bottom", addAttachment: addDraftAttachment },
   });
-  const inlineEditSessionId = inlineEditingQueuedMessage?.editSessionId ?? null;
   const addInlineAttachment = useCallback(
     (uploaded: PromptDraftAttachment) => {
-      const current = inlineEditingQueuedMessageRef.current;
-      if (
-        current === null ||
-        current.editSessionId !== inlineEditSessionId ||
-        current.draft.attachments.some(
-          (existing) => existing.path === uploaded.path,
-        )
-      ) {
+      const current = inlineSessionRef.current;
+      if (current === null || current.editSessionId !== inlineEditSessionId) {
         return;
       }
-      commitInlineQueuedMessage({
-        ...current,
-        draft: {
-          ...current.draft,
-          attachments: [...current.draft.attachments, uploaded],
-        },
-      });
+      current.setDraft((draft) =>
+        draft.attachments.some((existing) => existing.path === uploaded.path)
+          ? draft
+          : { ...draft, attachments: [...draft.attachments, uploaded] },
+      );
     },
-    [
-      commitInlineQueuedMessage,
-      inlineEditSessionId,
-      inlineEditingQueuedMessageRef,
-    ],
+    [inlineEditSessionId, inlineSessionRef],
   );
   const {
     attachmentError: inlineAttachmentError,
     setAttachmentError: setInlineAttachmentError,
     handleAttachFiles: handleAttachInlineFiles,
     isAttachingFiles: isAttachingInlineFiles,
+    pendingUploads: inlinePendingUploads,
   } = useDraftAttachmentUploads({
     projectId,
-    // `editSessionId` is monotonically unique per edit session, so a key match
-    // is a session match.
     target:
       inlineEditSessionId !== null
         ? {
@@ -227,9 +212,11 @@ export function useComposerAttachmentUploads({
     setBottomAttachmentError,
     handleAttachBottomFiles,
     isAttachingBottomFiles,
+    bottomPendingUploads,
     inlineAttachmentError,
     setInlineAttachmentError,
     handleAttachInlineFiles,
     isAttachingInlineFiles,
+    inlinePendingUploads,
   };
 }

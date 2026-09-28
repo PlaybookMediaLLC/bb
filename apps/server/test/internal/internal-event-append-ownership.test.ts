@@ -1,5 +1,12 @@
 import { eq } from "drizzle-orm";
-import { events, getThread, listQueuedThreadMessages } from "@bb/db";
+import {
+  events,
+  getThread,
+  getHighWaterMarks,
+  getLastStoredProviderThreadId,
+  listEvents,
+  listQueuedThreadMessages,
+} from "@bb/db";
 import { threadScope, turnScope } from "@bb/domain";
 import {
   groupHostDaemonEvents,
@@ -7,7 +14,7 @@ import {
   type HostDaemonEventEnvelope,
 } from "@bb/host-daemon-contract";
 import { describe, expect, it } from "vitest";
-import { buildThreadTimeline } from "../../src/services/threads/timeline.js";
+import { buildThreadTimelineWithProfile } from "../../src/services/threads/timeline.js";
 import {
   internalAuthHeaders,
   waitForQueuedCommand,
@@ -30,9 +37,7 @@ import {
 import { createTestAppHarness } from "../helpers/test-app.js";
 import type { TestAppHarness } from "../helpers/test-app.js";
 
-interface SeedEventRouteArgs {
-  hostType?: "persistent";
-}
+interface SeedEventRouteArgs {}
 
 interface PostEventBatchArgs {
   harness: TestAppHarness;
@@ -53,9 +58,7 @@ async function postEventBatch(args: PostEventBatchArgs): Promise<Response> {
 
 function setupEventRoute(args: SeedEventRouteArgs = {}) {
   return createTestAppHarness().then((harness) => {
-    const { host, session } = seedHostSession(harness.deps, {
-      type: args.hostType,
-    });
+    const { host, session } = seedHostSession(harness.deps);
     const { project } = seedProjectWithSource(harness.deps, {
       hostId: host.id,
     });
@@ -80,6 +83,187 @@ function setupEventRoute(args: SeedEventRouteArgs = {}) {
 }
 
 describe("internal event append ownership", () => {
+  it("skips diffs using the existing batch response while retaining edits and provider identity", async () => {
+    const { harness, session, thread } = await setupEventRoute();
+    try {
+      seedTurnStarted(harness.deps, {
+        threadId: thread.id,
+        turnId: "turn-diff",
+        sequence: 1,
+      });
+      const providerThreadId = "provider-diff";
+      const response = await postEventBatch({
+        harness,
+        sessionId: session.id,
+        events: [
+          {
+            threadId: thread.id,
+            event: {
+              type: "thread/identity",
+              threadId: thread.id,
+              providerThreadId,
+              scope: threadScope(),
+            },
+          },
+          {
+            threadId: thread.id,
+            event: {
+              type: "turn/diff/updated",
+              threadId: thread.id,
+              providerThreadId,
+              scope: turnScope("turn-diff"),
+              diff: "discard this snapshot",
+            },
+          },
+          {
+            threadId: thread.id,
+            event: {
+              type: "item/completed",
+              threadId: thread.id,
+              providerThreadId,
+              scope: turnScope("turn-diff"),
+              item: {
+                id: "edit-diff",
+                type: "fileChange",
+                status: "completed",
+                approvalStatus: null,
+                changes: [
+                  {
+                    path: "example.ts",
+                    kind: "update",
+                    diff: "+const value = 2;",
+                  },
+                ],
+              },
+            },
+          },
+          {
+            threadId: thread.id,
+            event: {
+              type: "thread/identity",
+              threadId: thread.id,
+              providerThreadId: "provider-latest",
+              scope: threadScope(),
+            },
+          },
+          {
+            threadId: thread.id,
+            event: {
+              type: "turn/diff/updated",
+              threadId: thread.id,
+              providerThreadId: "provider-latest",
+              scope: turnScope("turn-diff"),
+              diff: "discard the final snapshot too",
+            },
+          },
+        ],
+      });
+      expect(response.status).toBe(200);
+      const accepted = hostDaemonEventBatchResponseSchema.parse(
+        await response.json(),
+      );
+      expect(accepted.acceptedEvents.map((event) => event.sequence)).toEqual([
+        2, 3, 4,
+      ]);
+      expect(accepted.acceptedEvents.map((event) => event.eventIndex)).toEqual([
+        0, 2, 3,
+      ]);
+      const skipped = await postEventBatch({
+        harness,
+        sessionId: session.id,
+        events: [
+          {
+            threadId: thread.id,
+            event: {
+              type: "turn/diff/updated",
+              threadId: thread.id,
+              providerThreadId: "provider-latest",
+              scope: turnScope("turn-diff"),
+              diff: "skip the entire batch",
+            },
+          },
+        ],
+      });
+      expect(skipped.status).toBe(200);
+      expect(
+        hostDaemonEventBatchResponseSchema.parse(await skipped.json())
+          .acceptedEvents,
+      ).toEqual([]);
+      const stored = listEvents(harness.db, { threadId: thread.id });
+      expect(stored.some((event) => event.type === "turn/diff/updated")).toBe(
+        false,
+      );
+      expect(
+        stored.find((event) => event.type === "item/completed")?.sequence,
+      ).toBe(3);
+      expect(getHighWaterMarks(harness.db, [thread.id])[thread.id]).toBe(4);
+      expect(getLastStoredProviderThreadId(harness.db, thread.id)).toBe(
+        "provider-latest",
+      );
+    } finally {
+      await harness.cleanup();
+    }
+  });
+
+  it("keeps late provisioning output terminal after setup has failed", async () => {
+    const { environment, harness, session, thread } = await setupEventRoute();
+    try {
+      seedEvent(harness.deps, {
+        threadId: thread.id,
+        environmentId: environment.id,
+        sequence: 1,
+        type: "system/thread-provisioning",
+        scope: threadScope(),
+        data: {
+          provisioningId: "tpv-terminal",
+          environmentId: environment.id,
+          status: "failed",
+          entries: [],
+        },
+      });
+
+      const response = await postEventBatch({
+        harness,
+        sessionId: session.id,
+        events: [
+          {
+            threadId: thread.id,
+            event: {
+              type: "system/thread-provisioning",
+              threadId: thread.id,
+              scope: threadScope(),
+              provisioningId: "tpv-terminal",
+              environmentId: environment.id,
+              status: "active",
+              entries: [
+                {
+                  type: "output",
+                  key: "setup-output",
+                  text: "late buffered setup output",
+                },
+              ],
+            },
+          },
+        ],
+      });
+
+      expect(response.status).toBe(200);
+      expect(
+        listEvents(harness.db, { threadId: thread.id }).map((row) =>
+          JSON.parse(row.data),
+        ),
+      ).toMatchObject([
+        { status: "failed" },
+        {
+          status: "failed",
+          entries: [{ text: "late buffered setup output" }],
+        },
+      ]);
+    } finally {
+      await harness.cleanup();
+    }
+  });
+
   it("stores thread-scoped ACP context usage for the timeline display", async () => {
     const { harness, session, thread } = await setupEventRoute();
     try {
@@ -106,16 +290,17 @@ describe("internal event append ownership", () => {
 
       expect(response.status).toBe(200);
       expect(
-        buildThreadTimeline(harness.db, thread, {
+        buildThreadTimelineWithProfile(harness.db, thread, {
+          completedTurnDisplay: "collapse",
           eventBudget: 1_000_000,
-          includeProviderUnhandledOperations: true,
+          includeDiagnosticOperations: true,
           maxInlineOutputChars: null,
           maxSeq: 1,
           page: {
             kind: "latest",
             segmentLimit: Number.MAX_SAFE_INTEGER,
           },
-        }).contextWindowUsage,
+        }).response.contextWindowUsage,
       ).toEqual({
         usedTokens: 24_000,
         modelContextWindow: 128_000,
@@ -273,13 +458,6 @@ describe("internal event append ownership", () => {
   });
 
   it("accepts a batch carrying a provider/unhandled event for a turn bb never started", async () => {
-    // The production wedge, at the route that produced it. Codex labels its
-    // automatic-compaction traffic with a turn id of its own making, so the
-    // daemon posted a provider/unhandled event scoped to `auto-compact-1`. The
-    // append rolled the whole batch back and answered 409 — which the daemon,
-    // holding one queue for every thread on the host, reposted verbatim until
-    // the app was restarted. The orphan event must be dropped and its batch
-    // must survive.
     const { harness, session, thread } = await setupEventRoute();
     try {
       const response = await postEventBatch({
@@ -731,8 +909,6 @@ describe("internal event append ownership", () => {
       providerThreadId: "provider-side-chat-parent-provider-exit",
       threadId: parentThread.id,
     });
-    // A side chat keeps a parent id next to its origin; the origin, not the
-    // hidden visibility, is what excludes it from parent notices.
     const childThread = seedThread(harness.deps, {
       environmentId: environment.id,
       originKind: "fork",
@@ -833,9 +1009,6 @@ describe("interaction lifecycle records from the daemon", () => {
   }
 
   it("drops a lifecycle record that names no interaction on the thread", async () => {
-    // The server writes these records itself when it registers and settles
-    // an interaction; a daemon echoing one for an id that never existed
-    // would put a fabricated approval into the timeline.
     const { harness, session, thread } = await setupEventRoute();
     try {
       const response = await postLifecycle({
@@ -857,10 +1030,6 @@ describe("interaction lifecycle records from the daemon", () => {
   });
 
   it("drops a lifecycle record even for an interaction the server registered on that thread", async () => {
-    // The server is the only author of interaction lifecycle records. A
-    // daemon-posted one for a real, still-pending interaction would render
-    // the interaction as granted with whatever content the record carries
-    // while the row stays pending, so the id being real changes nothing.
     const { harness, session, thread } = await setupEventRoute();
     try {
       seedTurnStarted(harness.deps, {
@@ -1050,13 +1219,14 @@ describe("interaction lifecycle records from the daemon", () => {
           .all()
           .map((row) => row.sequence),
       );
-      const questionRows = buildThreadTimeline(harness.db, thread, {
+      const questionRows = buildThreadTimelineWithProfile(harness.db, thread, {
+        completedTurnDisplay: "collapse",
         eventBudget: 1_000_000,
-        includeProviderUnhandledOperations: true,
+        includeDiagnosticOperations: true,
         maxInlineOutputChars: null,
         maxSeq,
         page: { kind: "latest", segmentLimit: Number.MAX_SAFE_INTEGER },
-      }).rows.flatMap((row) =>
+      }).response.rows.flatMap((row) =>
         row.kind === "work" && row.workKind === "question" ? [row] : [],
       );
       expect(questionRows).toHaveLength(1);

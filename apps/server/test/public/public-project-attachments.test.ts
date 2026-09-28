@@ -70,8 +70,6 @@ describe("public project attachments", () => {
         expect(new Uint8Array(await content.arrayBuffer())).toEqual(
           fixture.bytes,
         );
-        // Stored names are unique per upload, so the bytes are immutable and
-        // the browser may keep them; the validator still answers 304.
         expect(content.headers.get("cache-control")).toBe(
           "private, immutable, max-age=31536000",
         );
@@ -98,30 +96,39 @@ describe("public project attachments", () => {
       const { project } = seedProjectWithSource(harness.deps, {
         hostId: host.id,
       });
+      const retinaScreenshot = await upload(
+        harness.app,
+        project.id,
+        new File([new Uint8Array(30 * 1024 * 1024)], "screenshot.png", {
+          type: "image/png",
+        }),
+      );
+      expect(retinaScreenshot.status).toBe(201);
+
       const oversized = await upload(
         harness.app,
         project.id,
-        new File([new Uint8Array(10 * 1024 * 1024 + 1)], "huge.png", {
+        new File([new Uint8Array(36 * 1024 * 1024)], "huge.png", {
           type: "image/png",
         }),
       );
       expect(oversized.status).toBe(400);
       await expect(readJson(oversized)).resolves.toEqual({
         code: "invalid_request",
-        message: "Attachment exceeds 10MB limit",
+        message: "huge.png is 36MB, over the 35MB attachment limit",
       });
 
       const oversizedFile = await upload(
         harness.app,
         project.id,
-        new File([new Uint8Array(25 * 1024 * 1024 + 1)], "huge-archive.bin", {
+        new File([new Uint8Array(35 * 1024 * 1024 + 512 * 1024)], "huge-archive.bin", {
           type: "application/octet-stream",
         }),
       );
       expect(oversizedFile.status).toBe(400);
       await expect(readJson(oversizedFile)).resolves.toEqual({
         code: "invalid_request",
-        message: "Attachment exceeds 25MB limit",
+        message: "huge-archive.bin is 35.5MB, over the 35MB attachment limit",
       });
 
       const ambiguous = await upload(
@@ -147,7 +154,6 @@ describe("public project attachments", () => {
       const { project } = seedProjectWithSource(harness.deps, {
         hostId: host.id,
       });
-      // ISO BMFF `ftyp` box with the `heic` brand, as an iPhone photo starts.
       const heicBytes = new Uint8Array([
         0x00, 0x00, 0x00, 0x18, 0x66, 0x74, 0x79, 0x70, 0x68, 0x65, 0x69, 0x63,
         0x00, 0x00, 0x00, 0x00, 0x6d, 0x69, 0x66, 0x31, 0x68, 0x65, 0x69, 0x63,
@@ -158,8 +164,6 @@ describe("public project attachments", () => {
           "HEIC images are not supported. Convert the image to JPEG or PNG before attaching it.",
       };
 
-      // Chromium labels a dropped or pasted .heic file `image/heic`, and the
-      // CLI infers the same from the extension.
       const heic = await upload(
         harness.app,
         project.id,
@@ -178,10 +182,6 @@ describe("public project attachments", () => {
       expect(heif.status).toBe(400);
       await expect(readJson(heif)).resolves.toEqual(rejected);
 
-      // Only the image classification is broken. The same bytes sent as a
-      // non-image (`bb project attachment upload photo.heic --mime-type
-      // application/octet-stream`) still store as a plain file chip that an
-      // agent can convert on the host.
       const asFile = await upload(
         harness.app,
         project.id,

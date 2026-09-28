@@ -1,20 +1,15 @@
+import type { ComponentType } from "react";
 import type { IconSvgElement } from "@hugeicons/react";
 
-/**
- * Names of the glyphs that live in the lazily loaded extended registry
- * (`./icon-extended`). Only this list of strings is on the boot path; the
- * artwork itself loads with the first route that renders one of these icons
- * or, as a fallback, on first request from `Icon`.
- *
- * `./icon-extended` must map every name here and nothing else; the compiler
- * enforces that through `Record<ExtendedIconName, IconSvgElement>`.
- */
 export const EXTENDED_ICON_NAMES = [
+  "AiBrain01",
+  "AiBrowser",
   "AiContentGenerator01",
   "AlignLeft",
   "AppWindow",
   "ArchiveRestore",
   "ArrowDown",
+  "ArrowLeft",
   "ArrowRight",
   "ArrowReloadHorizontal",
   "ArrowUp",
@@ -23,6 +18,7 @@ export const EXTENDED_ICON_NAMES = [
   "ArrowTurnForward",
   "ArrowUpRight",
   "Beaker",
+  "BellDot",
   "Browser",
   "Brain",
   "Calendar",
@@ -34,6 +30,8 @@ export const EXTENDED_ICON_NAMES = [
   "CircleArrowShrink",
   "Clean",
   "Clock",
+  "ClockArrowUp",
+  "ClockArrowDown",
   "Cloud",
   "CloudOff",
   "Coffee",
@@ -41,8 +39,10 @@ export const EXTENDED_ICON_NAMES = [
   "CornerDownLeft",
   "CornerDownRight",
   "Discord",
+  "DiscordLogo",
   "DateTime",
   "Github",
+  "GithubLogo",
   "DragDropHorizontal",
   "DragDropVertical",
   "EditFile",
@@ -70,14 +70,19 @@ export const EXTENDED_ICON_NAMES = [
   "GridView",
   "Laptop",
   "Layers",
+  "Limitation",
+  "ListEnd",
   "ListView",
   "Lock",
   "Mail",
   "MailOpen",
   "Maximize2",
   "Mic",
+  "Minus",
   "Minimize2",
+  "MoveTo",
   "NewTab",
+  "News01",
   "PackageReceive",
   "Palette",
   "PanelBottom",
@@ -87,6 +92,7 @@ export const EXTENDED_ICON_NAMES = [
   "Pin",
   "PinOff",
   "Play",
+  "Plug02",
   "Plus",
   "Puzzle",
   "Repeat",
@@ -97,6 +103,10 @@ export const EXTENDED_ICON_NAMES = [
   "SideChat",
   "Smartphone",
   "Sort",
+  "SortingAZ02",
+  "SortingZA01",
+  "SortingOneNine",
+  "SortingNineOne",
   "Square",
   "SquareUnlock02",
   "Star",
@@ -116,27 +126,64 @@ export type ExtendedIconMap = Readonly<
 let extendedIcons: ExtendedIconMap | null = null;
 const listeners = new Set<() => void>();
 
-/**
- * Publishes the extended glyph map. Called by `./icon-extended` when it
- * evaluates, so any chunk that statically imports that module makes every
- * extended icon render synchronously; `Icon` instances that were showing a
- * placeholder re-render through {@link subscribeExtendedIcons}.
- */
 export function registerExtendedIcons(map: ExtendedIconMap): void {
   if (extendedIcons === map) return;
   extendedIcons = map;
   for (const listener of listeners) listener();
 }
 
-/** The extended glyph map, or null until `./icon-extended` has evaluated. */
 export function getExtendedIcons(): ExtendedIconMap | null {
   return extendedIcons;
 }
 
-/** `useSyncExternalStore`-shaped subscription to {@link getExtendedIcons}. */
 export function subscribeExtendedIcons(listener: () => void): () => void {
   listeners.add(listener);
   return () => {
     listeners.delete(listener);
+  };
+}
+
+interface AppIconDefinition {
+  component: ComponentType<{ className?: string }>;
+  key: string;
+}
+
+let appIcons: ReadonlyMap<string, AppIconDefinition> = new Map();
+const appIconListeners = new Set<() => void>();
+
+export function setAppIcons(
+  next: ReadonlyMap<string, AppIconDefinition>,
+): void {
+  appIcons = next;
+  for (const listener of appIconListeners) listener();
+}
+
+export function getAppIcon(name: string): AppIconDefinition | undefined {
+  return appIcons.get(name);
+}
+
+export function subscribeAppIcons(listener: () => void): () => void {
+  appIconListeners.add(listener);
+  return () => {
+    appIconListeners.delete(listener);
+  };
+}
+
+let pluginAssetIcons: ReadonlyMap<string, string> = new Map();
+const pluginAssetIconListeners = new Set<() => void>();
+
+export function setPluginAssetIcons(next: ReadonlyMap<string, string>): void {
+  pluginAssetIcons = next;
+  for (const listener of pluginAssetIconListeners) listener();
+}
+
+export function getPluginAssetIcon(glyph: string): string | undefined {
+  return pluginAssetIcons.get(glyph);
+}
+
+export function subscribePluginAssetIcons(listener: () => void): () => void {
+  pluginAssetIconListeners.add(listener);
+  return () => {
+    pluginAssetIconListeners.delete(listener);
   };
 }

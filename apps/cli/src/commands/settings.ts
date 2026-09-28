@@ -1,21 +1,166 @@
 import { Command } from "commander";
 import {
-  appCommandIdSchema,
+  AI_TASKS,
+  AI_TEXT_TASKS,
+  aiTaskSchema,
+  aiTextTaskSchema,
+  keyboardCommandIdSchema,
   appShortcutSchema,
   appSettingsSchema,
+  completedTurnDisplaySchema,
+  describeUiPreference,
   experimentKeySchema,
   experimentsSchema,
+  isUiPreferenceKey,
+  parseUiPreferenceValue,
+  UI_PREFERENCE_KEYS,
+  type AiServiceSelection,
+  type AiTask,
   type AppSettings,
   type AppShortcut,
+  type CompletedTurnDisplay,
   type Experiments,
+  type UiPreferenceKey,
+  type UiPreferenceValue,
 } from "@bb/domain";
+import { BbHttpError } from "@bb/sdk";
+import type {
+  SystemAiServicesResponse,
+  SystemProviderInfo,
+} from "@bb/server-contract";
 import { action } from "../action.js";
 import { createCliBbSdk } from "../client.js";
+import { columnWidths, printBorderlessTable } from "../table.js";
 import { outputJson } from "./helpers.js";
 import { resolveMachineHostId, resolveMachineTargetOption } from "./machine.js";
 
 interface JsonOptions {
   json?: boolean;
+}
+
+interface AiServiceSetOptions extends JsonOptions {
+  plugin?: string;
+}
+
+function requireAiTask(input: string): AiTask {
+  const task = aiTaskSchema.safeParse(input);
+  if (!task.success) {
+    throw new Error(`Unknown task '${input}'. Tasks: ${AI_TASKS.join(", ")}`);
+  }
+  return task.data;
+}
+
+function resolveAiServiceChoice(
+  view: SystemAiServicesResponse,
+  args: { task: AiTask; choice: string; pluginId: string | undefined },
+): AiServiceSelection {
+  const { task, choice, pluginId } = args;
+  if (choice === "automatic" || choice === "off") {
+    if (pluginId !== undefined) {
+      throw new Error(`--plugin applies only to a service id, not ${choice}.`);
+    }
+    return { mode: choice };
+  }
+  const eligible = view.services.filter((candidate) =>
+    candidate.tasks.includes(task),
+  );
+  const matches = eligible.filter(
+    (candidate) =>
+      candidate.id === choice &&
+      (pluginId === undefined || candidate.pluginId === pluginId),
+  );
+  const [service] = matches;
+  if (service === undefined) {
+    const ids = [...new Set(eligible.map((candidate) => candidate.id))];
+    const from = pluginId === undefined ? "" : ` from plugin '${pluginId}'`;
+    throw new Error(
+      `No AI service '${choice}'${from} handles ${task}. Choose automatic, off${ids.length > 0 ? `, or one of: ${ids.join(", ")}` : ""}.`,
+    );
+  }
+  if (matches.length > 1) {
+    throw new Error(
+      `Several plugins register AI service '${choice}': ${matches.map((candidate) => candidate.pluginId).join(", ")}. Pass --plugin <plugin-id>.`,
+    );
+  }
+  return { mode: "service", pluginId: service.pluginId, serviceId: service.id };
+}
+
+function automaticAiServiceFor(
+  view: SystemAiServicesResponse,
+  task: AiTask,
+): SystemAiServicesResponse["services"][number] | null {
+  return (
+    view.services
+      .filter(
+        (service) =>
+          service.automaticRank !== null &&
+          service.tasks.includes(task) &&
+          service.status.ready,
+      )
+      .sort((a, b) => (a.automaticRank ?? 0) - (b.automaticRank ?? 0))[0] ??
+    null
+  );
+}
+
+function describeAiSelection(
+  view: SystemAiServicesResponse,
+  selection: AiServiceSelection,
+): string {
+  if (selection.mode === "off") return "Off";
+  if (selection.mode === "service") {
+    const service = view.services.find(
+      (candidate) =>
+        candidate.id === selection.serviceId &&
+        candidate.pluginId === selection.pluginId,
+    );
+    return service === undefined
+      ? `${selection.serviceId} (unavailable plugin ${selection.pluginId})`
+      : service.displayName;
+  }
+  return "Automatic";
+}
+
+function printAiServices(view: SystemAiServicesResponse): void {
+  for (const task of AI_TASKS) {
+    const selection = view.selections[task];
+    const automatic =
+      selection.mode === "automatic" ? automaticAiServiceFor(view, task) : null;
+    const using =
+      selection.mode !== "automatic"
+        ? ""
+        : automatic === null
+          ? " (nothing ready)"
+          : ` (using ${automatic.displayName})`;
+    console.log(
+      `${task.padEnd(16)}${describeAiSelection(view, selection)}${using}`,
+    );
+  }
+  console.log("");
+  if (view.services.length === 0) {
+    console.log("No plugin registers an AI service.");
+    return;
+  }
+  console.log("Services:");
+  for (const service of view.services) {
+    const status = service.status.ready
+      ? "ready"
+      : `not ready: ${service.status.message}`;
+    const automatic =
+      service.automaticRank === null
+        ? ""
+        : `  Automatic #${service.automaticRank + 1}`;
+    console.log(
+      `  ${service.id}  ${service.displayName}  plugin ${service.pluginId}  [${service.tasks.join(", ")}]${automatic}  ${status}`,
+    );
+  }
+}
+
+interface ProviderCompletedTurnDisplayEntry {
+  providerId: string;
+  displayName: string;
+  completedTurnDisplay: CompletedTurnDisplay;
+  providerDefault: CompletedTurnDisplay;
+  source: "setting" | "provider-default";
 }
 
 interface UsageOptions extends JsonOptions {
@@ -54,12 +199,6 @@ function parseShortcut(value: string): AppShortcut {
   });
 }
 
-/**
- * Command-line values are text, so read each one two ways: as JSON, which
- * covers booleans, numbers, null, and structured values, and as the raw text a
- * string setting wants. The setting's own schema picks between them below, so a
- * string setting can still hold `true` or `null`.
- */
 function generalSettingValueCandidates(value: string): unknown[] {
   if (value === "on") return [true, value];
   if (value === "off") return [false, value];
@@ -70,10 +209,6 @@ function generalSettingValueCandidates(value: string): unknown[] {
   }
 }
 
-/**
- * Keys and value shapes both come from `appSettingsSchema`, so a preference
- * added to `@bb/domain` is settable here with no change to this command.
- */
 function updateGeneralSetting(
   settings: AppSettings,
   key: string,
@@ -89,7 +224,7 @@ function updateGeneralSetting(
   }
 
   for (const candidate of generalSettingValueCandidates(value)) {
-    const updated = appSettingsSchema.safeParse({
+    const updated = appSettingsSchema.strip().safeParse({
       ...settings,
       [settingKey.data]: candidate,
     });
@@ -98,6 +233,82 @@ function updateGeneralSetting(
 
   throw new Error(
     `Invalid value '${value}' for '${settingKey.data}'. Booleans take true, false, on, or off, null clears a nullable setting, and structured values take JSON.`,
+  );
+}
+
+function describeProviderCompletedTurnDisplay(
+  settings: AppSettings,
+  provider: SystemProviderInfo,
+): ProviderCompletedTurnDisplayEntry {
+  const override = settings.providerCompletedTurnDisplay[provider.id];
+  return {
+    providerId: provider.id,
+    displayName: provider.displayName,
+    completedTurnDisplay: override ?? provider.completedTurnDisplay,
+    providerDefault: provider.completedTurnDisplay,
+    source: override === undefined ? "provider-default" : "setting",
+  };
+}
+
+function printCompletedTurnDisplayTable(
+  entries: readonly ProviderCompletedTurnDisplayEntry[],
+): void {
+  const rows = entries.map((entry) => [
+    entry.providerId,
+    entry.displayName,
+    entry.completedTurnDisplay,
+    entry.source === "setting" ? "setting" : "provider default",
+  ]);
+  printBorderlessTable(
+    {
+      head: ["ID", "Name", "Finished turns", "Source"],
+      colWidths: columnWidths(rows, [2, 4, 14, 6]),
+      trimTrailingWhitespace: true,
+    },
+    rows,
+  );
+}
+
+function parseCompletedTurnDisplayInput(
+  value: string,
+): CompletedTurnDisplay | null {
+  if (value === "default") return null;
+  const parsed = completedTurnDisplaySchema.safeParse(value);
+  if (!parsed.success) {
+    throw new Error(
+      `Invalid finished turn display '${value}'. Use collapse, flat, or default.`,
+    );
+  }
+  return parsed.data;
+}
+
+function updateProviderCompletedTurnDisplay(
+  settings: AppSettings,
+  providerId: string,
+  display: CompletedTurnDisplay | null,
+): AppSettings {
+  const remaining = Object.fromEntries(
+    Object.entries(settings.providerCompletedTurnDisplay).filter(
+      ([id]) => id !== providerId,
+    ),
+  );
+  return appSettingsSchema.strip().parse({
+    ...settings,
+    providerCompletedTurnDisplay:
+      display === null ? remaining : { ...remaining, [providerId]: display },
+  });
+}
+
+function requireKnownProvider(
+  providers: readonly SystemProviderInfo[],
+  providerId: string,
+): SystemProviderInfo {
+  const provider = providers.find((candidate) => candidate.id === providerId);
+  if (provider !== undefined) return provider;
+  throw new Error(
+    `Unknown provider '${providerId}'. Known providers: ${providers
+      .map((candidate) => candidate.id)
+      .join(", ")}.`,
   );
 }
 
@@ -115,6 +326,40 @@ function updateExperiment(
     ...experiments,
     [experimentKey.data]: enabled,
   });
+}
+
+function requireUiPreferenceKey(key: string): UiPreferenceKey {
+  if (isUiPreferenceKey(key)) return key;
+  throw new Error(
+    `Unknown UI preference '${key}'. Known preferences: ${UI_PREFERENCE_KEYS.join(", ")}.`,
+  );
+}
+
+function uiPreferenceValueCandidates(value: string): unknown[] {
+  try {
+    return [JSON.parse(value), value];
+  } catch {
+    return [value];
+  }
+}
+
+function parseUiPreferenceInput<Key extends UiPreferenceKey>(
+  key: Key,
+  value: string,
+): UiPreferenceValue<Key> {
+  let message = "";
+  for (const candidate of uiPreferenceValueCandidates(value)) {
+    const parsed = parseUiPreferenceValue(key, candidate);
+    if (parsed.success) return parsed.value;
+    message = parsed.message;
+  }
+  throw new Error(
+    `Invalid value '${value}' for '${key}': ${message}. Lists and null take JSON; plain strings may be unquoted.`,
+  );
+}
+
+function isUiPreferenceConflict(error: unknown): boolean {
+  return error instanceof BbHttpError && error.status === 409;
 }
 
 export function registerSettingsCommands(
@@ -137,30 +382,83 @@ export function registerSettingsCommands(
       }),
     );
 
-  settings
+  const aiServices = settings
     .command("ai-services")
     .description(
-      "Show the AI-service settings (BB_INFERENCE, BB_INFERENCE_FALLBACK, BB_TRANSCRIPTION) and the plugin services they may name",
-    )
+      "Choose which plugin AI service writes thread titles, commit messages, and voice transcripts",
+    );
+  aiServices
+    .command("show", { isDefault: true })
+    .description("Show each task's selection and every registered AI service")
     .option("--json", "Print machine-readable JSON output")
     .action(
       action(async (opts: JsonOptions) => {
-        const { aiServices } = await createCliBbSdk(getUrl()).system.config();
-        if (outputJson(opts, aiServices)) return;
-        console.log(`BB_INFERENCE          ${aiServices.inference}`);
-        console.log(`BB_INFERENCE_FALLBACK ${aiServices.inferenceFallback}`);
-        console.log(`BB_TRANSCRIPTION      ${aiServices.transcription}`);
-        console.log("");
-        if (aiServices.services.length === 0) {
-          console.log("No plugin registers an AI service.");
-          return;
-        }
-        console.log("Registered services (<id>/<model> in the settings above):");
-        for (const service of aiServices.services) {
+        const result = await createCliBbSdk(getUrl()).system.aiServices();
+        if (outputJson(opts, result)) return;
+        printAiServices(result);
+      }),
+    );
+  aiServices
+    .command("set <task> <choice>")
+    .description(
+      `Set the service for a task (${AI_TASKS.join(", ")}): automatic, off, or a service id`,
+    )
+    .option(
+      "--plugin <plugin-id>",
+      "Plugin that registers the service, when several plugins use the same service id",
+    )
+    .option("--json", "Print machine-readable JSON output")
+    .action(
+      action(
+        async (
+          taskInput: string,
+          choice: string,
+          opts: AiServiceSetOptions,
+        ) => {
+          const task = requireAiTask(taskInput);
+          const sdk = createCliBbSdk(getUrl());
+          const current = await sdk.system.aiServices();
+          const result = await sdk.system.setAiServiceSelection({
+            task,
+            selection: resolveAiServiceChoice(current, {
+              task,
+              choice,
+              pluginId: opts.plugin,
+            }),
+          });
+          if (outputJson(opts, result)) return;
           console.log(
-            `  ${service.id}  ${service.displayName}  [${service.kinds.join(", ")}]  plugin ${service.pluginId}`,
+            `${task}: ${describeAiSelection(result, result.selections[task])}`,
+          );
+        },
+      ),
+    );
+  aiServices
+    .command("test <task>")
+    .description(
+      `Run a sample through the current choice for ${AI_TEXT_TASKS.join(" or ")}`,
+    )
+    .option("--json", "Print machine-readable JSON output")
+    .action(
+      action(async (taskInput: string, opts: JsonOptions) => {
+        const task = aiTextTaskSchema.safeParse(taskInput);
+        if (!task.success) {
+          throw new Error(
+            `Unknown task '${taskInput}'. Testable tasks: ${AI_TEXT_TASKS.join(", ")}`,
           );
         }
+        const result = await createCliBbSdk(getUrl()).system.testAiService({
+          task: task.data,
+        });
+        if (outputJson(opts, result)) return;
+        if (result.ok) {
+          console.log(
+            `${result.displayName} (${result.durationMs}ms): ${result.text}`,
+          );
+          return;
+        }
+        console.log(`Failed after ${result.durationMs}ms: ${result.message}`);
+        process.exitCode = 1;
       }),
     );
 
@@ -177,6 +475,143 @@ export function registerSettingsCommands(
         );
         if (outputJson(opts, result)) return;
         console.log(`${key} updated`);
+      }),
+    );
+
+  settings
+    .command("completed-turns [providerId] [display]")
+    .description(
+      "Show or set whether each provider's finished turns collapse or stay flat (collapse, flat, or default)",
+    )
+    .option("--json", "Print machine-readable JSON output")
+    .action(
+      action(
+        async (
+          providerId: string | undefined,
+          display: string | undefined,
+          opts: JsonOptions,
+        ) => {
+          const sdk = createCliBbSdk(getUrl());
+          const [config, providers] = await Promise.all([
+            sdk.system.config(),
+            sdk.providers.list(),
+          ]);
+          if (providerId === undefined) {
+            const entries = providers.map((provider) =>
+              describeProviderCompletedTurnDisplay(
+                config.generalSettings,
+                provider,
+              ),
+            );
+            if (outputJson(opts, entries)) return;
+            if (entries.length === 0) {
+              console.log("No providers available");
+              return;
+            }
+            printCompletedTurnDisplayTable(entries);
+            return;
+          }
+          const provider = requireKnownProvider(providers, providerId);
+          if (display === undefined) {
+            const entry = describeProviderCompletedTurnDisplay(
+              config.generalSettings,
+              provider,
+            );
+            if (outputJson(opts, entry)) return;
+            printCompletedTurnDisplayTable([entry]);
+            return;
+          }
+          const updated = await sdk.system.updateGeneralSettings(
+            updateProviderCompletedTurnDisplay(
+              config.generalSettings,
+              provider.id,
+              parseCompletedTurnDisplayInput(display),
+            ),
+          );
+          const entry = describeProviderCompletedTurnDisplay(updated, provider);
+          if (outputJson(opts, entry)) return;
+          console.log(
+            `${provider.id} finished turns: ${entry.completedTurnDisplay} (${
+              entry.source === "setting" ? "setting" : "provider default"
+            })`,
+          );
+        },
+      ),
+    );
+
+  const ui = settings
+    .command("ui")
+    .description(
+      "Manage server-synced UI preferences such as sidebar layout and navigation",
+    );
+  ui.command("list")
+    .description("List every UI preference with its value and revision")
+    .option("--json", "Print machine-readable JSON output")
+    .action(
+      action(async (opts: JsonOptions) => {
+        const result =
+          await createCliBbSdk(getUrl()).system.uiPreferences.list();
+        if (outputJson(opts, result)) return;
+        for (const key of UI_PREFERENCE_KEYS) {
+          const entry = result.preferences[key];
+          console.log(
+            `${key}  ${JSON.stringify(entry.value)}  (revision ${entry.revision})`,
+          );
+          console.log(`  ${describeUiPreference(key)}`);
+        }
+      }),
+    );
+  ui.command("get <key>")
+    .description("Show one UI preference")
+    .option("--json", "Print machine-readable JSON output")
+    .action(
+      action(async (keyInput: string, opts: JsonOptions) => {
+        const key = requireUiPreferenceKey(keyInput);
+        const { preferences } =
+          await createCliBbSdk(getUrl()).system.uiPreferences.list();
+        const entry = preferences[key];
+        if (outputJson(opts, { key, ...entry })) return;
+        console.log(JSON.stringify(entry.value));
+      }),
+    );
+  ui.command("set <key> <value>")
+    .description("Set a UI preference; lists and null take JSON")
+    .option("--json", "Print machine-readable JSON output")
+    .action(
+      action(async (keyInput: string, value: string, opts: JsonOptions) => {
+        const key = requireUiPreferenceKey(keyInput);
+        const parsedValue = parseUiPreferenceInput(key, value);
+        const sdk = createCliBbSdk(getUrl());
+        const write = async () => {
+          const { preferences } = await sdk.system.uiPreferences.list();
+          return sdk.system.uiPreferences.set({
+            expectedRevision: preferences[key].revision,
+            key,
+            value: parsedValue,
+          });
+        };
+        let result;
+        try {
+          result = await write();
+        } catch (error) {
+          if (!isUiPreferenceConflict(error)) throw error;
+          result = await write();
+        }
+        if (outputJson(opts, result)) return;
+        console.log(`${key} updated`);
+      }),
+    );
+  ui.command("reset <key>")
+    .description("Reset a UI preference to its default")
+    .option("--json", "Print machine-readable JSON output")
+    .action(
+      action(async (keyInput: string, opts: JsonOptions) => {
+        const key = requireUiPreferenceKey(keyInput);
+        const result = await createCliBbSdk(
+          getUrl(),
+        ).system.uiPreferences.reset({ key });
+        if (outputJson(opts, result)) return;
+        console.log(`${key} reset`);
       }),
     );
 
@@ -240,7 +675,7 @@ export function registerSettingsCommands(
     .action(
       action(
         async (commandInput: string, shortcut: string, opts: JsonOptions) => {
-          const command = appCommandIdSchema.parse(commandInput);
+          const command = keyboardCommandIdSchema.parse(commandInput);
           const sdk = createCliBbSdk(getUrl());
           const config = await sdk.system.config();
           const next = config.keybindingOverrides.filter(
@@ -269,7 +704,7 @@ export function registerSettingsCommands(
             ? []
             : config.keybindingOverrides.filter(
                 (item) =>
-                  item.command !== appCommandIdSchema.parse(commandInput),
+                  item.command !== keyboardCommandIdSchema.parse(commandInput),
               );
         const result = await sdk.system.updateKeyboardSettings(next);
         if (outputJson(opts, result)) return;

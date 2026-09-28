@@ -1,78 +1,5 @@
-/**
- * GENERATED FILE — run pnpm --filter @bb/mobile theme:generate
- *
- * Source: apps/app/src/components/ui/theme.css, then the mobile-only override
- * layer apps/mobile/src/theme/mobile-overrides.css, then the built-in palettes
- * in apps/app/src/lib/themes/*.ts, replayed through the web cascade per
- * palette and mode by apps/mobile/scripts/generate-native-theme.ts. The
- * mobile layer re-tunes the default palette to the iOS system look; palettes
- * cascade after it, so their anchors and literals still win.
- *
- * `var()` is substituted textually; `color-mix(in oklch|oklab, …)` is
- * evaluated like Chrome (premultiplied alpha, shorter hue arc, converted
- * near-achromatic operands lose their hue). Opaque results are `#rrggbb`,
- * translucent ones `rgba(r, g, b, a)`. Typography is the Apple text-style
- * ramp from the mobile layer's `@theme` block, in CSS pixels.
- *
- * Tokens only the mobile layer defines (no web utility class; global.css
- * maps them by hand):
- *   --surface-grouped
- *   --surface-grouped-cell
- *
- * Tokens deliberately left out (edit the generator to add them):
- *   --bb-sidebar-row-height: dimension (1.75rem)
- *   --bb-sidebar-row-height-coarse: dimension (2.5rem)
- *   --diffs-dark: @pierre/diffs bridge; defined per mode only
- *   --diffs-dark-addition-color: @pierre/diffs bridge; defined per mode only
- *   --diffs-dark-bg: @pierre/diffs bridge; defined per mode only
- *   --diffs-dark-deletion-color: @pierre/diffs bridge; defined per mode only
- *   --diffs-light: @pierre/diffs bridge; defined per mode only
- *   --diffs-light-addition-color: @pierre/diffs bridge; defined per mode only
- *   --diffs-light-bg: @pierre/diffs bridge; defined per mode only
- *   --diffs-light-deletion-color: @pierre/diffs bridge; defined per mode only
- *   --font-mono: font stack
- *   --font-sans: font stack
- *   --font-serif: font stack
- *   --icon-stroke-width: dimension (1.75)
- *   --pill-shadow: box-shadow
- *   --pill-surface: gradient
- *   --pill-surface-selected: gradient
- *   --radius: emitted as nativeRadii
- *   --resource-source-shelf-action-block: computed dimension
- *   --resource-source-shelf-action-inline: computed dimension
- *   --resource-source-shelf-card-action-gap: computed dimension
- *   --resource-source-shelf-card-hover-shadow: box-shadow
- *   --resource-source-shelf-fade-ramp: computed dimension
- *   --resource-source-shelf-inset: computed dimension
- *   --resource-source-shelf-item-gap: computed dimension
- *   --resource-source-shelf-item-width: dimension (31.25%)
- *   --resource-source-shelf-label-gap: computed dimension
- *   --resource-source-shelf-section-gap: computed dimension
- *   --resource-source-shelf-shadow-bleed: computed dimension
- *   --resource-source-shelf-shadow-left-bleed: computed dimension
- *   --shadow: box-shadow
- *   --shadow-2xl: box-shadow
- *   --shadow-2xs: box-shadow
- *   --shadow-blur: dimension (0px)
- *   --shadow-lg: box-shadow
- *   --shadow-lift: box-shadow
- *   --shadow-md: box-shadow
- *   --shadow-opacity: dimension (0.15)
- *   --shadow-sm: box-shadow
- *   --shadow-spread: dimension (0px)
- *   --shadow-x: dimension (0px)
- *   --shadow-xl: box-shadow
- *   --shadow-xs: box-shadow
- *   --shadow-y: dimension (2px)
- *   --spacing: dimension (0.25rem)
- *   --tracking-normal: dimension (0em)
- */
 import type { BuiltInThemeId } from "@bb/domain";
 
-/**
- * theme.css custom-property color tokens, keyed by camelCase name. Every
- * value is a React Native color string.
- */
 export interface NativeThemeTokens {
   accent: string;
   accentForeground: string;
@@ -114,6 +41,7 @@ export interface NativeThemeTokens {
   borderHairline: string;
   borderSeam: string;
   borderSeamVertical: string;
+  brandDiscord: string;
   canvas: string;
   card: string;
   cardForeground: string;
@@ -138,7 +66,6 @@ export interface NativeThemeTokens {
   primary: string;
   primaryForeground: string;
   readbackForeground: string;
-  resourceSourceShelfCardHoverBorder: string;
   ring: string;
   secondary: string;
   secondaryForeground: string;
@@ -223,6 +150,7 @@ export const nativeThemes: Record<BuiltInThemeId, NativeThemeModes> = {
       borderHairline: "#d2d3dc",
       borderSeam: "#d2d3dc",
       borderSeamVertical: "#d2d3dc",
+      brandDiscord: "#5865f2",
       canvas: "#eff1f5",
       card: "#eff1f5",
       cardForeground: "#4c4f69",
@@ -247,7 +175,6 @@ export const nativeThemes: Record<BuiltInThemeId, NativeThemeModes> = {
       primary: "#8839ef",
       primaryForeground: "#eff1f5",
       readbackForeground: "#6c6f85",
-      resourceSourceShelfCardHoverBorder: "#c6c7d2",
       ring: "#8839ef",
       secondary: "#e2e3e9",
       secondaryForeground: "#4c4f69",
@@ -324,6 +251,7 @@ export const nativeThemes: Record<BuiltInThemeId, NativeThemeModes> = {
       borderHairline: "#54566b",
       borderSeam: "#54566b",
       borderSeamVertical: "#54566b",
+      brandDiscord: "#cdd6f4",
       canvas: "#1e1e2e",
       card: "#1e1e2e",
       cardForeground: "#cdd6f4",
@@ -348,7 +276,6 @@ export const nativeThemes: Record<BuiltInThemeId, NativeThemeModes> = {
       primary: "#cba6f7",
       primaryForeground: "#1e1e2e",
       readbackForeground: "#a6adc8",
-      resourceSourceShelfCardHoverBorder: "#4d4f64",
       ring: "#cba6f7",
       secondary: "#4b4d62",
       secondaryForeground: "#cdd6f4",
@@ -427,6 +354,7 @@ export const nativeThemes: Record<BuiltInThemeId, NativeThemeModes> = {
       borderHairline: "#c7c7c7",
       borderSeam: "#c7c7c7",
       borderSeamVertical: "#c7c7c7",
+      brandDiscord: "#5865f2",
       canvas: "#ffffff",
       card: "#ffffff",
       cardForeground: "#000000",
@@ -451,7 +379,6 @@ export const nativeThemes: Record<BuiltInThemeId, NativeThemeModes> = {
       primary: "#007aff",
       primaryForeground: "#ffffff",
       readbackForeground: "#747474",
-      resourceSourceShelfCardHoverBorder: "#b1b1b1",
       ring: "#007aff",
       secondary: "#e4e4e4",
       secondaryForeground: "#000000",
@@ -528,6 +455,7 @@ export const nativeThemes: Record<BuiltInThemeId, NativeThemeModes> = {
       borderHairline: "#383838",
       borderSeam: "#383838",
       borderSeamVertical: "#383838",
+      brandDiscord: "#ffffff",
       canvas: "#000000",
       card: "#000000",
       cardForeground: "#ffffff",
@@ -552,7 +480,6 @@ export const nativeThemes: Record<BuiltInThemeId, NativeThemeModes> = {
       primary: "#0a84ff",
       primaryForeground: "#ffffff",
       readbackForeground: "#808080",
-      resourceSourceShelfCardHoverBorder: "#2e2e2e",
       ring: "#0a84ff",
       secondary: "#2b2b2b",
       secondaryForeground: "#ffffff",
@@ -631,6 +558,7 @@ export const nativeThemes: Record<BuiltInThemeId, NativeThemeModes> = {
       borderHairline: "#cfd1d8",
       borderSeam: "#cfd1d8",
       borderSeamVertical: "#cfd1d8",
+      brandDiscord: "#5865f2",
       canvas: "#f8f8f2",
       card: "#f8f8f2",
       cardForeground: "#282a36",
@@ -655,7 +583,6 @@ export const nativeThemes: Record<BuiltInThemeId, NativeThemeModes> = {
       primary: "#7d5bbe",
       primaryForeground: "#ffffff",
       readbackForeground: "#6b6d78",
-      resourceSourceShelfCardHoverBorder: "#bfc1c9",
       ring: "#7d5bbe",
       secondary: "#e4e5eb",
       secondaryForeground: "#282a36",
@@ -732,6 +659,7 @@ export const nativeThemes: Record<BuiltInThemeId, NativeThemeModes> = {
       borderHairline: "#676974",
       borderSeam: "#676974",
       borderSeamVertical: "#676974",
+      brandDiscord: "#f8f8f2",
       canvas: "#282a36",
       card: "#282a36",
       cardForeground: "#f8f8f2",
@@ -756,7 +684,6 @@ export const nativeThemes: Record<BuiltInThemeId, NativeThemeModes> = {
       primary: "#bd93f9",
       primaryForeground: "#282a36",
       readbackForeground: "#a5a7b0",
-      resourceSourceShelfCardHoverBorder: "#5f616c",
       ring: "#bd93f9",
       secondary: "#5d5f6a",
       secondaryForeground: "#f8f8f2",
@@ -835,6 +762,7 @@ export const nativeThemes: Record<BuiltInThemeId, NativeThemeModes> = {
       borderHairline: "#d7cfac",
       borderSeam: "#d7cfac",
       borderSeamVertical: "#d7cfac",
+      brandDiscord: "#5865f2",
       canvas: "#fbf1c7",
       card: "#fbf1c7",
       cardForeground: "#3c3836",
@@ -859,7 +787,6 @@ export const nativeThemes: Record<BuiltInThemeId, NativeThemeModes> = {
       primary: "#076678",
       primaryForeground: "#fbf1c7",
       readbackForeground: "#7a7666",
-      resourceSourceShelfCardHoverBorder: "#c9c1a1",
       ring: "#076678",
       secondary: "#eae1ba",
       secondaryForeground: "#3c3836",
@@ -936,6 +863,7 @@ export const nativeThemes: Record<BuiltInThemeId, NativeThemeModes> = {
       borderHairline: "#645f53",
       borderSeam: "#645f53",
       borderSeamVertical: "#645f53",
+      brandDiscord: "#ebdbb2",
       canvas: "#282828",
       card: "#282828",
       cardForeground: "#ebdbb2",
@@ -960,7 +888,6 @@ export const nativeThemes: Record<BuiltInThemeId, NativeThemeModes> = {
       primary: "#83a598",
       primaryForeground: "#282828",
       readbackForeground: "#9f957d",
-      resourceSourceShelfCardHoverBorder: "#5c584e",
       ring: "#83a598",
       secondary: "#5a574d",
       secondaryForeground: "#ebdbb2",
@@ -1039,6 +966,7 @@ export const nativeThemes: Record<BuiltInThemeId, NativeThemeModes> = {
       borderHairline: "#c9ccd3",
       borderSeam: "#c9ccd3",
       borderSeamVertical: "#c9ccd3",
+      brandDiscord: "#5865f2",
       canvas: "#eceff4",
       card: "#eceff4",
       cardForeground: "#2e3440",
@@ -1063,7 +991,6 @@ export const nativeThemes: Record<BuiltInThemeId, NativeThemeModes> = {
       primary: "#5e81ac",
       primaryForeground: "#eceff4",
       readbackForeground: "#6c727c",
-      resourceSourceShelfCardHoverBorder: "#babec5",
       ring: "#5e81ac",
       secondary: "#dbdee4",
       secondaryForeground: "#2e3440",
@@ -1140,6 +1067,7 @@ export const nativeThemes: Record<BuiltInThemeId, NativeThemeModes> = {
       borderHairline: "#636975",
       borderSeam: "#636975",
       borderSeamVertical: "#636975",
+      brandDiscord: "#d8dee9",
       canvas: "#2e3440",
       card: "#2e3440",
       cardForeground: "#d8dee9",
@@ -1164,7 +1092,6 @@ export const nativeThemes: Record<BuiltInThemeId, NativeThemeModes> = {
       primary: "#88c0d0",
       primaryForeground: "#2e3440",
       readbackForeground: "#969ca8",
-      resourceSourceShelfCardHoverBorder: "#5c626f",
       ring: "#88c0d0",
       secondary: "#5b616d",
       secondaryForeground: "#d8dee9",
@@ -1243,6 +1170,7 @@ export const nativeThemes: Record<BuiltInThemeId, NativeThemeModes> = {
       borderHairline: "#d1d4bd",
       borderSeam: "#d1d4bd",
       borderSeamVertical: "#d1d4bd",
+      brandDiscord: "#5865f2",
       canvas: "#fdf6e3",
       card: "#fdf6e3",
       cardForeground: "#073642",
@@ -1267,7 +1195,6 @@ export const nativeThemes: Record<BuiltInThemeId, NativeThemeModes> = {
       primary: "#268bd2",
       primaryForeground: "#fdf6e3",
       readbackForeground: "#577a6f",
-      resourceSourceShelfCardHoverBorder: "#bfc6af",
       ring: "#268bd2",
       secondary: "#e9e6d1",
       secondaryForeground: "#073642",
@@ -1344,6 +1271,7 @@ export const nativeThemes: Record<BuiltInThemeId, NativeThemeModes> = {
       borderHairline: "#34505a",
       borderSeam: "#34505a",
       borderSeamVertical: "#34505a",
+      brandDiscord: "#93a1a1",
       canvas: "#002b36",
       card: "#002b36",
       cardForeground: "#93a1a1",
@@ -1368,7 +1296,6 @@ export const nativeThemes: Record<BuiltInThemeId, NativeThemeModes> = {
       primary: "#268bd2",
       primaryForeground: "#002b36",
       readbackForeground: "#5e747b",
-      resourceSourceShelfCardHoverBorder: "#2e4c55",
       ring: "#268bd2",
       secondary: "#2d4b54",
       secondaryForeground: "#93a1a1",
@@ -1407,10 +1334,6 @@ export const nativeThemes: Record<BuiltInThemeId, NativeThemeModes> = {
   },
 };
 
-/**
- * `--radius` and the Tailwind `--radius-*` steps, in CSS pixels. `xl2` is
- * `rounded-2xl`; `full` is `rounded-full` (pills, circles).
- */
 export const nativeRadii = {
   base: 8,
   sm: 4,
@@ -1426,11 +1349,6 @@ export interface NativeTextStyle {
   lineHeight: number;
 }
 
-/**
- * The `--text-*` scale: theme.css's coarse-pointer (touch) values with the
- * mobile layer's Apple text-style ramp on top (caption2 → largeTitle), in
- * CSS pixels. Mirrored as ratios in global.css (theme-vars.test.ts).
- */
 export const nativeTypography = {
   "2xs": {
     fontSize: 11,

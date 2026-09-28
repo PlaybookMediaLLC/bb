@@ -8,6 +8,13 @@ import {
   reusableSuccessfulResult,
 } from "./cache.js";
 import {
+  abandonOriginNotifications,
+  hasWorker,
+  ownWorker,
+  workerOrigins,
+  isWorkerRetired,
+  retiredWorkers,
+  recordWorkerCleanup,
   activeChildThreadsForRun,
   attachCallThread,
   beginNotificationAttempt,
@@ -15,7 +22,7 @@ import {
   claimQueuedRun,
   countCallsForRun,
   createRun,
-  deleteExpiredTerminalRuns,
+  deleteTerminalRuns,
   getCall,
   getCallByChildThread,
   getLatestRunForOriginThread,
@@ -24,6 +31,7 @@ import {
   incrementRepairAttempts,
   listCallsForRun,
   listCallsForRunPage,
+  listExpiredTerminalRuns,
   listActiveRunsForOriginThread,
   listRuns,
   listPendingNotificationRuns,
@@ -62,6 +70,7 @@ import type {
   WorkflowCapabilities,
   WorkflowReference,
 } from "./types.js";
+import { utf8Prefix } from "./utf8.js";
 import { parseStoredAgentOptions } from "./validation.js";
 import { prepareWorkflowSource } from "./workflow-input.js";
 
@@ -96,6 +105,8 @@ const VALUE_LIMITS = { bytes: 1024 * 1024, nodes: 100_000, depth: 128 };
 const NOTIFICATION_RETRY_BASE_MS = 1_000;
 const NOTIFICATION_RETRY_MAX_MS = 60 * 60 * 1_000;
 const PROVIDER_RETRY_DELAYS_MS = [1_000, 4_000] as const;
+const RETENTION_SWEEP_RUNS = 20;
+const RECOVERY_SCAN_INTERVAL_MS = 30_000;
 
 function message(error: unknown): string {
   return error instanceof Error ? error.message : String(error);
@@ -129,19 +140,6 @@ export function isRetryableProviderFailure(error: unknown): boolean {
     /\b(?:econnreset|econnrefused|etimedout|ehostunreach|enetunreach)\b/,
     /(?:connection reset|connection closed|socket hang up|network error)/,
   ].some((pattern) => pattern.test(detail));
-}
-
-function utf8Prefix(text: string, maximumBytes: number): string {
-  if (maximumBytes <= 0) return "";
-  let result = "";
-  let bytes = 0;
-  for (const character of text) {
-    const next = Buffer.byteLength(character, "utf8");
-    if (bytes + next > maximumBytes) break;
-    result += character;
-    bytes += next;
-  }
-  return result;
 }
 
 export function formatWorkflowNotification(
@@ -307,8 +305,6 @@ function resolveStructuredValue(
   if (validation.valid || typeof value !== "string") {
     return { value, validation };
   }
-  // Models sometimes double-encode structured output as a JSON string.
-  // Accept the unwrapped value only when it satisfies the schema.
   let unwrapped: JsonValue;
   try {
     unwrapped = JSON.parse(value) as JsonValue;
@@ -331,15 +327,13 @@ function resolveStructuredValue(
 function sleep(ms: number, signal: AbortSignal): Promise<void> {
   return new Promise((resolve) => {
     if (signal.aborted) return resolve();
-    const timeout = setTimeout(resolve, ms);
-    signal.addEventListener(
-      "abort",
-      () => {
-        clearTimeout(timeout);
-        resolve();
-      },
-      { once: true },
-    );
+    const settle = () => {
+      clearTimeout(timeout);
+      signal.removeEventListener("abort", settle);
+      resolve();
+    };
+    const timeout = setTimeout(settle, ms);
+    signal.addEventListener("abort", settle, { once: true });
   });
 }
 
@@ -369,13 +363,12 @@ export interface WorkflowService {
   onThreadIdle(threadId: string, output: string | null): void;
   onThreadFailed(threadId: string, error: string | null): void;
   onThreadDeleted(threadId: string): void;
+  onOriginUnavailable(threadId: string): Promise<void>;
   submitStructuredResult(
     threadId: string,
     value: JsonValue,
   ): Promise<{ ok: true } | { ok: false; terminal: boolean; error: string }>;
   agentConfiguration(threadId: string): {
-    /** Parameter schema for bb_workflow_result; null when the call is not a
-     * running structured call. */
     resultParameters: Record<string, unknown> | null;
     terminal: boolean;
     instructions: string | null;
@@ -424,17 +417,124 @@ export function createWorkflowService(
     if (signal.aborted) throw new Error("Workflow cancelled");
   }
 
-  /**
-   * Tell open pages that the run set for an origin thread changed. The
-   * composer banner polls only while it shows an active run, so this is how
-   * a freshly started run appears without a standing 1 s poll on idle
-   * threads. Ephemeral: a page that missed it catches up on its next
-   * refresh (visibility regain, reconnect, or its own active poll).
-   */
   function publishRunsChanged(originThreadId: string): void {
     bb.realtime.publish(WORKFLOW_RUNS_REALTIME_CHANNEL, {
       threadId: originThreadId,
     });
+  }
+
+  const spawningCalls = new Set<string>();
+  let discoveryOffset = 0;
+  let nextDiscoveryAt = 0;
+  let nextOriginReconcileAt = 0;
+
+  async function onOriginUnavailable(threadId: string): Promise<void> {
+    const stops = listActiveRunsForOriginThread(db, threadId).map((run) =>
+      stop(run.id),
+    );
+    abandonOriginNotifications(db, threadId);
+    await Promise.all(stops);
+  }
+
+  async function originUnavailable(threadId: string): Promise<boolean> {
+    try {
+      const origin = await bb.sdk.threads.get({ threadId });
+      return origin.archivedAt != null;
+    } catch (error) {
+      if (isMissingThread(error)) return true;
+      throw error;
+    }
+  }
+
+  async function waitForOrigin(
+    threadId: string,
+    signal: AbortSignal,
+  ): Promise<boolean> {
+    let delay = 1_000;
+    while (true) {
+      throwIfCancelled(signal);
+      try {
+        return await originUnavailable(threadId);
+      } catch (error) {
+        if (!isRetryableProviderFailure(error)) throw error;
+        await sleep(delay, signal);
+        delay = Math.min(delay * 2, 30_000);
+      }
+    }
+  }
+
+  async function reconcileOrigins(): Promise<void> {
+    if (Date.now() < nextOriginReconcileAt) return;
+    nextOriginReconcileAt = Date.now() + RECOVERY_SCAN_INTERVAL_MS;
+    for (const threadId of workerOrigins(db, Date.now())) {
+      try {
+        if (await originUnavailable(threadId))
+          await onOriginUnavailable(threadId);
+      } catch (error) {
+        bb.log.warn(
+          `Could not reconcile workflow origin ${threadId}: ${message(error)}`,
+        );
+      }
+    }
+  }
+
+  const ownershipSchema = z.object({
+    workflowWorker: z.literal(1),
+    runId: z.string().min(1),
+    callId: z.string().min(1),
+    originThreadId: z.string().min(1),
+  });
+
+  async function discoverWorkers(): Promise<void> {
+    if (Date.now() < nextDiscoveryAt && spawningCalls.size === 0) return;
+    nextDiscoveryAt = Date.now() + RECOVERY_SCAN_INTERVAL_MS;
+    const threads = await bb.sdk.threads.list({
+      originPluginId: bb.pluginId,
+      includeHidden: true,
+      archived: false,
+      limit: 100,
+      offset: discoveryOffset,
+    });
+    for (const thread of threads) {
+      if (hasWorker(db, thread.id)) continue;
+      try {
+        const metadata = ownershipSchema.safeParse(
+          await bb.sdk.threads.getPluginMetadata({ threadId: thread.id }),
+        );
+        if (!metadata.success) continue;
+        const owner = metadata.data;
+        ownWorker(
+          db,
+          thread.id,
+          owner.runId,
+          owner.callId,
+          owner.originThreadId,
+        );
+      } catch (error) {
+        if (!isMissingThread(error))
+          bb.log.warn(
+            `Could not discover workflow worker ${thread.id}: ${message(error)}`,
+          );
+      }
+    }
+    discoveryOffset =
+      threads.length < 100 ? 0 : discoveryOffset + threads.length;
+    if (discoveryOffset !== 0) nextDiscoveryAt = Date.now() + 1_000;
+  }
+
+  async function cleanupWorkers(): Promise<void> {
+    for (const worker of retiredWorkers(db, Date.now())) {
+      if (
+        spawningCalls.has(worker.callId) ||
+        !isWorkerRetired(db, worker.threadId)
+      )
+        continue;
+      recordWorkerCleanup(
+        db,
+        worker.threadId,
+        await archiveRetiredWorker(worker.threadId),
+      );
+    }
   }
 
   async function stopChild(threadId: string): Promise<void> {
@@ -665,9 +765,7 @@ export function createWorkflowService(
     const permissionMode = executionValuesSchema.shape.permissionMode.parse(
       run.originPermissionMode,
     );
-    if (
-      !provider.capabilities.permissionModes.includes(permissionMode)
-    ) {
+    if (!provider.capabilities.permissionModes.includes(permissionMode)) {
       throw new Error(
         `Permission mode ${JSON.stringify(run.originPermissionMode)} is not supported by provider ${requested.provider}`,
       );
@@ -825,7 +923,20 @@ export function createWorkflowService(
     while (true) {
       try {
         throwIfCancelled(signal);
+        if (await waitForOrigin(run.originThreadId, signal)) {
+          await onOriginUnavailable(run.originThreadId);
+          throw new Error("Workflow origin is archived or deleted");
+        }
+        throwIfCancelled(signal);
+        spawningCalls.add(call.id);
         const child = await bb.sdk.threads.spawn({
+          lifecycleOwnerThreadId: run.originThreadId,
+          pluginMetadata: {
+            workflowWorker: 1,
+            runId: run.id,
+            callId: call.id,
+            originThreadId: run.originThreadId,
+          },
           projectId: run.projectId,
           environment: { type: "reuse", environmentId: run.environmentId },
           prompt: childPrompt(run, prompt, options),
@@ -836,6 +947,7 @@ export function createWorkflowService(
           permissionMode: selection.permissionMode,
           visibility: "hidden",
         });
+        ownWorker(db, child.id, run.id, call.id, run.originThreadId);
         if (signal.aborted) {
           await stopChild(child.id);
           throw new Error("Workflow cancelled");
@@ -845,6 +957,7 @@ export function createWorkflowService(
           await stopChild(child.id);
           throw new Error("Workflow cancelled");
         }
+        spawningCalls.delete(call.id);
         const stopOnAbort = () => void stopChild(child.id);
         signal.addEventListener("abort", stopOnAbort, { once: true });
         try {
@@ -875,6 +988,7 @@ export function createWorkflowService(
           signal.removeEventListener("abort", stopOnAbort);
         }
       } catch (error) {
+        spawningCalls.delete(call.id);
         throwIfCancelled(signal);
         const delay = PROVIDER_RETRY_DELAYS_MS[call.providerRetryAttempts];
         if (delay === undefined || !isRetryableProviderFailure(error)) {
@@ -1000,8 +1114,6 @@ export function createWorkflowService(
             },
           ],
         });
-        // The corrective turn is still part of this call. A later idle event
-        // or result-tool submission settles it and wakes the existing waiter.
         return;
       } catch (error) {
         const correctionError = `Could not request structured-output correction: ${message(error)}`;
@@ -1158,6 +1270,10 @@ export function createWorkflowService(
     const settings = settingsForRun(latest);
     if (!beginNotificationAttempt(db, run.id)) return;
     try {
+      if (await originUnavailable(latest.originThreadId)) {
+        await onOriginUnavailable(latest.originThreadId);
+        return;
+      }
       await bb.sdk.threads.send({
         threadId: latest.originThreadId,
         mode: "steer-if-active",
@@ -1176,7 +1292,15 @@ export function createWorkflowService(
       markNotificationSent(db, run.id);
     } catch (error) {
       const detail = message(error);
-      if (isMissingThread(error)) {
+      let unavailable = isMissingThread(error);
+      if (!unavailable) {
+        try {
+          unavailable = await originUnavailable(latest.originThreadId);
+        } catch {
+          unavailable = false;
+        }
+      }
+      if (unavailable) {
         settleNotificationUndeliverable(
           db,
           run.id,
@@ -1350,6 +1474,11 @@ export function createWorkflowService(
       },
     };
     try {
+      if (await waitForOrigin(run.originThreadId, signal)) {
+        await onOriginUnavailable(run.originThreadId);
+        return;
+      }
+      throwIfCancelled(signal);
       const result = await executeWorkflowScript({
         args: parseJson(run.argsJson, "workflow args"),
         body: parsed.body,
@@ -1403,7 +1532,9 @@ export function createWorkflowService(
       const threadId = call.childThreadId!;
       try {
         const thread = await bb.sdk.threads.get({ threadId });
-        if (thread.status === "idle") {
+        if (thread.archivedAt != null) {
+          failThreadCall(threadId, "Workflow worker was archived");
+        } else if (thread.status === "idle") {
           const output = await bb.sdk.threads.output({ threadId });
           onThreadIdle(threadId, output.output);
           await idleHandlerTasks.get(call.id);
@@ -1435,6 +1566,26 @@ export function createWorkflowService(
     }
   }
 
+  async function archiveRetiredWorker(threadId: string): Promise<boolean> {
+    try {
+      await bb.sdk.threads.stop({ threadId });
+      await bb.sdk.threads.archive({ threadId });
+      return true;
+    } catch (error) {
+      if (isMissingThread(error)) return true;
+      bb.log.warn(
+        `Could not archive retired workflow worker ${threadId}: ${message(error)}`,
+      );
+      return false;
+    }
+  }
+
+  async function sweepExpiredRuns(now: number): Promise<void> {
+    const expired = listExpiredTerminalRuns(db, now, RETENTION_SWEEP_RUNS);
+    if (expired.runIds.length === 0) return;
+    deleteTerminalRuns(db, expired.runIds);
+  }
+
   async function maintenanceTick(): Promise<void> {
     const now = Date.now();
     const isolated = async (
@@ -1449,13 +1600,12 @@ export function createWorkflowService(
         );
       }
     };
-    // Thread state is authoritative. Reconcile calls before enforcing the
-    // total run deadline.
+    await isolated("discover-workers", discoverWorkers);
+    await isolated("reconcile-origins", reconcileOrigins);
+    await isolated("cleanup-workers", cleanupWorkers);
     await isolated("reconcile-workers", reconcileRunningCalls);
     await isolated("enforce-timeouts", () => enforceTimeouts(now));
-    await isolated("retention", () => {
-      deleteExpiredTerminalRuns(db, now, 100);
-    });
+    await isolated("retention", () => sweepExpiredRuns(now));
   }
 
   async function runWorker(signal: AbortSignal): Promise<void> {
@@ -1477,12 +1627,12 @@ export function createWorkflowService(
         publishRunsChanged(run.originThreadId);
         const controller = new AbortController();
         controllers.set(run.id, controller);
-        signal.addEventListener("abort", () => controller.abort(), {
-          once: true,
+        const abortRun = () => controller.abort();
+        signal.addEventListener("abort", abortRun, { once: true });
+        const execution = executeRun(run, controller.signal).finally(() => {
+          signal.removeEventListener("abort", abortRun);
+          active.delete(execution);
         });
-        const execution = executeRun(run, controller.signal).finally(() =>
-          active.delete(execution),
-        );
         active.add(execution);
       }
       if (Date.now() >= nextMaintenanceAt) {
@@ -1534,6 +1684,7 @@ export function createWorkflowService(
     },
     runWorker,
     onThreadIdle,
+    onOriginUnavailable,
     onThreadFailed: (threadId, error) =>
       failThreadCall(threadId, error ?? "Workflow worker failed"),
     onThreadDeleted: (threadId) =>

@@ -5,21 +5,20 @@ import {
   GROK_ACP_DIALECT,
   OMP_ACP_DIALECT,
   OPENCODE_ACP_DIALECT,
+  grokContextUsageFromPromptResult,
+  grokContextWindowSizeFromSessionModels,
   resolveAcpDialect,
 } from "./dialect.js";
 import type { AcpToolCallUpdateEvent } from "./wire.js";
 
 describe("resolveAcpDialect", () => {
-  // The registration names the dialect, so the same agent behind a wrapper
-  // script — or registered by a third-party plugin under another id — still
-  // gets its side channels read.
   it("takes the dialect the registration named", () => {
     expect(
       resolveAcpDialect({ dialectId: "grok", command: "/opt/wrappers/agent" }),
     ).toBe(GROK_ACP_DIALECT);
-    expect(
-      resolveAcpDialect({ dialectId: "cursor", command: "node" }),
-    ).toBe(CURSOR_ACP_DIALECT);
+    expect(resolveAcpDialect({ dialectId: "cursor", command: "node" })).toBe(
+      CURSOR_ACP_DIALECT,
+    );
     expect(resolveAcpDialect({ dialectId: "opencode", command: "node" })).toBe(
       OPENCODE_ACP_DIALECT,
     );
@@ -47,8 +46,6 @@ describe("resolveAcpDialect", () => {
     ).toBe(GENERIC_ACP_DIALECT);
   });
 
-  // Selecting on the launch command, not a bb provider id, is what lets a
-  // user-configured instance of the same agent get the same dialect.
   it("gives an unknown agent the generic dialect, which answers nothing", () => {
     const dialect = resolveAcpDialect({ command: "amp" });
     expect(dialect).toBe(GENERIC_ACP_DIALECT);
@@ -223,8 +220,6 @@ describe("OpenCode command results", () => {
 });
 
 describe("grok sub-agents", () => {
-  // Version 1 of the protocol has no sub-agent concept, so only the dialect
-  // can know that this tool call is delegated work.
   it("maps a spawn_subagent call to a delegation", () => {
     expect(
       GROK_ACP_DIALECT.classifyToolCall?.(
@@ -281,8 +276,6 @@ describe("cursor sub-agents", () => {
     });
   });
 
-  // bb answered cursor/task with -32601: a protocol error for a request the
-  // agent is entitled to send, and the sub-agent detail was thrown away.
   it("acknowledges cursor/task and reports the sub-agent it names", () => {
     expect(
       CURSOR_ACP_DIALECT.handleClientRequest?.("cursor/task", {
@@ -336,14 +329,75 @@ describe("grok dialect", () => {
     ).toEqual({ name: "run_terminal_command", kind: "execute" });
   });
 
-  // The side channel is the vendor's, so it is read defensively: a kind bb's
-  // vocabulary does not have is no kind at all, and a call with no _meta
-  // leaves every decision to the protocol fields.
   it("ignores a kind outside the ACP vocabulary and a missing _meta", () => {
     expect(
       identity({ "x.ai/tool": { name: "deploy_thing", kind: "deploy" } }),
     ).toEqual({ name: "deploy_thing" });
     expect(identity(undefined)).toBeUndefined();
     expect(identity({ "other.vendor/tool": { name: "x" } })).toBeUndefined();
+  });
+});
+
+describe("grok session context _meta", () => {
+  it("reads the current model's advertised window size", () => {
+    expect(
+      grokContextWindowSizeFromSessionModels({
+        currentModelId: "grok-4.6",
+        availableModels: [
+          {
+            modelId: "grok-4.6",
+            name: "Grok 4.6",
+            _meta: { totalContextTokens: 500_000 },
+          },
+          {
+            modelId: "grok-4.5",
+            name: "Grok 4.5",
+            _meta: { totalContextTokens: 256_000 },
+          },
+        ],
+      }),
+    ).toBe(500_000);
+  });
+
+  it("skips a model without a window and ignores empty catalogs", () => {
+    expect(
+      grokContextWindowSizeFromSessionModels({
+        currentModelId: "grok-4.6",
+        availableModels: [
+          { modelId: "grok-4.6", name: "Grok 4.6" },
+          {
+            modelId: "grok-4.5",
+            name: "Grok 4.5",
+            _meta: { totalContextTokens: 256_000 },
+          },
+        ],
+      }),
+    ).toBe(256_000);
+    expect(grokContextWindowSizeFromSessionModels(undefined)).toBeUndefined();
+    expect(
+      grokContextWindowSizeFromSessionModels({ availableModels: [] }),
+    ).toBeUndefined();
+  });
+
+  it("prefers prompt usage inputTokens for the occupied window", () => {
+    expect(
+      grokContextUsageFromPromptResult({
+        stopReason: "end_turn",
+        _meta: {
+          totalTokens: 17_538,
+          inputTokens: 17_504,
+          usage: { inputTokens: 17_504, totalTokens: 17_531 },
+        },
+      }),
+    ).toEqual({ used: 17_504 });
+    expect(
+      grokContextUsageFromPromptResult({
+        stopReason: "end_turn",
+        _meta: { totalTokens: 12 },
+      }),
+    ).toEqual({ used: 12 });
+    expect(
+      grokContextUsageFromPromptResult({ stopReason: "end_turn" }),
+    ).toBeUndefined();
   });
 });

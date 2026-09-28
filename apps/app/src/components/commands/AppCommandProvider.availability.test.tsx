@@ -48,6 +48,7 @@ function defaultBinding(
 
 const testState = vi.hoisted(() => ({
   isDesktop: false,
+  setSplitNavigationEnabled: vi.fn(),
 }));
 
 vi.mock("@/hooks/queries/system-queries", () => ({
@@ -57,7 +58,6 @@ vi.mock("@/hooks/queries/system-queries", () => ({
         ...defaultAppSettings,
         showKeyboardHints: false,
       },
-      // Empty on purpose: availability must not depend on these.
       keybindings: [],
       defaultKeybindings: [
         defaultBinding("thread.new", { none: ["modalOpen"] }),
@@ -73,7 +73,9 @@ vi.mock("@/hooks/queries/system-queries", () => ({
 }));
 
 vi.mock("@/lib/bb-desktop", () => ({
-  getBbDesktopInfo: () => (testState.isDesktop ? {} : null),
+  getBbDesktopInfo: () => (testState.isDesktop ? {
+    setSplitNavigationEnabled: testState.setSplitNavigationEnabled,
+  } : null),
 }));
 
 function Handler({ command }: { command: AppCommandId }) {
@@ -86,8 +88,6 @@ function SplitContext() {
   return null;
 }
 
-// Asks on click, as the palette does: reading during render would run before
-// sibling handlers have registered.
 function Availability({
   command,
   target = null,
@@ -127,6 +127,7 @@ function availabilityOf(command: AppCommandId): string | null {
 afterEach(() => {
   cleanup();
   testState.isDesktop = false;
+  testState.setSplitNavigationEnabled.mockClear();
 });
 
 describe("isCommandAvailable", () => {
@@ -167,7 +168,6 @@ describe("isCommandAvailable", () => {
   });
 
   it("ignores `none` guards, which exist to stop chords stealing keystrokes", () => {
-    // The palette is itself a modal with a focused input.
     renderProvider(
       <>
         <div aria-modal="true" />
@@ -183,7 +183,6 @@ describe("isCommandAvailable", () => {
   });
 
   it("is true for a command the user left unbound", () => {
-    // Ships with a null shortcut, so it is absent from the merged bindings.
     renderProvider(
       <>
         <Handler command="thread.rename" />
@@ -213,4 +212,20 @@ describe("isCommandAvailable", () => {
     );
     expect(availabilityOf("window.new")).toBe("yes");
   });
+});
+
+it("keeps native split availability until the last registered split unmounts", () => {
+  testState.isDesktop = true;
+  const { rerender, unmount } = renderProvider(
+    <><SplitContext key="first" /><SplitContext key="second" /></>,
+  );
+  expect(testState.setSplitNavigationEnabled).toHaveBeenLastCalledWith(true);
+  rerender(
+    <MemoryRouter>
+      <AppCommandProvider><SplitContext key="first" /></AppCommandProvider>
+    </MemoryRouter>,
+  );
+  expect(testState.setSplitNavigationEnabled).toHaveBeenLastCalledWith(true);
+  unmount();
+  expect(testState.setSplitNavigationEnabled).toHaveBeenLastCalledWith(false);
 });

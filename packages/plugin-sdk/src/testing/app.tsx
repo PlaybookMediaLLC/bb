@@ -1,3 +1,4 @@
+import * as React from "react";
 import {
   createContext,
   useContext,
@@ -15,8 +16,11 @@ import { act, render, type RenderResult } from "@testing-library/react";
 import {
   type BbContext,
   type BbNavigate,
+  type BranchesState,
   type ComposerCustomization,
   type ComposerView,
+  type ExperimentalAppOverlayRegistration,
+  type ExperimentalQuestionFormHost,
   type PluginAppDefinition,
   type PluginAppSetup,
   type PluginCodeThemeState,
@@ -35,7 +39,7 @@ import {
   type PluginNavPanelRegistration,
   type PluginNewThreadPanelActionRegistration,
   type PluginPendingInteractionRegistration,
-  type PluginProviderIconRegistration,
+  type ExperimentalIconRegistration,
   type PluginTimelineRendererRegistration,
   type PluginRealtimeConnectionState,
   type PluginRpcClient,
@@ -43,14 +47,28 @@ import {
   type PluginSettingsSectionRegistration,
   type PluginSettingsState,
   type PluginSidebarFooterActionRegistration,
+  type ExperimentalSidebarNavigationRegistration,
+  type ExperimentalSidebarHeaderRegistration,
+  type ExperimentalSidebarNavigationActions,
+  type ExperimentalSidebarNavigationIconProps,
+  type ExperimentalSidebarNavigationItem,
+  type ExperimentalSidebarNavigationSplit,
+  type ExperimentalSidebarNavigationState,
   type PluginSidebarPullRequest,
   type PluginSidebarThreadActions,
+  type PluginBrowserBbSdk,
+  type PluginEnvironmentProvidersState,
+  type PluginSidebarSplitLayout,
+  type PluginSidebarThreadDraftState,
   type PluginSidebarThreadPullRequestState,
+  type PluginSidebarThreadRowStatus,
+  type PluginSidebarThreadShortcut,
   type PluginSidebarThreadSplit,
   type PluginProvidersState,
   type PluginSidebarThreadsState,
   type PluginSourceCodeRendererRegistration,
   type PluginThreadHeaderActionRegistration,
+  type ExperimentalPluginBrowserToolbarActionRegistration,
   type PluginThreadListRegistration,
   type PluginThreadPanelActionRegistration,
   type PluginRpcContract,
@@ -60,13 +78,19 @@ import {
   type UrlLinkProps,
   type ExperimentalFileLinkProps,
   type ExperimentalFileOpenOptions,
+  type ExperimentalComposerSelection,
+  type ExperimentalComposerSubmitOptions,
   type ExperimentalAppPanel,
   type ExperimentalFixedTabTargetState,
   type ExperimentalOpenFixedTabOptions,
   type ExperimentalPluginFixedTabReference,
   type NewThreadComposerProps,
+  type BranchPickerProps,
+  type CheckoutState,
   type ExperimentalPermissionModePickerProps,
   type ExperimentalProviderModelPickerProps,
+  type PluginEnvironmentProviderInputsRegistration,
+  type PluginMachineProviderInputsRegistration,
   type ThreadChatProps,
   type DiffProps,
   type SourceCodeProps,
@@ -75,7 +99,11 @@ import {
 import { isComposerDraftEmpty } from "../internal/composer-view.js";
 import { normalizePluginThreadRowStatus } from "../internal/composer-customization-validation.js";
 import { normalizeExperimentalFileOpenOptions } from "../internal/file-navigation-validation.js";
-import { collectPluginAppRegistrations } from "../internal/plugin-app-collector.js";
+import {
+  collectPluginAppRegistrations,
+  type CollectedPluginProviderIconRegistration,
+  type CollectedExperimentalSidebarFooterItem,
+} from "../internal/plugin-app-collector.js";
 
 /**
  * `@get-bb/plugin-sdk/testing/app` — the frontend plugin test harness. Tests a
@@ -84,11 +112,11 @@ import { collectPluginAppRegistrations } from "../internal/plugin-app-collector.
  *
  * - {@link installTestPluginRuntime} fills `globalThis.__bbPluginRuntime.
  *   pluginSdkApp` with a test implementation of the `@get-bb/plugin-sdk/app`
- *   surface (the same seam `bb plugin build` shims to the real app). It must
- *   run BEFORE the plugin's `app.tsx` module evaluates, because that module
- *   binds the runtime at import time — so import `app.tsx` through
- *   {@link loadPluginApp}'s thunk form, or call the installer from a vitest
- *   setup file when you prefer static imports.
+ *   surface (the same seam `bb plugin build` shims to the real app). The
+ *   `@get-bb/plugin-sdk/app` exports look the runtime up when they are called
+ *   or rendered, so import order does not matter: install the runtime any time
+ *   before the first hook runs ({@link loadPluginApp} and {@link renderSlot}
+ *   install it for you).
  * - {@link loadPluginApp} runs the definition's setup against a validating
  *   collector (ported from the BB app's interpreter, same error messages)
  *   and returns the typed slot registrations.
@@ -110,6 +138,24 @@ export interface RpcCall {
   method: string;
   input: unknown;
 }
+/** One recorded `useSdk()` call, as `"<area>.<method>"` plus its arguments. */
+export interface SdkCall {
+  method: string;
+  args: unknown[];
+}
+type PluginSdkFakeTree<T> = {
+  [Key in keyof T]?: T[Key] extends (...args: never[]) => unknown
+    ? T[Key]
+    : PluginSdkFakeTree<T[Key]>;
+};
+
+/**
+ * Nested partial fakes for `useSdk()`, mirroring the client's areas and
+ * sub-areas (`{ threads: { queuedMessages: { create } } }`). Provide only the
+ * methods the slot calls; a call to anything else throws with the missing
+ * dot-path so the test fails loudly instead of returning undefined.
+ */
+export type PluginSdkTestFakes = PluginSdkFakeTree<PluginBrowserBbSdk>;
 export type NavigateCall =
   | { method: "toThread"; threadId: string }
   | { method: "toProject"; projectId: string }
@@ -159,6 +205,20 @@ export interface ComposerLog {
   quotes: string[];
   mentions: PluginComposerMention[];
   focusCount: number;
+  /**
+   * Every `experimental_submit` the plugin ran, in order. The harness composer
+   * has no submit pipeline of its own, so it records the options and clears the
+   * draft — enough to assert what a picker scheduled and that it tidied up.
+   */
+  submits: ExperimentalComposerSubmitOptions[];
+  /**
+   * Every `experimental_setSelection` the harness composer accepted, in
+   * order. The harness has no pickers of its own, so it records the request
+   * and echoes it back as the settled selection, minus the fields the
+   * composer's scope has no picker for (a thread has no project or
+   * environment). Queued-message and side-chat scopes reject, as the app does.
+   */
+  selections: ExperimentalComposerSelection[];
 }
 
 interface TestComposerStore {
@@ -177,6 +237,8 @@ interface SlotEnv {
   realtimeConnection: TestRealtimeConnectionStore;
   settingsState: PluginSettingsState;
   bbContext: BbContext;
+  pluginId: string;
+  questionFormHost: ExperimentalQuestionFormHost;
   navigate: BbNavigate;
   navigateCalls: NavigateCall[];
   appPanel: ExperimentalAppPanel;
@@ -188,8 +250,19 @@ interface SlotEnv {
   sidebarActions: PluginSidebarThreadActions;
   sidebarActionCalls: SidebarActionCall[];
   sidebarPullRequests: ReadonlyMap<string, PluginSidebarPullRequest>;
+  sidebarDraftThreadIds: ReadonlySet<string>;
+  sidebarRowStatuses: ReadonlyMap<string, PluginSidebarThreadRowStatus>;
+  sidebarShortcuts: ReadonlyMap<string, PluginSidebarThreadShortcut>;
+  sidebarSplitLayout: PluginSidebarSplitLayout | null;
+  sidebarNavigation: ExperimentalSidebarNavigationState;
+  sidebarNavigationCalls: SidebarNavigationCall[];
+  environmentProviders: PluginEnvironmentProvidersState;
+  sdk: PluginBrowserBbSdk;
+  sdkCalls: SdkCall[];
   providers: PluginProvidersState;
   codeTheme: PluginCodeThemeState;
+  branchesState: BranchesState;
+  checkoutState: CheckoutState;
 }
 
 interface TestFixedTabTargetStore {
@@ -211,6 +284,80 @@ export interface SidebarActionCall {
   title?: string;
   pinned?: boolean;
   read?: boolean;
+}
+
+/**
+ * One recorded `experimental_useSidebarNavigation()` action, or a split drag
+ * started from `experimental_useSidebarNavigationSplit()` (`beginSplitDrag`).
+ */
+export interface SidebarNavigationCall {
+  method: keyof ExperimentalSidebarNavigationActions | "beginSplitDrag";
+  itemId?: string;
+  itemIds?: string[];
+  isVisible?: boolean;
+  openInSplit?: boolean;
+}
+
+function createSdkFakeNode(
+  provided: unknown,
+  path: string,
+  calls: SdkCall[],
+): unknown {
+  const callable = function sdkFakeNode() {};
+  return new Proxy(callable, {
+    apply(_target, _thisArg, args: unknown[]) {
+      calls.push({ method: path, args });
+      if (typeof provided !== "function") {
+        throw new Error(
+          `no sdk fake for "${path}" — add it to renderSlot options.sdk`,
+        );
+      }
+      return (provided as (...input: unknown[]) => unknown)(...args);
+    },
+    get(_target, key) {
+      if (typeof key !== "string" || key === "then") return undefined;
+      const next =
+        provided !== null &&
+        typeof provided === "object" &&
+        !Array.isArray(provided)
+          ? (provided as Record<string, unknown>)[key]
+          : undefined;
+      return createSdkFakeNode(
+        next,
+        path === "" ? key : `${path}.${key}`,
+        calls,
+      );
+    },
+  });
+}
+
+function createSdkFake(
+  fakes: PluginSdkTestFakes,
+  calls: SdkCall[],
+): PluginBrowserBbSdk {
+  return createSdkFakeNode(fakes, "", calls) as PluginBrowserBbSdk;
+}
+
+function TestThreadTitle({ threadId }: { threadId: string }) {
+  const env = useSlotEnv("ThreadTitle");
+  const thread = env.sidebarThreads.threads.find((row) => row.id === threadId);
+  if (thread === undefined) return null;
+  return <span data-thread-title={threadId}>{thread.displayTitle}</span>;
+}
+
+function TestSidebarNavigationIcon({
+  icon,
+  className,
+}: ExperimentalSidebarNavigationIconProps) {
+  return (
+    <span
+      aria-hidden="true"
+      className={className}
+      data-sidebar-navigation-icon={
+        icon.kind === "host" ? icon.name : `${icon.pluginId}/${icon.icon ?? ""}`
+      }
+    />
+  );
 }
 
 function SlotLifecycleGuard({
@@ -596,6 +743,41 @@ function TestProviderModelPicker({
   );
 }
 
+function TestBranchPicker({
+  hostId,
+  projectId,
+  value,
+  onChange,
+  label,
+  placeholder,
+  disabled,
+}: BranchPickerProps) {
+  const inert = hostId === null || projectId === null || disabled === true;
+  return (
+    <div
+      data-testid="bb-branch-picker"
+      data-host-id={hostId ?? ""}
+      data-project-id={projectId ?? ""}
+      data-disabled={inert ? "true" : "false"}
+    >
+      <input
+        aria-label={label ?? "Branch"}
+        placeholder={placeholder ?? "Select branch"}
+        disabled={inert}
+        value={value ?? ""}
+        onChange={(event) => {
+          const next = event.target.value;
+          if (next.length === 0) {
+            onChange(null);
+          } else {
+            onChange(next);
+          }
+        }}
+      />
+    </div>
+  );
+}
+
 function TestPermissionModePicker({
   providerId,
   value,
@@ -742,6 +924,12 @@ const testPluginSdkApp = {
   useBbContext(): BbContext {
     return useSlotEnv("useBbContext").bbContext;
   },
+  experimental_usePluginId(): string {
+    return useSlotEnv("experimental_usePluginId").pluginId;
+  },
+  experimental_useQuestionFormHost(): ExperimentalQuestionFormHost {
+    return useSlotEnv("experimental_useQuestionFormHost").questionFormHost;
+  },
   useBbNavigate(): BbNavigate {
     return useSlotEnv("useBbNavigate").navigate;
   },
@@ -795,10 +983,44 @@ const testPluginSdkApp = {
   ThreadChat: TestThreadChat,
   Markdown: TestMarkdown,
   experimental_FileLink: TestFileLink,
+  experimental_Icon: ({ name, fallback, ...props }) => (
+    <span {...props} data-icon={name} data-icon-fallback={fallback} />
+  ),
+  experimental_ProviderIcon: ({
+    providerKind,
+    provider,
+    fallback,
+    ...props
+  }) => (
+    <span
+      {...props}
+      data-provider-kind={providerKind}
+      data-provider-id={provider.id}
+      data-provider-logo={provider.logoUrl ?? undefined}
+      data-provider-glyph={
+        (typeof provider.icon === "string"
+          ? provider.icon
+          : provider.icon?.glyph) ?? undefined
+      }
+      data-provider-tint={
+        provider.strings?.iconTint == null
+          ? undefined
+          : JSON.stringify(provider.strings.iconTint)
+      }
+      data-provider-fallback={fallback}
+    />
+  ),
   UrlLink: TestUrlLink,
   experimental_NewThreadComposer: TestNewThreadComposer,
   experimental_ProviderModelPicker: TestProviderModelPicker,
   experimental_PermissionModePicker: TestPermissionModePicker,
+  experimental_BranchPicker: TestBranchPicker,
+  experimental_useBranches(): BranchesState {
+    return useSlotEnv("experimental_useBranches").branchesState;
+  },
+  experimental_useCheckoutState(): CheckoutState {
+    return useSlotEnv("experimental_useCheckoutState").checkoutState;
+  },
   experimental_SourceCode: TestSourceCode,
   experimental_Diff: TestDiff,
   experimental_useSidebarThreads(): PluginSidebarThreadsState {
@@ -827,6 +1049,65 @@ const testPluginSdkApp = {
       }),
       [env, threadId],
     );
+  },
+  useSidebarThreadDraft(threadId): PluginSidebarThreadDraftState {
+    const env = useSlotEnv("useSidebarThreadDraft");
+    return useMemo(
+      () => ({ hasUnsubmittedDraft: env.sidebarDraftThreadIds.has(threadId) }),
+      [env, threadId],
+    );
+  },
+  useSidebarThreadDraftIds(): ReadonlySet<string> {
+    return useSlotEnv("useSidebarThreadDraftIds").sidebarDraftThreadIds;
+  },
+  useSidebarThreadRowStatus(threadId): PluginSidebarThreadRowStatus | null {
+    const env = useSlotEnv("useSidebarThreadRowStatus");
+    return env.sidebarRowStatuses.get(threadId) ?? null;
+  },
+  useSidebarThreadRowStatuses(): ReadonlyMap<
+    string,
+    PluginSidebarThreadRowStatus
+  > {
+    return useSlotEnv("useSidebarThreadRowStatuses").sidebarRowStatuses;
+  },
+  useSidebarSplitLayout(): PluginSidebarSplitLayout | null {
+    return useSlotEnv("useSidebarSplitLayout").sidebarSplitLayout;
+  },
+  useSidebarThreadShortcut(threadId): PluginSidebarThreadShortcut | null {
+    const env = useSlotEnv("useSidebarThreadShortcut");
+    return env.sidebarShortcuts.get(threadId) ?? null;
+  },
+  ThreadTitle: TestThreadTitle,
+  experimental_useSidebarNavigation(): ExperimentalSidebarNavigationState {
+    return useSlotEnv("experimental_useSidebarNavigation").sidebarNavigation;
+  },
+  experimental_useSidebarNavigationSplit(
+    itemId,
+    _options,
+  ): ExperimentalSidebarNavigationSplit {
+    const env = useSlotEnv("experimental_useSidebarNavigationSplit");
+    return useMemo(
+      () => ({
+        splitProps: {
+          onPointerDown: () => {
+            env.sidebarNavigationCalls.push({
+              method: "beginSplitDrag",
+              itemId,
+            });
+          },
+        },
+        isAvailable: true,
+        layout: null,
+      }),
+      [env, itemId],
+    );
+  },
+  experimental_SidebarNavigationIcon: TestSidebarNavigationIcon,
+  useEnvironmentProviders(): PluginEnvironmentProvidersState {
+    return useSlotEnv("useEnvironmentProviders").environmentProviders;
+  },
+  useSdk(): PluginBrowserBbSdk {
+    return useSlotEnv("useSdk").sdk;
   },
   experimental_useSidebarThreadPullRequest(
     threadId,
@@ -865,18 +1146,21 @@ const testPluginSdkApp = {
 } satisfies PluginSdkApp;
 
 interface PluginRuntimeHost {
-  __bbPluginRuntime?: { pluginSdkApp?: unknown };
+  __bbPluginRuntime?: { pluginSdkApp?: unknown; react?: unknown };
 }
 
 /**
- * Install the test runtime at `globalThis.__bbPluginRuntime.pluginSdkApp`.
- * Idempotent per module instance; must run before the plugin's `app.tsx`
- * (and therefore `@get-bb/plugin-sdk/app`) is imported.
+ * Install the test runtime at `globalThis.__bbPluginRuntime.pluginSdkApp`,
+ * plus the React the `@get-bb/plugin-sdk/app` components render through.
+ * Idempotent per module instance. Call it before the first SDK hook runs or
+ * SDK component renders; when the plugin's modules are imported does not
+ * matter.
  */
 export function installTestPluginRuntime(): void {
   const host = globalThis as PluginRuntimeHost;
   host.__bbPluginRuntime = {
     ...host.__bbPluginRuntime,
+    react: host.__bbPluginRuntime?.react ?? React,
     pluginSdkApp: testPluginSdkApp,
   };
 }
@@ -888,21 +1172,29 @@ export function installTestPluginRuntime(): void {
 export interface CapturedPluginApp {
   homepageSections: PluginHomepageSectionRegistration[];
   settingsSections: PluginSettingsSectionRegistration[];
+  appOverlays: ExperimentalAppOverlayRegistration[];
   navPanels: PluginNavPanelRegistration[];
   threadPanelActions: PluginThreadPanelActionRegistration[];
   newThreadPanelActions: PluginNewThreadPanelActionRegistration[];
   composerCustomizations: ComposerCustomization[];
   pendingInteractions: PluginPendingInteractionRegistration[];
   sidebarFooterActions: PluginSidebarFooterActionRegistration[];
+  experimentalSidebarFooterItems: CollectedExperimentalSidebarFooterItem[];
+  experimentalSidebarNavigations: ExperimentalSidebarNavigationRegistration[];
+  experimentalSidebarHeaders: ExperimentalSidebarHeaderRegistration[];
   threadLists: PluginThreadListRegistration[];
   threadHeaderActions: PluginThreadHeaderActionRegistration[];
+  browserToolbarActions: ExperimentalPluginBrowserToolbarActionRegistration[];
   fileOpeners: PluginFileOpenerRegistration[];
   sourceCodeRenderers: PluginSourceCodeRendererRegistration[];
   diffRenderers: PluginDiffRendererRegistration[];
   messageDirectives: PluginMessageDirectiveRegistration[];
   messageActions: PluginMessageActionRegistration[];
-  providerIcons: PluginProviderIconRegistration[];
+  providerIcons: CollectedPluginProviderIconRegistration[];
+  icons: ExperimentalIconRegistration[];
   timelineRenderers: PluginTimelineRendererRegistration[];
+  environmentProviderInputs: PluginEnvironmentProviderInputsRegistration[];
+  machineProviderInputs: PluginMachineProviderInputsRegistration[];
   contentScripts: PluginContentScriptRegistration[];
 }
 
@@ -915,9 +1207,8 @@ export type PluginAppSource =
 
 /**
  * Install the test runtime, resolve the plugin app definition, and capture
- * its slot registrations. Pass a thunk (`() => import("../app.tsx")`) so the
- * plugin module evaluates after the runtime is installed — a static import
- * would bind `definePluginApp` before the installer runs.
+ * its slot registrations. Pass the imported module, its default export, or a
+ * thunk (`() => import("../app.tsx")`).
  */
 export async function loadPluginApp(
   source: PluginAppSource,
@@ -1095,9 +1386,11 @@ export interface RenderSlotOptions<
    */
   rpc?: PluginRpcTestHandlers<Contract>;
   /** `useSettings()` values; omitted → `{ values: undefined, isLoading: false }`. */
-  settings?: Record<string, string | boolean>;
+  settings?: Record<string, string | number | boolean>;
   /** `useBbContext()` selection; both default to null. */
   context?: { projectId?: string | null; threadId?: string | null };
+  /** `experimental_usePluginId()` value; defaults to `test-plugin`. */
+  pluginId?: string;
   /** Initial `useRealtimeConnectionState()` value; defaults to `connected`. */
   realtimeConnectionState?: PluginRealtimeConnectionState;
   /** Initial state for this render's isolated composer scope and view. */
@@ -1121,11 +1414,53 @@ export interface RenderSlotOptions<
    * mode with no resolved document, the state a plugin sees on first paint.
    */
   codeTheme?: Partial<PluginCodeThemeState>;
+  branchesState?: Partial<BranchesState>;
+  /** Checkout facts `experimental_useCheckoutState()` reports. */
+  checkoutState?: Partial<CheckoutState>;
   /**
    * Pull requests `experimental_useSidebarThreadPullRequest()` reports, keyed
    * by thread id. Omitted → every thread reports none.
    */
   sidebarPullRequests?: Record<string, PluginSidebarPullRequest>;
+  /**
+   * Thread ids `useSidebarThreadDraft()` and `useSidebarThreadDraftIds()`
+   * report as holding an unsent draft. Omitted → none.
+   */
+  sidebarDraftThreadIds?: readonly string[];
+  /**
+   * Row statuses `useSidebarThreadRowStatus()` reports, keyed by thread id.
+   * Omitted → every thread reports null.
+   */
+  sidebarRowStatuses?: Record<string, PluginSidebarThreadRowStatus>;
+  /**
+   * Shortcuts `useSidebarThreadShortcut()` reports, keyed by thread id, as
+   * if the app command modifier were held. Omitted → every thread reports
+   * null.
+   */
+  sidebarShortcuts?: Record<string, PluginSidebarThreadShortcut>;
+  /** The split layout `useSidebarSplitLayout()` reports. Omitted → null. */
+  sidebarSplitLayout?: PluginSidebarSplitLayout;
+  /**
+   * Items and the active item `experimental_useSidebarNavigation()` reports.
+   * Omitted → no items. Actions are recorded in
+   * `inspection.sidebarNavigationCalls` and do not change the items.
+   */
+  sidebarNavigation?: {
+    items?: readonly ExperimentalSidebarNavigationItem[];
+    activeItemId?: string | null;
+    isShortcutModifierHeld?: boolean;
+  };
+  /**
+   * The environment provider catalog `useEnvironmentProviders()` reports.
+   * Omitted → a ready, empty list. Pass `{ status: "loading" }` to test that
+   * branch.
+   */
+  environmentProviders?: Partial<PluginEnvironmentProvidersState>;
+  /**
+   * Fakes for `useSdk()`, one partial object per area. Calls are recorded
+   * in `inspection.sdkCalls`; a call to a method you did not provide throws.
+   */
+  sdk?: PluginSdkTestFakes;
   /** Host acceptance for `useBbNavigate().openThreadPanel`. */
   openThreadPanel?: (
     options: Parameters<BbNavigate["openThreadPanel"]>[0],
@@ -1173,6 +1508,13 @@ export interface RenderedSlotInspectionState {
   readonly experimental_fixedTabOpenCalls: ExperimentalFixedTabOpenCall[];
   /** Every `experimental_useSidebarThreadActions()` call, in order. */
   readonly sidebarActionCalls: SidebarActionCall[];
+  /**
+   * Every `experimental_useSidebarNavigation()` action and navigation split
+   * drag, in order.
+   */
+  readonly sidebarNavigationCalls: SidebarNavigationCall[];
+  /** Every `useSdk()` call, in order, as `"<area>.<method>"`. */
+  readonly sdkCalls: SdkCall[];
   /** Everything written through `useComposer()`. */
   readonly composer: ComposerLog;
 }
@@ -1251,6 +1593,7 @@ export function renderSlot<
   props: Props,
   options: RenderSlotOptions<Contract> = {},
 ): RenderedSlot {
+  installTestPluginRuntime();
   const rpcCalls: RpcCall[] = [];
   const rpcHandlers = (options.rpc ?? {}) as Record<
     string,
@@ -1360,18 +1703,75 @@ export function renderSlot<
     },
   };
   const sidebarActionCalls: SidebarActionCall[] = [];
+  const sidebarNavigationCalls: SidebarNavigationCall[] = [];
+  const sidebarNavigation: ExperimentalSidebarNavigationState = {
+    items: options.sidebarNavigation?.items ?? [],
+    activeItemId: options.sidebarNavigation?.activeItemId ?? null,
+    isShortcutModifierHeld:
+      options.sidebarNavigation?.isShortcutModifierHeld ?? false,
+    actions: {
+      activate(itemId, activationOptions) {
+        sidebarNavigationCalls.push({
+          method: "activate",
+          itemId,
+          openInSplit: activationOptions.openInSplit,
+        });
+      },
+      setVisible(itemId, isVisible) {
+        sidebarNavigationCalls.push({
+          method: "setVisible",
+          itemId,
+          isVisible,
+        });
+      },
+      setOrder(itemIds) {
+        sidebarNavigationCalls.push({
+          method: "setOrder",
+          itemIds: [...itemIds],
+        });
+      },
+      openCustomize() {
+        sidebarNavigationCalls.push({ method: "openCustomize" });
+      },
+      openDetails(itemId) {
+        sidebarNavigationCalls.push({ method: "openDetails", itemId });
+      },
+      async disablePlugin(itemId) {
+        sidebarNavigationCalls.push({ method: "disablePlugin", itemId });
+      },
+    },
+  };
   const sidebarPullRequests = new Map(
     Object.entries(options.sidebarPullRequests ?? {}),
   );
+  const sidebarDraftThreadIds: ReadonlySet<string> = new Set(
+    options.sidebarDraftThreadIds ?? [],
+  );
+  const sidebarRowStatuses = new Map(
+    Object.entries(options.sidebarRowStatuses ?? {}),
+  );
+  const sidebarShortcuts = new Map(
+    Object.entries(options.sidebarShortcuts ?? {}),
+  );
   const sidebarThreads: PluginSidebarThreadsState = {
+    experimental_archived:
+      options.sidebarThreads?.experimental_archived ?? null,
     status: options.sidebarThreads?.status ?? "ready",
     threads: options.sidebarThreads?.threads ?? [],
+    experimental_hosts: options.sidebarThreads?.experimental_hosts ?? [],
     projects: options.sidebarThreads?.projects ?? [],
+    sections: options.sidebarThreads?.sections ?? [],
   };
   const providers: PluginProvidersState = {
     status: options.providers?.status ?? "ready",
     providers: options.providers?.providers ?? [],
   };
+  const environmentProviders: PluginEnvironmentProvidersState = {
+    status: options.environmentProviders?.status ?? "ready",
+    providers: options.environmentProviders?.providers ?? [],
+  };
+  const sdkCalls: SdkCall[] = [];
+  const sdk = createSdkFake(options.sdk ?? {}, sdkCalls);
   const codeTheme: PluginCodeThemeState = {
     mode: options.codeTheme?.mode ?? "light",
     name: options.codeTheme?.name ?? "pierre-light",
@@ -1492,8 +1892,11 @@ export function renderSlot<
     quotes: [],
     mentions: [],
     focusCount: 0,
+    submits: [],
+    selections: [],
   };
   const composerOwnership = { active: true };
+  const submissionListeners = new Set<() => void>();
   const composer: TestComposerStore = {
     getAttachmentCount: () => composerAttachmentCount,
     getScope: () => composerScope,
@@ -1537,6 +1940,25 @@ export function renderSlot<
         }
         composerLog.focusCount += 1;
       },
+      experimental_onSubmitted(listener) {
+        submissionListeners.add(listener);
+        return () => {
+          submissionListeners.delete(listener);
+        };
+      },
+      experimental_removeMention({ provider, id }) {
+        for (
+          let index = composerLog.mentions.length - 1;
+          index >= 0;
+          index -= 1
+        ) {
+          const mention = composerLog.mentions[index];
+          if (mention?.provider === provider && mention.id === id) {
+            commitComposerText(composerText.replace(mention.label, ""));
+            composerLog.mentions.splice(index, 1);
+          }
+        }
+      },
       insertMention(mention) {
         const label = mention.label.trim() || mention.id;
         const separator =
@@ -1548,6 +1970,43 @@ export function renderSlot<
       focus() {
         composerLog.focusCount += 1;
       },
+      async experimental_submit(options) {
+        if (!composerOwnership.active) {
+          throw new Error("This composer is no longer active.");
+        }
+        if (composerText.trim() === "") {
+          throw new Error("Type a message before scheduling it.");
+        }
+        if (
+          options.sendAt !== undefined &&
+          (!Number.isFinite(options.sendAt) || options.sendAt <= Date.now())
+        ) {
+          throw new Error("Pick a time in the future.");
+        }
+        composerLog.submits.push(options);
+        commitComposerText("");
+        for (const listener of submissionListeners) listener();
+      },
+      async experimental_setSelection(selection) {
+        if (!composerOwnership.active) {
+          throw new Error("This composer is no longer active.");
+        }
+        if (
+          composerScope.kind === "queued-message" ||
+          composerScope.kind === "side-chat"
+        ) {
+          throw new Error("This composer has no pickers to set.");
+        }
+        const {
+          projectId: _projectId,
+          environment: _environment,
+          ...rest
+        } = selection;
+        const accepted: ExperimentalComposerSelection =
+          composerScope.kind === "thread" ? rest : { ...selection };
+        composerLog.selections.push(accepted);
+        return accepted;
+      },
     },
   };
 
@@ -1558,6 +2017,11 @@ export function renderSlot<
     realtimeConnection,
     settingsState: { values: options.settings, isLoading: false },
     bbContext: { projectId, threadId },
+    pluginId: options.pluginId ?? "test-plugin",
+    questionFormHost: {
+      shortcuts: new Map(),
+      registerChoiceHandler: () => () => {},
+    },
     navigate,
     navigateCalls,
     appPanel,
@@ -1569,8 +2033,32 @@ export function renderSlot<
     sidebarActions,
     sidebarActionCalls,
     sidebarPullRequests,
+    sidebarDraftThreadIds,
+    sidebarRowStatuses,
+    sidebarShortcuts,
+    sidebarSplitLayout: options.sidebarSplitLayout ?? null,
+    sidebarNavigation,
+    sidebarNavigationCalls,
+    environmentProviders,
+    sdk,
+    sdkCalls,
     providers,
     codeTheme,
+    branchesState: {
+      branches: options.branchesState?.branches ?? [],
+      remoteBranches: options.branchesState?.remoteBranches ?? [],
+      isLoading: options.branchesState?.isLoading ?? false,
+      refresh: options.branchesState?.refresh ?? (() => Promise.resolve()),
+    },
+    checkoutState: {
+      isGit: true,
+      unborn: false,
+      detached: false,
+      dirty: false,
+      currentBranch: "main",
+      operation: { kind: "none" },
+      ...options.checkoutState,
+    },
   };
 
   const releaseComposerOwnership = (): void => {
@@ -1641,6 +2129,8 @@ export function renderSlot<
     navigateCalls,
     experimental_fixedTabOpenCalls,
     sidebarActionCalls,
+    sidebarNavigationCalls,
+    sdkCalls,
     composer: composerLog,
     behavior: {
       emitRealtime,
@@ -1653,6 +2143,8 @@ export function renderSlot<
       navigateCalls,
       experimental_fixedTabOpenCalls,
       sidebarActionCalls,
+      sidebarNavigationCalls,
+      sdkCalls,
       composer: composerLog,
     },
     lifecycle: { rerender: rerenderSlot, unmount: unmountSlot },

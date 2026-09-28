@@ -18,6 +18,7 @@ import {
 import { Icon } from "@bb/shared-ui/icon";
 import { Input } from "@bb/shared-ui/input";
 import { appToast } from "@/components/ui/app-toast.js";
+import { pluginToast } from "@/components/plugin/PluginNotificationDescription";
 import { pluginAdminErrorMessage } from "@/lib/plugin-admin-error";
 import {
   applyInstalledPlugin,
@@ -31,32 +32,18 @@ import {
 } from "@/hooks/queries/plugin-catalog-queries";
 import { CatalogEntryIcon, FullTrustWarning } from "./plugin-ui";
 
-/**
- * Pre-fill for Browse-tab installs: the dialog shows the catalog entry instead
- * of the free source field.
- */
 export type AddPluginInitial = {
   entryId: string;
-  /** Marketplace that listed the entry; the install routes through it. */
   marketplace: string;
-  /** Who published the entry, as the confirmation names them. */
+  pluginId: string;
   publisherLabel: string;
   displayName: string;
   icon: string | null;
   iconUrl: string | null;
   iconTinted: boolean;
-  /** The entry's install source; decides how the dialog describes the install. */
   source: string;
 };
 
-/**
- * The dialog describes each catalog source without claiming that a remote
- * package is bundled or that a mutable Git reference is pinned.
- *
- * It names the publisher rather than calling every catalog entry official: the
- * catalog also lists community and third-party plugins, and "official" is the
- * one claim a confirmation for full-trust code must not overstate.
- */
 function catalogInstallDescription(
   source: string,
   publisherLabel: string,
@@ -77,13 +64,6 @@ interface AddPluginDialogProps {
   initial?: AddPluginInitial | null;
 }
 
-/**
- * The one-step Add-plugin dialog: source field (or the Browse tab's catalog
- * entry pre-filled) plus the full-trust confirmation, committing straight to
- * POST /plugins/install. The server resolves and validates during install;
- * an incompatible or unparsable source surfaces as the install error toast
- * with no active state changed.
- */
 export function AddPluginDialog({
   open,
   onOpenChange,
@@ -123,7 +103,6 @@ function buildRequest(
   return trimmed.length === 0 ? null : { kind: "direct", source: trimmed };
 }
 
-/** One labelled fact of the resolved source, rendered as a definition row. */
 function resolvedSourceRows(
   source: PluginCatalogResolvedSource,
 ): { label: string; value: string; href?: string }[] {
@@ -139,8 +118,6 @@ function resolvedSourceRows(
     ];
   }
   return [
-    // The repository row is a link so a reader can inspect the code that
-    // the confirmation describes before it installs.
     { label: "repository", value: source.url, href: source.url },
     ...(source.subdir === undefined
       ? []
@@ -169,20 +146,16 @@ function resolvedSourceRows(
   ];
 }
 
-/**
- * The true resolved source of a third-party entry, shown before anything runs.
- * A listing's own display metadata is not evidence of what the install
- * fetches, so this renders what bb resolved from the marketplace's source
- * fields — including the exact tag and commit a semver range lands on.
- */
 function ThirdPartySourceDisclosure({
   plan,
   pending,
   error,
+  onRetry,
 }: {
   plan: PluginCatalogInstallPlan | undefined;
   pending: boolean;
   error: unknown;
+  onRetry: () => void;
 }) {
   if (pending) {
     return (
@@ -192,11 +165,47 @@ function ThirdPartySourceDisclosure({
     );
   }
   if (error !== null && error !== undefined) {
+    const status =
+      error instanceof Error &&
+      "status" in error &&
+      typeof error.status === "number"
+        ? error.status
+        : null;
+    const retryable =
+      status === null || status === 408 || status === 429 || status >= 500;
+    const message =
+      status === 401 || status === 403
+        ? "Source access denied. Check repository permissions."
+        : status === 404
+          ? "Source not found. Check the marketplace listing."
+          : retryable
+            ? "Source unavailable. Try again."
+            : "Invalid source. Check the marketplace listing.";
     return (
-      <p className="text-2xs text-warning-text" role="status">
-        Could not resolve this listing&rsquo;s source:{" "}
-        {pluginAdminErrorMessage(error)}
-      </p>
+      <div
+        className="flex items-center gap-3 rounded-md border border-warning/20 bg-warning/5 p-3"
+        role="alert"
+      >
+        <Icon
+          name="AlertTriangle"
+          className="size-4 shrink-0 text-warning-text"
+          aria-hidden
+        />
+        <p className="min-w-0 flex-1 text-xs leading-normal text-foreground">
+          {message}
+        </p>
+        {retryable ? (
+          <Button
+            type="button"
+            variant="outline"
+            size="sm"
+            className="h-7 shrink-0 px-2 text-xs"
+            onClick={onRetry}
+          >
+            Retry
+          </Button>
+        ) : null}
+      </div>
     );
   }
   if (plan === undefined || plan.kind !== "marketplace" || plan.official) {
@@ -267,10 +276,10 @@ function AddPluginDialogContent({
   const queryClient = useQueryClient();
   const [sourceText, setSourceText] = useState("");
   const request = buildRequest(initial, sourceText);
-  // Only a third-party listing needs its source resolved before confirming:
-  // the official catalog is BB's own and installs without a round trip.
   const thirdParty =
-    initial !== null && initial.marketplace !== CURATED_PLUGIN_MARKETPLACE_NAME;
+    initial !== null &&
+    initial.marketplace !== CURATED_PLUGIN_MARKETPLACE_NAME &&
+    !initial.source.startsWith("builtin:");
   const planQuery = useCatalogInstallPlan(
     thirdParty && initial !== null
       ? { entryId: initial.entryId, marketplace: initial.marketplace }
@@ -279,6 +288,7 @@ function AddPluginDialogContent({
   const plan = planQuery.data;
 
   const install = useMutation({
+    meta: { showErrorToast: false },
     mutationFn: (body: NonNullable<typeof request>) =>
       body.kind === "catalog"
         ? installCatalogPlugin(fetch, {
@@ -292,16 +302,23 @@ function AddPluginDialogContent({
     onSuccess: (plugin) => {
       applyInstalledPlugin({ queryClient, plugin });
       invalidatePluginList({ queryClient });
-      // Search rows carry installed flags; a fresh install flips them.
       invalidatePluginCatalogSearch({ queryClient });
-      appToast.success(`${initial?.displayName ?? "Plugin"} installed`);
+      pluginToast.success("Plugin installed", plugin, "installed");
       onOpenChange(false);
       onInstalled?.(plugin);
     },
     onError: (error) => {
-      appToast.error("Installing the plugin failed", {
-        description: pluginAdminErrorMessage(error),
-      });
+      const detail = pluginAdminErrorMessage(error);
+      if (initial === null) {
+        appToast.error("Plugin installation failed", { description: detail });
+        return;
+      }
+      pluginToast.error(
+        "Plugin installation failed",
+        { id: initial.pluginId, name: initial.displayName },
+        "catalog",
+        detail,
+      );
     },
   });
 
@@ -334,11 +351,6 @@ function AddPluginDialogContent({
                 {initial.entryId}
               </span>
             </div>
-            {/* The exact source, including a pinned npm registry: a listing
-                must not send BB somewhere the confirmation never named. It
-                scrolls on one line rather than wrapping: a long git ref broken
-                across three lines pushes the buttons around and reads as
-                damage rather than as an address. */}
             <p className="overflow-x-auto whitespace-nowrap font-mono text-2xs text-subtle-foreground">
               {initial.source}
             </p>
@@ -364,7 +376,17 @@ function AddPluginDialogContent({
             plan={plan}
             pending={planQuery.isPending}
             error={planQuery.error}
+            onRetry={() => void planQuery.refetch()}
           />
+        ) : null}
+
+        {install.isError ? (
+          <p
+            role="alert"
+            className="max-h-40 overflow-y-auto whitespace-pre-wrap break-words text-xs text-warning-text"
+          >
+            {pluginAdminErrorMessage(install.error)}
+          </p>
         ) : null}
 
         {install.isPending ? (
@@ -373,13 +395,13 @@ function AddPluginDialogContent({
             role="progressbar"
             aria-label="Installing plugin"
           >
-            <div className="h-full w-1/3 animate-plugin-install-progress rounded-full bg-muted-foreground" />
+            <div className="h-full w-1/3 animate-indeterminate-progress rounded-full bg-muted-foreground" />
           </div>
         ) : (
           <FullTrustWarning />
         )}
       </div>
-      <DialogFooter>
+      <DialogFooter className="gap-2">
         <Button
           type="button"
           variant="outline"
@@ -392,8 +414,6 @@ function AddPluginDialogContent({
           disabled={
             request === null ||
             install.isPending ||
-            // A third-party install is confirmed against its resolved source,
-            // so the button waits for that resolution to arrive.
             (thirdParty && planQuery.isPending) ||
             (thirdParty && plan === undefined)
           }

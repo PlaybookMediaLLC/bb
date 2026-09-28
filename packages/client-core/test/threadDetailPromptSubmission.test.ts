@@ -34,9 +34,6 @@ describe("threadDetailPromptSubmission", () => {
     });
   });
 
-  // get-bb/bb#1860: the picker can change mid-turn. The steer must carry the
-  // selection like the normal send does, or the server falls back to the
-  // active turn's execution tuple.
   it("steers with the selected execution options", () => {
     expect(
       buildFollowUpShortcutRequest({
@@ -86,7 +83,7 @@ describe("threadDetailPromptSubmission", () => {
       kind: "queued",
       request: {
         id: "thread-1",
-        mode: "auto",
+        mode: "steer",
         queuedMessageId: "queued-1",
       },
     });
@@ -230,6 +227,48 @@ describe("threadDetailPromptSubmission", () => {
         submitModeKind: "queue",
       }),
     ).toBe(true);
+    for (const runtimeDisplayStatus of ["provisioning", "starting"] as const) {
+      expect(
+        canSubmitFollowUpShortcut({
+          hasPromptDraftInput: true,
+          isFollowUpSubmitting: false,
+          isQueueMutationPending: false,
+          queuedMessageCount: 0,
+          runtimeDisplayStatus,
+          submitModeKind: "queue",
+        }),
+      ).toBe(true);
+    }
+    expect(
+      canSubmitFollowUpShortcut({
+        hasPromptDraftInput: false,
+        isFollowUpSubmitting: false,
+        isQueueMutationPending: false,
+        queuedMessageCount: 1,
+        runtimeDisplayStatus: "idle",
+        submitModeKind: "ready",
+      }),
+    ).toBe(true);
+    expect(
+      canSubmitFollowUpShortcut({
+        hasPromptDraftInput: true,
+        isFollowUpSubmitting: false,
+        isQueueMutationPending: false,
+        queuedMessageCount: 0,
+        runtimeDisplayStatus: "waiting-for-host",
+        submitModeKind: "queue",
+      }),
+    ).toBe(true);
+    expect(
+      canSubmitFollowUpShortcut({
+        hasPromptDraftInput: false,
+        isFollowUpSubmitting: false,
+        isQueueMutationPending: false,
+        queuedMessageCount: 1,
+        runtimeDisplayStatus: "waiting-for-host",
+        submitModeKind: "queue",
+      }),
+    ).toBe(false);
     expect(
       canSubmitFollowUpShortcut({
         hasPromptDraftInput: true,
@@ -273,7 +312,6 @@ describe("threadDetailPromptSubmission", () => {
 
     const queueableStatuses: ThreadRuntimeDisplayStatus[] = [
       "active",
-      "host-reconnecting",
       "provisioning",
       "starting",
       "waiting-for-host",
@@ -310,7 +348,7 @@ describe("threadDetailPromptSubmission", () => {
     }
   });
 
-  it("keeps stopping and pending interactions blocked before starting stop-only mode", () => {
+  it("offers a stop-free queue mode while a stop is in flight, and keeps pending interactions blocked", () => {
     const onStop = () => undefined;
     expect(
       buildFollowUpSubmitMode({
@@ -321,7 +359,7 @@ describe("threadDetailPromptSubmission", () => {
         onStop,
         runtimeDisplayStatus: "starting",
       }),
-    ).toEqual({ kind: "blocked", reason: "stopping" });
+    ).toEqual({ kind: "queue-while-stopping" });
     expect(
       buildFollowUpSubmitMode({
         hasPendingInteraction: true,
@@ -365,7 +403,9 @@ describe("threadDetailPromptSubmission", () => {
     expect(
       buildSideChatSubmitMode({
         childThreadId: null,
+        hasPendingInteraction: false,
         isDefaultExecutionOptionsLoading: true,
+        isPendingInteractionsInitialLoading: false,
         isStopRequested: false,
         onStop,
         runtimeDisplayStatus: "provisioning",
@@ -375,7 +415,9 @@ describe("threadDetailPromptSubmission", () => {
     expect(
       buildSideChatSubmitMode({
         childThreadId: null,
+        hasPendingInteraction: false,
         isDefaultExecutionOptionsLoading: false,
+        isPendingInteractionsInitialLoading: false,
         isStopRequested: false,
         onStop,
         runtimeDisplayStatus: "idle",
@@ -389,11 +431,41 @@ describe("threadDetailPromptSubmission", () => {
     expect(
       buildSideChatSubmitMode({
         childThreadId: "thr_side",
+        hasPendingInteraction: false,
         isDefaultExecutionOptionsLoading: false,
+        isPendingInteractionsInitialLoading: false,
         isStopRequested: false,
         onStop,
         runtimeDisplayStatus: "active",
       }),
     ).toEqual({ kind: "queue", onStop });
+  });
+
+  it("blocks child side chats until pending interactions initially load", () => {
+    expect(
+      buildSideChatSubmitMode({
+        childThreadId: "thr_side",
+        hasPendingInteraction: false,
+        isDefaultExecutionOptionsLoading: false,
+        isPendingInteractionsInitialLoading: true,
+        isStopRequested: false,
+        onStop: () => undefined,
+        runtimeDisplayStatus: "active",
+      }),
+    ).toEqual({ kind: "blocked", reason: "loading-pending-interactions" });
+  });
+
+  it("blocks child side chats with a pending interaction", () => {
+    expect(
+      buildSideChatSubmitMode({
+        childThreadId: "thr_side",
+        hasPendingInteraction: true,
+        isDefaultExecutionOptionsLoading: false,
+        isPendingInteractionsInitialLoading: false,
+        isStopRequested: false,
+        onStop: () => undefined,
+        runtimeDisplayStatus: "active",
+      }),
+    ).toEqual({ kind: "blocked", reason: "pending-interaction" });
   });
 });

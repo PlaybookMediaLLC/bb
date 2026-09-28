@@ -27,7 +27,6 @@ vi.mock("@/lib/sdk", () => ({
   },
 }));
 
-// The preview body is not under test; keep pierre out of jsdom.
 vi.mock("@pierre/diffs/react", async () => {
   const React = await import("react");
   return {
@@ -71,18 +70,17 @@ describe("GitDiffTabContent panel gating", () => {
         <GitDiffTabContent
           environmentId={ENVIRONMENT_ID}
           target={TARGET}
-          isDiffPanelActive
           isPanelOpen={isPanelOpen}
           gitDiffPresentation={{
             view: "unified",
             overflow: "scroll",
             showLineNumbers: true,
           }}
+          fileFilter=""
         />
       </Wrapper>
     );
 
-    // Retained-but-closed panel: the body mounts, the TOC does not load.
     const view = render(renderTab(false));
     expect(sdk.environments.diffFiles).not.toHaveBeenCalled();
 
@@ -91,8 +89,6 @@ describe("GitDiffTabContent panel gating", () => {
       expect(sdk.environments.diffFiles).toHaveBeenCalledTimes(1);
     });
 
-    // Closed again: realtime workspace writes invalidate the TOC, but a hidden
-    // panel must not refetch it.
     view.rerender(renderTab(false));
     await act(async () => {
       await queryClient.invalidateQueries({
@@ -101,7 +97,6 @@ describe("GitDiffTabContent panel gating", () => {
     });
     expect(sdk.environments.diffFiles).toHaveBeenCalledTimes(1);
 
-    // Reopen: the stale TOC refreshes exactly once.
     view.rerender(renderTab(true));
     await waitFor(() => {
       expect(sdk.environments.diffFiles).toHaveBeenCalledTimes(2);

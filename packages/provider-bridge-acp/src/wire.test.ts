@@ -8,9 +8,6 @@ import {
 } from "./wire.js";
 
 describe("acpToolCallUpdateEventSchema", () => {
-  // ACP's ToolKind is an open enum upstream (`#[serde(other)]`). A closed zod
-  // enum rejected the whole tool_call for one unseen value, so the call never
-  // opened and its later `completed` update merged into nothing.
   it("parses an unknown kind as `other` and keeps the agent's word on rawKind", () => {
     const parsed = acpToolCallUpdateEventSchema.parse({
       sessionUpdate: "tool_call",
@@ -101,9 +98,6 @@ describe("acpInitializeResultSchema", () => {
 });
 
 describe("acpSessionNewResultSchema", () => {
-  // pi-acp serializes absent optional strings as explicit `null` instead of
-  // omitting them. Before this was accepted, every pi-acp thread failed to
-  // start with "ACP agent returned an unexpected session/new result".
   it("accepts explicit null for optional model and config-option strings", () => {
     const parsed = acpSessionNewResultSchema.safeParse({
       sessionId: "session-1",
@@ -156,6 +150,64 @@ describe("acpSessionNewResultSchema", () => {
     );
     expect(parsed.data.configOptions?.[1].category).toBeUndefined();
     expect(parsed.data.configOptions?.[1].options?.[0].name).toBeUndefined();
+  });
+
+  it("flattens grouped select options into their values", () => {
+    const parsed = acpSessionNewResultSchema.safeParse({
+      sessionId: "session-1",
+      configOptions: [
+        {
+          type: "select",
+          id: "model",
+          category: "model",
+          name: "Model",
+          currentValue: "model-a",
+          options: [
+            {
+              group: "vendor-1",
+              name: "Vendor 1",
+              options: [{ value: "model-a", name: "Model A" }],
+            },
+            {
+              group: "vendor-2",
+              name: "Vendor 2",
+              options: [
+                { value: "model-b", name: "Model B" },
+                { value: "model-c", name: "Model C" },
+              ],
+            },
+          ],
+        },
+        {
+          type: "select",
+          id: "reasoning_effort",
+          category: "thought_level",
+          name: "Reasoning effort",
+          currentValue: "high",
+          options: [
+            {
+              group: "levels",
+              name: "Levels",
+              options: [
+                { value: "low", name: "Low" },
+                { value: "high", name: "High" },
+              ],
+            },
+          ],
+        },
+      ],
+    });
+
+    expect(parsed.success).toBe(true);
+    if (!parsed.success) {
+      return;
+    }
+    expect(
+      parsed.data.configOptions?.[0].options?.map((option) => option.value),
+    ).toEqual(["model-a", "model-b", "model-c"]);
+    expect(
+      parsed.data.configOptions?.[1].options?.map((option) => option.value),
+    ).toEqual(["low", "high"]);
   });
 });
 

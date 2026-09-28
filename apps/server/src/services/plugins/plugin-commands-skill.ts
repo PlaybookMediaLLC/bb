@@ -4,19 +4,12 @@ import { pluginCliCall } from "@bb/domain/plugin-cli";
 import { PLUGIN_CLI_OUTPUT_MAX_BYTES } from "@get-bb/plugin-sdk";
 import type { PluginCliCommandInfo } from "./plugin-api.js";
 
-/**
- * Server-generated `plugin-commands` skill (design §4.4): teaches agents the
- * `bb` subcommands installed plugins contribute, one section per plugin, at
- * near-zero context cost. Lives under <dataDir>/skills-generated (a distinct
- * root resolved with the data-dir skill tier mechanics) and exists only while
- * at least one CLI command is registered — the plugin service rewrites or
- * removes it on load/reload/toggle.
- */
 export interface PluginCliContribution {
   pluginId: string;
   name: string;
   summary: string;
   commands: PluginCliCommandInfo[];
+  rendersHelp: boolean;
 }
 
 const SKILL_NAME = "plugin-commands";
@@ -56,7 +49,7 @@ function renderPluginCommandsSkill(
   return [
     "---",
     `name: ${SKILL_NAME}`,
-    "description: CLI commands contributed by installed BB plugins. Use when a task involves one of the plugin commands listed here; run them with bash like any other bb command.",
+    "description: Discover CLI commands contributed by installed BB plugins and their invocation paths.",
     "---",
     "",
     "# Plugin Commands",
@@ -71,11 +64,6 @@ function renderPluginCommandsSkill(
   ].join("\n");
 }
 
-/**
- * Write the skill when there is at least one contribution; remove it
- * otherwise (an absent directory is how "no plugin commands" reaches
- * resolveInjectedSkillSources, which tolerates a missing root).
- */
 export async function syncPluginCommandsSkill(
   dataDir: string,
   contributions: readonly PluginCliContribution[],

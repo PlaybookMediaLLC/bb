@@ -1,4 +1,6 @@
-import type { FollowUpSubmitMode } from "@bb/client-core";
+import { Icon, type IconName } from "@bb/shared-ui/icon";
+import { Button } from "@bb/shared-ui/button";
+import type { FollowUpSubmitMode, PromptDraftState } from "@bb/client-core";
 import {
   memo,
   useCallback,
@@ -9,6 +11,7 @@ import {
   useState,
   type ComponentProps,
   type FocusEvent as ReactFocusEvent,
+  type PointerEvent as ReactPointerEvent,
   type ReactNode,
   type RefObject,
 } from "react";
@@ -19,6 +22,7 @@ import type {
 } from "@bb/domain";
 import type { ComposerView, PluginComposerScope } from "@get-bb/plugin-sdk";
 import type { ComposerTextEffectSource } from "@/lib/composer-text-effects";
+import { modifierSubmitShortcutLabel } from "./modifier-submit-shortcut";
 import { isKeyboardFocusTarget } from "@/components/layout/useMobileVisualViewportHeight";
 import { ComposerBannersSlot } from "@/components/plugin/PluginComposerBanners";
 import {
@@ -33,6 +37,7 @@ import {
   useComposerExtensionController,
 } from "@/components/plugin/ComposerExtensionHost";
 import {
+  DEFAULT_COMPOSER_SCOPE,
   PromptBoxInternal,
   type AttachmentsConfig,
   type HistoryConfig,
@@ -40,6 +45,7 @@ import {
   type PromptBoxHandle,
   type TypeaheadConfig,
 } from "@/components/promptbox/PromptBoxInternal";
+import { usePromptModePermissionDisplay } from "@/components/promptbox/usePromptModePermissionDisplay";
 import { usePromptVoice } from "@/components/promptbox/usePromptVoice";
 import { PermissionModePicker } from "@/components/pickers/PermissionModePicker";
 import {
@@ -53,13 +59,10 @@ import { usePointerCoarse } from "@bb/shared-ui/hooks/use-pointer-coarse";
 import { ThreadTimelineScrollToBottomButton } from "@/views/thread-detail/ThreadTimelineScrollToBottomButton";
 import { useOptionalPaneContext } from "@/views/thread-detail/PaneContext";
 import { ThreadContextWindowIndicator } from "@/components/thread/timeline";
-import { THREAD_PROMPT_CONTEXT_BANNER_ROW_HEIGHT } from "@/components/promptbox/banner/ThreadPromptContextBanner";
 import {
-  isPlanModePrompt,
-  permissionDisplayForActivePromptMode,
-  permissionDisplayForPromptMode,
-  shouldDisablePermissionPickerForActivePromptMode,
-} from "@bb/client-core";
+  PROMPT_STACK_CARD_ROW_HEIGHT,
+  PROMPT_STACK_TRACK_CLASS,
+} from "@/components/promptbox/banner/PromptStackCard";
 
 type PromptBoxWithScrollAnchorProps = ComponentProps<
   typeof PromptBoxInternal
@@ -109,60 +112,35 @@ function PromptBoxWithScrollAnchor({
   );
 }
 
-// Elastic compensation: when nothing is stacked above the textarea, the
-// textarea defaults to FOLLOW_UP_PROMPT_BOX_ELASTIC_TARGET_HEIGHT so the
-// prompt area is already at "with-banner" height on first paint. As the stack
-// (context banner + queued messages) grows, the textarea min-height shrinks
-// by the same amount — total prompt-area height stays constant and the
-// thread timeline does not shift when the context banner mounts.
 const FOLLOW_UP_PROMPT_BOX_DEFAULT_MIN_HEIGHT = 68;
 const FOLLOW_UP_PROMPT_BOX_ELASTIC_TARGET_HEIGHT =
-  FOLLOW_UP_PROMPT_BOX_DEFAULT_MIN_HEIGHT +
-  THREAD_PROMPT_CONTEXT_BANNER_ROW_HEIGHT;
-const OPEN_COMPOSER_OVERLAY_TRIGGER_SELECTOR =
-  '[aria-haspopup][aria-expanded="true"]';
+  FOLLOW_UP_PROMPT_BOX_DEFAULT_MIN_HEIGHT + PROMPT_STACK_CARD_ROW_HEIGHT;
+const COMPOSER_CONTROL_SELECTOR = "button, [role='button'], [aria-haspopup]";
+const COMPOSER_OVERLAY_TRIGGER_SELECTOR = "[aria-haspopup]";
+const OPEN_COMPOSER_OVERLAY_TRIGGER_SELECTOR = `${COMPOSER_OVERLAY_TRIGGER_SELECTOR}[aria-expanded="true"]`;
 const MOBILE_KEYBOARD_VIEWPORT_MIN_DELTA_PX = 80;
 const MOBILE_FOCUS_EXPANSION_FALLBACK_MS = 350;
 const MOBILE_KEYBOARD_DISMISSAL_FALLBACK_MS = 750;
-const DEFAULT_FOLLOW_UP_COMPOSER_SCOPE = {
-  kind: "new-thread",
-  projectId: null,
-} as const;
 
-// The submit-mode discriminated union lives in @bb/client-core so the shared
-// submission policy and the native composer read the same shape.
-export type {
-  FollowUpBlockedReason,
-  FollowUpSubmitMode,
-} from "@bb/client-core";
+export type { FollowUpSubmitMode } from "@bb/client-core";
 
 export interface FollowUpComposerProps {
   history: HistoryConfig;
-  /** True while the send/queue mutation is in flight. Orthogonal to submitMode. */
   isFollowUpSubmitting: boolean;
   message: string;
   mentionRanges: readonly PromptTextMention[];
   onChangeMessage: (value: string, mentionRanges: PromptTextMention[]) => void;
   onModifierSubmit: () => void;
   onSubmit: () => void;
-  /**
-   * Escape pressed in the editor with no higher-priority consumer open.
-   * The sent-message editor passes its cancel action; when omitted, Escape
-   * blurs the editor (the bottom and queued-message composers' behavior).
-   */
   onEscape?: () => void;
-  /** Accessible label and tooltip for the primary submit action. */
+  submitLabel?: string;
+  submitIcon?: IconName;
   submitTitle?: string;
   compactPromptPlaceholder: string;
   promptPlaceholder: string;
   canModifierSubmit: boolean;
-  /**
-   * While the runtime is active, use Enter for steer and the modifier shortcut
-   * for queue. False preserves the default Enter-to-queue behavior.
-   */
   steerActiveThreadOnEnter: boolean;
   submitMode: FollowUpSubmitMode;
-  /** Used by the scroll-to-bottom button to know whether the runtime is actively streaming. */
   threadRuntimeDisplayStatus: ThreadRuntimeDisplayStatus;
 }
 
@@ -173,76 +151,30 @@ type ContextWindowUsage = ComponentProps<
 export interface FollowUpPromptBoxProps {
   id?: string;
   attachments: AttachmentsConfig;
-  /**
-   * Slot for the stack of context cards above the prompt input — today
-   * <ContextBanner> + <QueuedMessagesList>, both wrapped in PromptStackCard
-   * chrome. The caller composes whatever should render above the composer
-   * and passes it as a single element. Pass null to hide the stack entirely.
-   */
   stack: ReactNode | null;
   activePromptMode?: ThreadTimelineActivePromptMode | null;
   composer: FollowUpComposerProps | null;
-  /** Slot for the read-only environment strip in the bottom row. Pass null to hide. */
   environmentSummary: ReactNode | null;
-  /**
-   * Token usage indicator shown to the right of the permission picker. Null
-   * means no usage available yet (e.g. thread just created); the indicator is
-   * hidden in that case.
-   */
   contextWindowUsage: ContextWindowUsage | null;
-  /**
-   * Execution controls (provider + model + service tier + reasoning) rendered
-   * in PromptBox's footer slot. Callers omit provider.onChange so the picker
-   * renders the provider as locked — follow-ups can't change provider, the
-   * thread is already committed.
-   */
   execution: ExecutionControlsProps;
-  /** Permission mode picker rendered in the bottom row. */
   permission: ExecutionPermissionConfig;
-  /**
-   * Render all footer controls (model/reasoning + permission pickers) as
-   * non-interactive, dimmed labels. The composer text input stays editable.
-   */
-  readOnly?: boolean;
-  /** Override only the execution controls' readonly state. */
   executionReadOnly?: boolean;
-  /** Override only the permission picker's readonly state. */
   permissionReadOnly?: boolean;
   typeahead: TypeaheadConfig;
   promptActions?: readonly PromptBoxAction[];
-  /** Suppress plugin customizations while a retained secondary composer is inactive. */
   suppressPluginComposerCustomizations?: boolean;
-  /** Optional transient draft host exposed to plugin composer hooks. */
   pluginComposerHost?: PluginComposerHost | null;
-  /** Active scope used to filter and lifecycle-key plugin banner slots. */
+  voiceDraft?: {
+    getCurrent: () => PromptDraftState;
+    setDraft: (draft: PromptDraftState) => void;
+  };
   pluginComposerScope?: PluginComposerScope | null;
   textEffects?: readonly ComposerTextEffectSource[];
-  /** Scope key for resetting a manually collapsed prompt box on thread change. */
   collapseResetKey: string | number;
-  /**
-   * Changing this refocuses the composer caret to the end — e.g. after editing a
-   * queued message restores its text into the draft.
-   */
+  preferExpanded?: boolean;
   focusEndKey?: string | number;
-  /**
-   * Whether this is the pane's primary composer (the main thread box) rather
-   * than a secondary one such as a side-chat composer, which stays mounted but
-   * hidden. Only the primary composer answers the pane-scoped Cmd+Shift+C /
-   * Cmd+Shift+M fallback when the caret is outside every composer. Defaults to
-   * true; side chats pass false. Marks the composer shell via
-   * `data-app-composer-role` so the model picker can read the same signal.
-   */
   isPrimaryComposer?: boolean;
-  /** Inline queue editors do not own a timeline scroll control. */
   showScrollToBottomButton?: boolean;
-  /**
-   * A pending interaction (permission request, user question) that takes the
-   * composer's place. The composer editor stays MOUNTED but hidden while this
-   * is set: the previous implementation swapped the whole composer out of the
-   * tree, so every approval tore down and rebuilt the TipTap editor and the
-   * composer's pickers, and the draft-restoring remount landed in the same
-   * task as the approval's timeline update. Rendered as the last stack item.
-   */
   pendingInteraction?: ReactNode;
 }
 
@@ -265,7 +197,7 @@ function FollowUpPromptBoxStackOnly({
     pluginComposerScope ?? pluginComposerHost?.scope ?? null;
   const hostDraft = usePluginComposerHostDraft(pluginComposerHost ?? null);
   const composerView = usePluginComposerViewModel({
-    scope: composerScope ?? DEFAULT_FOLLOW_UP_COMPOSER_SCOPE,
+    scope: composerScope ?? DEFAULT_COMPOSER_SCOPE,
     layout: "expanded",
     text: hostDraft?.text ?? "",
     attachmentCount: hostDraft?.attachments.length ?? 0,
@@ -279,7 +211,7 @@ function FollowUpPromptBoxStackOnly({
     <PluginComposerViewProvider value={composerView}>
       <PluginComposerHostProvider value={pluginComposerHost ?? null}>
         <div data-promptbox-shell="" className="space-y-2">
-          <div className="grid gap-2">
+          <div className={`grid gap-2 ${PROMPT_STACK_TRACK_CLASS}`}>
             {composerScope ? (
               <ComposerBannersSlot>{stack}</ComposerBannersSlot>
             ) : (
@@ -296,22 +228,23 @@ function FollowUpPromptBoxWithComposer({
   id,
   attachments,
   stack,
-  activePromptMode,
+  activePromptMode = null,
   composer,
   environmentSummary,
   contextWindowUsage,
   execution,
   permission,
-  readOnly,
   executionReadOnly,
   permissionReadOnly,
   typeahead,
   promptActions,
   suppressPluginComposerCustomizations,
   pluginComposerHost,
+  voiceDraft,
   pluginComposerScope,
   textEffects,
   collapseResetKey,
+  preferExpanded = false,
   focusEndKey,
   isPrimaryComposer = true,
   showScrollToBottomButton = true,
@@ -320,24 +253,19 @@ function FollowUpPromptBoxWithComposer({
   const submitMode = composer.submitMode;
   const hasPendingInteraction =
     pendingInteraction !== null && pendingInteraction !== undefined;
-  const canQueueFollowUp = submitMode.kind === "queue";
-  const canSubmit = submitMode.kind === "ready" || submitMode.kind === "queue";
-  const isStopping =
-    submitMode.kind === "blocked" && submitMode.reason === "stopping";
+  const isStopping = submitMode.kind === "queue-while-stopping";
+  const canQueueFollowUp = submitMode.kind === "queue" || isStopping;
+  const canSubmit = submitMode.kind === "ready" || canQueueFollowUp;
   const isLoadingExecutionOptions =
     submitMode.kind === "blocked" &&
     submitMode.reason === "loading-execution-options";
   const isLoadingPendingInteractions =
     submitMode.kind === "blocked" &&
     submitMode.reason === "loading-pending-interactions";
-  const isProvisioning =
-    submitMode.kind === "blocked" && submitMode.reason === "provisioning";
   const isUnavailable =
     submitMode.kind === "blocked" && submitMode.reason === "unavailable";
   const onStopRuntime =
-    submitMode.kind === "queue" || submitMode.kind === "stop-only"
-      ? submitMode.onStop
-      : undefined;
+    submitMode.kind === "queue" ? submitMode.onStop : undefined;
   const canStopRuntime = onStopRuntime !== undefined;
   const attachmentCount = attachments.items?.length ?? 0;
   const composerScope =
@@ -345,47 +273,43 @@ function FollowUpPromptBoxWithComposer({
   const [composerLayout, setComposerLayout] =
     useState<ComposerView["layout"]>("expanded");
   const composerView = usePluginComposerViewModel({
-    scope: composerScope ?? DEFAULT_FOLLOW_UP_COMPOSER_SCOPE,
+    scope: composerScope ?? DEFAULT_COMPOSER_SCOPE,
     layout: composerLayout,
     text: composer.message,
     attachmentCount,
-    isRunning: canStopRuntime,
-    isSubmitting: composer.isFollowUpSubmitting || isStopping,
+    isRunning: canStopRuntime || isStopping,
+    isSubmitting: composer.isFollowUpSubmitting,
   });
   const promptBoxRef = useRef<PromptBoxHandle>(null);
-  // Scope Cmd+Shift+C to the focused pane's primary composer. Every mounted
-  // composer registers this handler — including side-chat composers that stay
-  // mounted while hidden — so gating on both the focused pane and "primary"
-  // keeps a hidden side chat from stealing the chord. Standalone/single-pane
-  // surfaces have no pane context and default to focused.
   const paneContext = useOptionalPaneContext();
   const isFocusedPane = paneContext?.isFocused ?? true;
   const focusDefault = useCallback(() => {
     promptBoxRef.current?.focusEnd();
     return promptBoxRef.current !== null;
   }, []);
-  const extensionController = useComposerExtensionController({
-    host: pluginComposerHost ?? null,
-    view: composerView,
-    isFocused: isFocusedPane,
-    isPrimary: isPrimaryComposer,
-    focusDefault,
-  });
-  const voice = usePromptVoice(promptBoxRef);
+  const voice = usePromptVoice(
+    promptBoxRef,
+    voiceDraft ?? pluginComposerHost ?? undefined,
+  );
   const isCompactViewport = useIsCompactViewport();
   const isPointerCoarse = usePointerCoarse();
   const composerInteractionRef = useRef<HTMLDivElement>(null);
   const interactionExpandedRef = useRef(false);
   const pendingFocusExpansionCleanupRef = useRef<(() => void) | null>(null);
   const pendingFocusLossCleanupRef = useRef<(() => void) | null>(null);
+  const deferredControlFocusLossRef = useRef<(() => void) | null>(null);
+  const pressedComposerControlRef = useRef(false);
+  const pressedComposerControlCleanupRef = useRef<(() => void) | null>(null);
   const [isInteractionExpanded, setIsInteractionExpanded] = useState(false);
   const [widePromptBoxCollapsedFor, setWidePromptBoxCollapsedFor] = useState<
     string | number | null
   >(null);
   const isWidePromptBoxCollapsed =
     widePromptBoxCollapsedFor === collapseResetKey;
+  const isEditorExpanded =
+    isInteractionExpanded || (preferExpanded && !isWidePromptBoxCollapsed);
   const isPromptBoxCompact =
-    isWidePromptBoxCollapsed || (isCompactViewport && !isInteractionExpanded);
+    isWidePromptBoxCollapsed || (isCompactViewport && !isEditorExpanded);
   const compactConfig = useMemo(
     () =>
       isCompactViewport || isWidePromptBoxCollapsed
@@ -412,13 +336,74 @@ function FollowUpPromptBoxWithComposer({
     pendingFocusExpansionCleanupRef.current = null;
   }, []);
   const cancelPendingFocusLoss = useCallback(() => {
+    deferredControlFocusLossRef.current = null;
     const cleanup = pendingFocusLossCleanupRef.current;
     pendingFocusLossCleanupRef.current = null;
     cleanup?.();
   }, []);
+  const cancelPressedComposerControl = useCallback(() => {
+    const cleanup = pressedComposerControlCleanupRef.current;
+    pressedComposerControlCleanupRef.current = null;
+    cleanup?.();
+  }, []);
+  const handleComposerPointerDown = useCallback(
+    (event: ReactPointerEvent) => {
+      const target = event.target;
+      if (
+        !(target instanceof Element) ||
+        !target.closest(COMPOSER_CONTROL_SELECTOR)
+      ) {
+        return;
+      }
+
+      cancelPendingFocusExpansion();
+      cancelPendingFocusLoss();
+      cancelPressedComposerControl();
+      pressedComposerControlRef.current = true;
+      let releaseTimeout: number | null = null;
+      const removeReleaseListeners = () => {
+        window.removeEventListener("pointerup", finishRelease, true);
+        window.removeEventListener("pointercancel", finishRelease, true);
+      };
+      const finishRelease = () => {
+        removeReleaseListeners();
+        releaseTimeout = window.setTimeout(() => {
+          releaseTimeout = null;
+          pressedComposerControlRef.current = false;
+          pressedComposerControlCleanupRef.current = null;
+          const resumeFocusLoss = deferredControlFocusLossRef.current;
+          deferredControlFocusLossRef.current = null;
+          resumeFocusLoss?.();
+        });
+      };
+      const cleanup = () => {
+        removeReleaseListeners();
+        if (releaseTimeout !== null) {
+          window.clearTimeout(releaseTimeout);
+        }
+        pressedComposerControlRef.current = false;
+      };
+
+      window.addEventListener("pointerup", finishRelease, {
+        capture: true,
+        once: true,
+      });
+      window.addEventListener("pointercancel", finishRelease, {
+        capture: true,
+        once: true,
+      });
+      pressedComposerControlCleanupRef.current = cleanup;
+    },
+    [
+      cancelPendingFocusExpansion,
+      cancelPendingFocusLoss,
+      cancelPressedComposerControl,
+    ],
+  );
   const handleComposerFocus = useCallback(
     (event: ReactFocusEvent) => {
       cancelPendingFocusLoss();
+      if (pressedComposerControlRef.current) return;
       setWidePromptBoxCollapsedFor(null);
       if (interactionExpandedRef.current) return;
       if (
@@ -455,8 +440,6 @@ function FollowUpPromptBoxWithComposer({
         if (hasFinished) return;
         hasFinished = true;
         removeSignals();
-        // AppLayout updates its visual-viewport height in the same animation
-        // frame. Expanding here keeps the composer and keyboard on one paint.
         animationFrame = window.requestAnimationFrame(() => {
           animationFrame = null;
           pendingFocusExpansionCleanupRef.current = null;
@@ -491,20 +474,24 @@ function FollowUpPromptBoxWithComposer({
     (event: ReactFocusEvent) => {
       cancelPendingFocusLoss();
       const dismissedKeyboard = isKeyboardFocusTarget(event.target);
-      const focusLossFrame = window.requestAnimationFrame(() => {
+      const scheduleFocusLoss = () => {
+        const frame = window.requestAnimationFrame(checkFocusLoss);
+        pendingFocusLossCleanupRef.current = () => {
+          window.cancelAnimationFrame(frame);
+        };
+      };
+      const checkFocusLoss = () => {
         pendingFocusLossCleanupRef.current = null;
         const composerElement = composerInteractionRef.current;
         if (!composerElement) return;
 
-        // Focus events for the element losing focus run before the browser has
-        // assigned the next active element. Waiting one frame makes collapse a
-        // decision about settled focus state instead of pointer intent.
         if (composerElement.contains(document.activeElement)) return;
 
-        // Responsive popovers and dropdowns portal their content outside the
-        // composer. Their shared trigger contract exposes open state through
-        // aria-haspopup + aria-expanded, so focus in an owned overlay must not
-        // collapse the composer behind it.
+        if (pressedComposerControlRef.current) {
+          deferredControlFocusLossRef.current = scheduleFocusLoss;
+          return;
+        }
+
         if (
           composerElement.querySelector(OPEN_COMPOSER_OVERLAY_TRIGGER_SELECTOR)
         ) {
@@ -530,10 +517,6 @@ function FollowUpPromptBoxWithComposer({
           return;
         }
 
-        // The software keyboard's dismiss control usually leaves focus on the
-        // document before the viewport grows. Keep the expanded composer
-        // stable during that native animation, then compact it as soon as the
-        // visible viewport reports the keyboard has actually closed.
         const keyboardViewportHeight = visualViewport.height;
         let fallbackTimeout: number | null = null;
         let hasFinished = false;
@@ -567,10 +550,8 @@ function FollowUpPromptBoxWithComposer({
           MOBILE_KEYBOARD_DISMISSAL_FALLBACK_MS,
         );
         pendingFocusLossCleanupRef.current = cleanup;
-      });
-      pendingFocusLossCleanupRef.current = () => {
-        window.cancelAnimationFrame(focusLossFrame);
       };
+      scheduleFocusLoss();
     },
     [
       cancelPendingFocusExpansion,
@@ -587,63 +568,69 @@ function FollowUpPromptBoxWithComposer({
     setIsInteractionExpanded(false);
     setWidePromptBoxCollapsedFor(collapseResetKey);
   }, [cancelPendingFocusExpansion, cancelPendingFocusLoss, collapseResetKey]);
+  const collapseIfFocused = useCallback(() => {
+    const activeElement = document.activeElement;
+    if (
+      !(activeElement instanceof HTMLElement) ||
+      !composerInteractionRef.current?.contains(activeElement)
+    ) {
+      return false;
+    }
+    promptBoxRef.current?.captureHeightForLayoutChange();
+    activeElement.blur();
+    collapseWidePromptBox();
+    return true;
+  }, [collapseWidePromptBox]);
+  const extensionController = useComposerExtensionController({
+    host: pluginComposerHost ?? null,
+    view: composerView,
+    isFocused: isFocusedPane,
+    isPrimary: isPrimaryComposer,
+    collapseIfFocused,
+    focusDefault,
+  });
   useEffect(
     () => () => {
       cancelPendingFocusExpansion();
       cancelPendingFocusLoss();
+      cancelPressedComposerControl();
     },
-    [cancelPendingFocusExpansion, cancelPendingFocusLoss],
+    [
+      cancelPendingFocusExpansion,
+      cancelPendingFocusLoss,
+      cancelPressedComposerControl,
+    ],
   );
   const steerOnPrimarySubmit =
     submitMode.kind === "queue" && composer.steerActiveThreadOnEnter;
-  const onPrimarySubmit = steerOnPrimarySubmit
-    ? composer.onModifierSubmit
-    : composer.onSubmit;
+  const isSteeringWhenReady =
+    steerOnPrimarySubmit &&
+    (composer.threadRuntimeDisplayStatus === "provisioning" ||
+      composer.threadRuntimeDisplayStatus === "starting");
   const onModifierSubmit = composer.canModifierSubmit
-    ? steerOnPrimarySubmit
-      ? composer.onSubmit
-      : composer.onModifierSubmit
+    ? composer.onModifierSubmit
     : undefined;
-  // While the interaction owns the surface the pickers are hidden with the
-  // editor; keep them disabled too so their keyboard chords (model picker
-  // toggle/cycle) cannot open a popover anchored to a hidden trigger.
+  const modifierSubmitHint = (action: "queue" | "steer"): string =>
+    onModifierSubmit ? `, ${modifierSubmitShortcutLabel()} to ${action}` : "";
   const executionControlsDisabled =
-    (executionReadOnly ?? readOnly ?? false) || hasPendingInteraction;
+    (executionReadOnly ?? false) || hasPendingInteraction;
   const footerStart = useMemo(
     () => (
       <ExecutionControls {...execution} disabled={executionControlsDisabled} />
     ),
     [execution, executionControlsDisabled],
   );
-  const selectedProviderPlanModeCopy = execution.provider.options?.find(
-    (option) => option.value === execution.provider.selectedId,
-  )?.planModeCopy;
-  const promptModeInput = useMemo(
-    () => ({
-      planModeCopy: selectedProviderPlanModeCopy,
+  const { permissionDisplayOverride, permissionPickerDisabledByPlanMode } =
+    usePromptModePermissionDisplay({
+      execution,
       value: composer.message,
       mentionRanges: composer.mentionRanges,
-    }),
-    [composer.mentionRanges, composer.message, selectedProviderPlanModeCopy],
-  );
-  const permissionDisplayOverride = useMemo(
-    () =>
-      permissionDisplayForActivePromptMode(
-        activePromptMode,
-        selectedProviderPlanModeCopy,
-      ) ?? permissionDisplayForPromptMode(promptModeInput),
-    [activePromptMode, promptModeInput, selectedProviderPlanModeCopy],
-  );
-  const permissionPickerDisabledByPlanMode =
-    shouldDisablePermissionPickerForActivePromptMode(activePromptMode) ||
-    isPlanModePrompt(promptModeInput);
+      activePromptMode,
+    });
   const permissionReadOnlyResolved =
-    (permissionReadOnly ?? readOnly ?? false) || hasPendingInteraction;
+    (permissionReadOnly ?? false) || hasPendingInteraction;
   const permissionPickerDisabled =
     permissionReadOnlyResolved || permissionPickerDisabledByPlanMode;
-  // Side chat and active plan mode render the same permission picker as the
-  // main thread, but non-interactive so the displayed effective mode cannot
-  // diverge from the provider mode driving the current turn.
   const permissionControl = useMemo(
     () => (
       <PermissionModePicker
@@ -676,9 +663,6 @@ function FollowUpPromptBoxWithComposer({
     setStackHeight(measured);
   }, []);
 
-  // Take one initial border-box measurement before paint. Later measurements
-  // use ResizeObserver's supplied border-box size, which avoids a synchronous
-  // offsetHeight read after each timeline or composer render.
   useLayoutEffect(() => {
     const element = stackRef.current;
     if (element) {
@@ -700,10 +684,6 @@ function FollowUpPromptBoxWithComposer({
     observer.observe(element);
     return () => observer.disconnect();
   }, [applyStackHeight]);
-  // The elastic pre-size keeps the prompt area's total height constant as the
-  // stack (context banner + queued messages) mounts/unmounts so the timeline
-  // doesn't shift. Callers that need the main-thread prompt height should pass
-  // an empty stack instead of null.
   const elasticTextareaMinHeight =
     stack === null
       ? FOLLOW_UP_PROMPT_BOX_DEFAULT_MIN_HEIGHT
@@ -717,12 +697,11 @@ function FollowUpPromptBoxWithComposer({
       ref={composerInteractionRef}
       className="relative z-20"
       data-follow-up-composer=""
-      data-follow-up-composer-expanded={isInteractionExpanded ? "" : undefined}
-      // Hidden, not unmounted: the editor keeps its DOM, draft, and history
-      // across the interaction (see `pendingInteraction`).
+      data-follow-up-composer-expanded={isEditorExpanded ? "" : undefined}
       hidden={hasPendingInteraction}
       onBlurCapture={scheduleCollapseAfterFocusLoss}
       onFocusCapture={handleComposerFocus}
+      onPointerDownCapture={handleComposerPointerDown}
     >
       <PromptBoxWithScrollAnchor
         id={id}
@@ -732,48 +711,49 @@ function FollowUpPromptBoxWithComposer({
         value={composer.message}
         mentionRanges={composer.mentionRanges}
         onChange={composer.onChangeMessage}
-        onSubmit={onPrimarySubmit}
+        onSubmit={composer.onSubmit}
         onEscape={composer.onEscape}
         blurOnPointerSubmit={isCompactViewport && isPointerCoarse}
         textEffects={textEffects}
         onComposerLayoutChange={setComposerLayout}
-        scrollToBottomOnSubmit={
-          submitMode.kind !== "queue" || steerOnPrimarySubmit
-        }
-        scrollToBottomOnModifierSubmit={!steerOnPrimarySubmit}
+        scrollToBottomOnSubmit={submitMode.kind !== "queue"}
         history={composer.history}
         focusEndKey={focusEndKey}
         placeholder={composer.promptPlaceholder}
         containerCompactPlaceholder={composer.compactPromptPlaceholder}
-        heightAnimationKey={isInteractionExpanded ? "expanded" : "compact"}
+        heightAnimationKey={isEditorExpanded ? "expanded" : "compact"}
         mentionMenuPlacement="top"
         submission={{
+          label: composer.submitLabel,
+          icon: composer.submitIcon,
           onStop: onStopRuntime,
-          isSubmitting: composer.isFollowUpSubmitting || isStopping,
+          isSubmitting: composer.isFollowUpSubmitting,
           disabled:
             !canSubmit ||
             composer.isFollowUpSubmitting ||
             (steerOnPrimarySubmit && !composer.canModifierSubmit),
           onModifierSubmit,
+          swapSubmitActions: steerOnPrimarySubmit,
+          showModifierSubmitAction: submitMode.kind === "queue",
           title: composer.isFollowUpSubmitting
             ? "Submitting..."
             : canSubmit && composer.submitTitle !== undefined
               ? composer.submitTitle
-              : canQueueFollowUp
-                ? steerOnPrimarySubmit
-                  ? "Steer current run (Enter)"
-                  : "Queue follow-up (Enter)"
-                : isStopping
-                  ? "Stopping run..."
+              : isStopping
+                ? "Queue for after the stop (Enter)"
+                : canQueueFollowUp
+                  ? steerOnPrimarySubmit
+                    ? isSteeringWhenReady
+                      ? `Steer when ready (Enter)${modifierSubmitHint("queue")}`
+                      : `Steer current run (Enter)${modifierSubmitHint("queue")}`
+                    : `Queue follow-up (Enter)${modifierSubmitHint("steer")}`
                   : isLoadingExecutionOptions
                     ? "Loading models..."
                     : isLoadingPendingInteractions
                       ? "Checking pending interactions..."
-                      : isProvisioning
-                        ? "Provisioning..."
-                        : isUnavailable
-                          ? "Unavailable"
-                          : "Submit (Enter)",
+                      : isUnavailable
+                        ? "Unavailable"
+                        : "Submit (Enter)",
           isRunning: canStopRuntime,
         }}
         typeahead={typeahead}
@@ -785,6 +765,29 @@ function FollowUpPromptBoxWithComposer({
         compact={compactConfig}
         editorLayout="thread"
         onCollapse={isCompactViewport ? undefined : collapseWidePromptBox}
+        modeHeader={
+          execution.handoff?.active ? (
+            <div className="flex min-h-7 items-center gap-1.5 text-xs text-subtle-foreground">
+              <Icon
+                name="MessageSquarePlus"
+                className="size-3.5 shrink-0"
+                aria-hidden
+              />
+              <span>Handoff to new thread</span>
+              <Button
+                type="button"
+                size="icon"
+                variant="ghost"
+                className="ml-auto size-6 shrink-0 text-subtle-foreground"
+                onClick={execution.handoff.onExit}
+                disabled={executionControlsDisabled}
+                aria-label="Exit handoff"
+              >
+                <Icon name="X" className="size-3" aria-hidden />
+              </Button>
+            </div>
+          ) : null
+        }
         footerStart={footerStart}
       />
       {!isPromptBoxCompact ? (
@@ -836,7 +839,6 @@ interface DefaultFollowUpComposerProps {
   stackRef: RefObject<HTMLDivElement | null>;
 }
 
-/** BB's presentation for a host-owned follow-up Composer controller. */
 function DefaultFollowUpComposer({
   active,
   composerElement,
@@ -858,7 +860,10 @@ function DefaultFollowUpComposer({
         data-promptbox-shell=""
         className="space-y-2"
       >
-        <div ref={stackRef} className="grid gap-2">
+        <div
+          ref={stackRef}
+          className={`grid gap-2 ${PROMPT_STACK_TRACK_CLASS}`}
+        >
           {hasPluginComposerScope ? (
             <ComposerBannersSlot>{stack}</ComposerBannersSlot>
           ) : (

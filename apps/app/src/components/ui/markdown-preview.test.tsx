@@ -9,6 +9,7 @@ import {
   waitFor,
 } from "@testing-library/react";
 import { afterEach, describe, expect, it, vi } from "vitest";
+import { highlightMarkdownCode } from "./markdown-code-highlight";
 import { MarkdownPreview } from "./markdown-preview";
 import {
   MarkdownLocalFileContextMenuContext,
@@ -91,6 +92,14 @@ function mockResizeObserverDeliveries(): {
   };
 }
 
+function requireElement(container: ParentNode, selector: string): Element {
+  const element = container.querySelector(selector);
+  if (element === null) {
+    throw new Error(`Expected an element matching ${selector}`);
+  }
+  return element;
+}
+
 describe("MarkdownPreview", () => {
   it("shares one observer and observes content width only for table previews", () => {
     const { notifyResize, observed, observerCount } =
@@ -145,7 +154,6 @@ describe("MarkdownPreview", () => {
 
   it("caps the table breakout at the nearest horizontally clipped ancestor", () => {
     const { notifyResize } = mockResizeObserverDeliveries();
-    // Every element is 300px wide at x=100 unless it sets data-left/data-width.
     vi.spyOn(HTMLElement.prototype, "getBoundingClientRect").mockImplementation(
       function (this: HTMLElement) {
         const left = Number(this.dataset.left ?? 100);
@@ -180,7 +188,6 @@ describe("MarkdownPreview", () => {
         </div>,
       );
 
-    // The clip ends where the content ends: no room on the right, no breakout.
     const flush = renderClipped(400);
     const flushBreakout =
       flush.container.querySelector("table")?.parentElement?.parentElement;
@@ -190,7 +197,6 @@ describe("MarkdownPreview", () => {
     ).toBe("300px");
     flush.unmount();
 
-    // 100px free on the left and 200px on the right: grow by the smaller side.
     const roomy = renderClipped(600);
     const roomyBreakout =
       roomy.container.querySelector("table")?.parentElement?.parentElement;
@@ -200,7 +206,6 @@ describe("MarkdownPreview", () => {
     ).toBe("500px");
     roomy.unmount();
 
-    // The preview root itself clips: the table must not leave the preview.
     const sheet = document.createElement("style");
     sheet.textContent = ".overflow-x-hidden { overflow-x: hidden; }";
     document.head.appendChild(sheet);
@@ -247,12 +252,10 @@ describe("MarkdownPreview", () => {
     notifyResize();
     expect(breakout.style.getPropertyValue("--md-content-w")).toBe("320px");
 
-    // Same width, different height: no style write.
     breakout.style.setProperty("--md-content-w", "sentinel");
     notifyResize();
     expect(breakout.style.getPropertyValue("--md-content-w")).toBe("sentinel");
 
-    // A width change re-measures.
     width = 480;
     notifyResize();
     expect(breakout.style.getPropertyValue("--md-content-w")).toBe("480px");
@@ -274,6 +277,44 @@ describe("MarkdownPreview", () => {
     );
     expect(container.querySelector("script")).toBeNull();
     expect(container.textContent).toContain("<script>alert(1)</script>");
+  });
+
+  it("keeps highlighted code DOM until the code text changes", () => {
+    const fence = "```ts\nconst a = 1;\n```";
+    const view = render(<MarkdownPreview content={`${fence}\n\nPara one.`} />);
+    const code = requireElement(view.container, "pre code");
+    const line = requireElement(code, "span.sh__line");
+    const observer = new MutationObserver(() => {});
+    observer.observe(code, {
+      characterData: true,
+      childList: true,
+      subtree: true,
+    });
+
+    view.rerender(
+      <MarkdownPreview content={`${fence}\n\nPara one.\n\nPara two.`} />,
+    );
+
+    const mutations = observer.takeRecords();
+    observer.disconnect();
+    expect(view.container.textContent).toContain("Para two.");
+    expect(mutations).toHaveLength(0);
+    expect(line.isConnected).toBe(true);
+
+    view.rerender(
+      <MarkdownPreview
+        content={"```ts\nconst a = 1;\nconst b = 2;\n```\n\nPara one."}
+      />,
+    );
+
+    const expected = document.createElement("code");
+    expected.innerHTML = highlightMarkdownCode({
+      code: "const a = 1;\nconst b = 2;",
+      language: "ts",
+    });
+    expect(requireElement(view.container, "pre code")).toBe(code);
+    expect(code.innerHTML).toBe(expected.innerHTML);
+    expect(code.querySelectorAll("span.sh__line")).toHaveLength(2);
   });
 
   it("renders inline-code Markdown file paths as local file links", () => {
@@ -358,7 +399,6 @@ describe("MarkdownPreview", () => {
     expect(openFinder).not.toHaveBeenCalled();
     expect(openBuiltin).not.toHaveBeenCalled();
 
-    // The provider returned null for the .ts link — plain anchor, no menu.
     fireEvent.contextMenu(screen.getByRole("link", { name: /app/ }));
     expect(screen.queryByText(/Open with/)).toBeNull();
   });
@@ -368,6 +408,93 @@ describe("MarkdownPreview", () => {
 
     expect(screen.queryByRole("link", { name: "README.md" })).toBeNull();
     expect(screen.getByText("README.md").tagName).toBe("CODE");
+  });
+
+  it("renders sanitized HTML video and source URLs through local file routing", () => {
+    const { container } = render(
+      <MarkdownPreview
+        allowHtml
+        content={
+          '<video controls poster="poster.png" title="Demo"><source src="clips/demo.mp4" type="video/mp4"></video>\n\n![image](still.mp4)\n\n[download](clips/demo.mp4)'
+        }
+        linkRouting={{
+          localImage: {
+            absolutePaths: { kind: "trusted-host" },
+            relativePaths: { baseDir: "/workspace", rootPath: "/workspace" },
+            resolveSrc: ({ path }) =>
+              `/content?path=${encodeURIComponent(path)}`,
+          },
+        }}
+      />,
+    );
+    const video = container.querySelector("video");
+    expect(video?.getAttribute("poster")).toBe(
+      "/content?path=%2Fworkspace%2Fposter.png",
+    );
+    expect(video?.querySelector("source")?.getAttribute("src")).toBe(
+      "/content?path=%2Fworkspace%2Fclips%2Fdemo.mp4",
+    );
+    expect(video?.querySelector("source")?.type).toBe("video/mp4");
+    expect(video?.controls).toBe(true);
+    expect(video?.playsInline).toBe(true);
+    expect(video?.preload).toBe("metadata");
+    expect(video?.getAttribute("aria-label")).toBe("Demo");
+    expect(container.querySelectorAll("img")).toHaveLength(1);
+    expect(screen.getByRole("link", { name: "download" })).not.toBeNull();
+  });
+
+  it("strips unsafe video attributes, URLs, and executable HTML", () => {
+    const { container } = render(
+      <MarkdownPreview
+        allowHtml
+        content={
+          '<video src="javascript:alert(1)" poster="javascript:alert(1)" onerror="alert(1)" autoplay style="position:fixed"><source src="javascript:alert(1)"></video><script>alert(1)</script><iframe src="https://example.com"></iframe>'
+        }
+      />,
+    );
+    const video = container.querySelector("video");
+    expect(video).not.toBeNull();
+    for (const attribute of ["src", "poster", "onerror", "autoplay", "style"]) {
+      expect(video?.hasAttribute(attribute)).toBe(false);
+    }
+    expect(video?.querySelector("source")?.hasAttribute("src")).toBe(false);
+    expect(container.querySelector("script, iframe")).toBeNull();
+  });
+
+  it("preserves a video element as streaming Markdown grows", () => {
+    const content =
+      '<video src="https://example.com/clip.mp4" controls></video>\n\n';
+    const { container, rerender } = render(
+      <MarkdownPreview
+        allowHtml
+        incrementalBlocks
+        content={content + "First"}
+      />,
+    );
+    const video = container.querySelector("video");
+    expect(video).not.toBeNull();
+    rerender(
+      <MarkdownPreview
+        allowHtml
+        incrementalBlocks
+        content={content + "First paragraph grows"}
+      />,
+    );
+    expect(container.querySelector("video")).toBe(video);
+  });
+
+  it("keeps video HTML disabled when not opted in and suppresses media in text-only previews", () => {
+    const content =
+      '<video src="https://example.com/clip.mp4" title="Demo"></video>';
+    const { container, rerender } = render(
+      <MarkdownPreview content={content} />,
+    );
+    expect(container.querySelector("video")).toBeNull();
+    rerender(
+      <MarkdownPreview allowHtml content={content} imagePolicy="alt-text" />,
+    );
+    expect(container.querySelector("video")).toBeNull();
+    expect(screen.getByText("[Video: Demo]")).not.toBeNull();
   });
 
   it("routes local Markdown images through the configured content resolver", () => {
@@ -441,6 +568,18 @@ describe("MarkdownPreview", () => {
     );
   });
 
+  it("keeps a rewritten link mounted across unrelated preview rerenders", () => {
+    const content = "Open [preview](http://localhost:5173/demo).";
+    const { rerender } = render(
+      <MarkdownPreview className="first" content={content} />,
+    );
+    const link = screen.getByRole("link", { name: "preview" });
+
+    rerender(<MarkdownPreview className="second" content={content} />);
+
+    expect(screen.getByRole("link", { name: "preview" })).toBe(link);
+  });
+
   it("renders inline LaTeX math with KaTeX", async () => {
     const { container } = render(
       <MarkdownPreview content={"Mass-energy is $$E = mc^2$$ exactly."} />,
@@ -511,9 +650,6 @@ describe("MarkdownPreview", () => {
   });
 
   it("closes a display math block whose `$$` delimiters are glued to the TeX (#1778)", async () => {
-    // `$$T_…` opens a math fence with the TeX as dropped meta and a trailing
-    // `…$$` never closes it, so the rest of the message used to render as one
-    // `.katex-error`.
     const { container } = render(
       <MarkdownPreview
         content={[
@@ -534,7 +670,6 @@ describe("MarkdownPreview", () => {
       expect(container.querySelector(".katex-display")).not.toBeNull(),
     );
     expect(container.querySelector(".katex-error")).toBeNull();
-    // The first formula line is rendered, not dropped as fence meta.
     expect(
       container.querySelector(".katex-display annotation")?.textContent,
     ).toContain("appearance");

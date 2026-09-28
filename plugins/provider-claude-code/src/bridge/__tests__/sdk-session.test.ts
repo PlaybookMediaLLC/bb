@@ -89,7 +89,6 @@ describe("SdkSession", () => {
     mockQueryInstance.applyFlagSettings.mockResolvedValue(undefined);
     mockQueryInstance.setModel.mockResolvedValue(undefined);
     mockQueryInstance.setPermissionMode.mockResolvedValue(undefined);
-    // Make the query async iterable return immediately
     mockQueryInstance[Symbol.asyncIterator].mockReturnValue({
       next: vi.fn().mockResolvedValue({ value: undefined, done: true }),
       return: vi.fn().mockResolvedValue({ value: undefined, done: true }),
@@ -112,7 +111,7 @@ describe("SdkSession", () => {
     const session = new SdkSession(defaultOptions, vi.fn(), vi.fn());
     session.start();
 
-    await session.setModel("claude-sonnet-5");
+    await session.setModel("claude-opus-5");
     await session.applyMutableSettings({
       effort: "max",
       settings: {
@@ -120,15 +119,17 @@ describe("SdkSession", () => {
         enableWorkflows: true,
         effortLevel: "max",
         ultracode: false,
+        fastMode: true,
       },
     });
 
-    expect(mockQueryInstance.setModel).toHaveBeenCalledWith("claude-sonnet-5");
+    expect(mockQueryInstance.setModel).toHaveBeenCalledWith("claude-opus-5");
     expect(mockQueryInstance.applyFlagSettings).toHaveBeenCalledWith({
       autoMemoryEnabled: false,
       enableWorkflows: true,
       effortLevel: "max",
       ultracode: false,
+      fastMode: true,
     });
     session.stop();
   });
@@ -229,8 +230,6 @@ describe("SdkSession", () => {
         }),
       }),
     );
-    // The SDK `skills` option is an allowlist: setting it would hide every
-    // skill the user installed outside bb (~/.claude, plugins, built-ins).
     expect(queryMock.mock.calls[0]?.[0]?.options).not.toHaveProperty("skills");
   });
 
@@ -310,7 +309,7 @@ describe("SdkSession", () => {
     const session = new SdkSession(
       {
         ...defaultOptions,
-        permissionMode: "dontAsk",
+        permissionMode: "acceptEdits",
         disallowedTools: ["WebFetch"],
       },
       onMessage,
@@ -322,7 +321,7 @@ describe("SdkSession", () => {
     expect(queryMock).toHaveBeenCalledWith(
       expect.objectContaining({
         options: expect.objectContaining({
-          permissionMode: "dontAsk",
+          permissionMode: "acceptEdits",
           disallowedTools: ["WebFetch"],
         }),
       }),

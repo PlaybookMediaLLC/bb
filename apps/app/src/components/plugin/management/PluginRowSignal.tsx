@@ -19,7 +19,7 @@ export function PluginSignalLogo({
 }: {
   children: ReactNode;
   signal: Extract<PluginRowSignal, { kind: "status" }> | null;
-  onStatusClick: () => void;
+  onStatusClick: (trigger: HTMLButtonElement) => void;
 }) {
   return (
     <span className="relative flex size-6 items-center justify-center">
@@ -38,7 +38,6 @@ export function PluginSignalLogo({
   );
 }
 
-/** The single status/action slot shared by installed plugin rows and galleries. */
 export function PluginRowSignalView({
   signal,
   onUpdateClick,
@@ -47,19 +46,17 @@ export function PluginRowSignalView({
 }: {
   signal: PluginRowSignal;
   onUpdateClick: () => void;
-  onStatusClick: () => void;
+  onStatusClick: (trigger: HTMLButtonElement) => void;
   statusPresentation?: "standalone" | "badge";
 }) {
   if (signal.kind === "update") {
-    // The row only ever says what is offered — a readable version when there
-    // is one — and the dialog carries the (shortened) hash detail. The control
-    // is an icon key like the status one beside it; the tooltip and the
-    // accessible name carry the words.
     const readableVersion = isReadablePluginVersion(signal.version)
       ? signal.version
       : null;
     const updateDescription =
-      readableVersion === null ? "Update available" : `Update to ${readableVersion}`;
+      readableVersion === null
+        ? "Update available"
+        : `Update to ${readableVersion}`;
     return (
       <TooltipProvider delayDuration={250}>
         <Tooltip>
@@ -100,10 +97,12 @@ export function PluginRowSignalView({
                 : "size-7",
               signal.tone === "error"
                 ? "text-destructive hover:text-destructive"
-                : "text-warning-text hover:text-warning-text",
+                : signal.tone === "warning"
+                  ? "text-warning-text hover:text-warning-text"
+                  : "text-muted-foreground hover:text-muted-foreground",
             )}
             aria-label={statusDescription}
-            onClick={onStatusClick}
+            onClick={(event) => onStatusClick(event.currentTarget)}
           >
             <Icon
               name={signal.icon}

@@ -3,6 +3,7 @@ import type {
   TimelineRow,
   TimelineRowStatus,
 } from "@bb/server-contract";
+import { displayWidth } from "@bb/text-utils";
 import { assertNever } from "./assert-never.js";
 import {
   buildTimelineWorkSummaryLabel,
@@ -38,12 +39,6 @@ interface TimelineTextFormatContext {
   verbose: boolean;
   color: boolean;
   depth: number;
-  /**
-   * `id` of the bundle-summary that is the open step's active-latest bundle
-   * for the row list currently being formatted. Computed once per list via
-   * `findActiveLatestBundleId` and passed down so per-row title formatting can
-   * mark only the matching bundle as active.
-   */
   activeLatestBundleId: string | null;
 }
 
@@ -89,7 +84,7 @@ function cyan(text: string, color: boolean): string {
 }
 
 function separator(label: string, color: boolean): string {
-  const pad = Math.max(0, 60 - label.length - 4);
+  const pad = Math.max(0, 60 - displayWidth(label) - 4);
   const suffix = "─".repeat(pad);
   return dim(
     suffix.length > 0 ? `── ${label} ${suffix}` : `── ${label}`,
@@ -104,13 +99,6 @@ function rowHeader(label: string, context: TimelineTextFormatContext): string {
   return dim(`── ${label}`, context.color);
 }
 
-// Active-latest bundle treatment fires only for the trailing bundle of a
-// "feed-like" container — top-level rows and delegation childRows. Turn
-// children and bundle/step children are excluded: a turn's children are an
-// archived completed-turn body, and bundle children are a single grouped
-// concept where there is no separate "frontier" to mark. `nestedRows`
-// drives the active-latest lookup for feed-like containers; pass `null`
-// for non-feed scopes to suppress active-latest treatment.
 function nestedContext(
   context: TimelineTextFormatContext,
   nestedRows: readonly ThreadTimelineViewRow[] | null,
@@ -235,6 +223,8 @@ function formatWorkBody(
       return lines;
     case "web-fetch":
       return lines;
+    case "image-generation":
+      return lines;
     case "image-view":
       return lines;
     case "file-read":
@@ -264,6 +254,7 @@ function formatWorkBody(
       return lines;
     case "approval":
     case "question":
+    case "form":
     case "workflow":
       return lines;
     case "delegation":
@@ -323,6 +314,10 @@ function formatWorkSummaryDetails(
   const lines: string[] = [];
   const childContext = nestedContext(context, null);
   for (const child of row.children) {
+    if (child.kind === "system") {
+      lines.push(formatRow(child, childContext));
+      continue;
+    }
     if (
       (child.workKind === "command" ||
         child.workKind === "file-read" ||

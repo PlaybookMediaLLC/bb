@@ -38,16 +38,6 @@ interface ClaudeToolUseBlockData {
   name: string;
 }
 
-interface ClaudeReasoningBlockData {
-  contentIndex: number;
-  text: string;
-}
-
-interface ClaudeStreamDelta {
-  contentIndex: number;
-  delta: string;
-}
-
 interface ClaudeToolResultBlockData {
   content: unknown;
   isError: boolean;
@@ -78,6 +68,9 @@ const LARGE_CLAUDE_CONTEXT_WINDOW = 1_000_000;
 const LARGE_CLAUDE_CONTEXT_MODELS = new Set([
   "best",
   "claude-fable-5",
+  "claude-fable-5-1",
+  "claude-mythos-5",
+  "claude-mythos-5-1",
   "fable",
 ]);
 
@@ -130,7 +123,7 @@ export function extractToolUses(
 
 export function extractStreamTextDelta(
   message: ClaudeStreamEventMessage,
-): ClaudeStreamDelta | undefined {
+): string | undefined {
   const parsed = streamEventSchema.safeParse(message.event);
   if (!parsed.success) return undefined;
 
@@ -138,21 +131,17 @@ export function extractStreamTextDelta(
     if (parsed.data.delta.type !== "text_delta") {
       return undefined;
     }
-    return parsed.data.delta.text.length > 0
-      ? { contentIndex: parsed.data.index, delta: parsed.data.delta.text }
-      : undefined;
+    return parsed.data.delta.text || undefined;
   }
   if (parsed.data.content_block.type !== "text") {
     return undefined;
   }
-  return parsed.data.content_block.text.length > 0
-    ? { contentIndex: parsed.data.index, delta: parsed.data.content_block.text }
-    : undefined;
+  return parsed.data.content_block.text || undefined;
 }
 
 export function extractStreamThinkingDelta(
   message: ClaudeStreamEventMessage,
-): ClaudeStreamDelta | undefined {
+): string | undefined {
   const parsed = streamEventSchema.safeParse(message.event);
   if (!parsed.success) return undefined;
 
@@ -160,35 +149,23 @@ export function extractStreamThinkingDelta(
     if (parsed.data.delta.type !== "thinking_delta") {
       return undefined;
     }
-    return parsed.data.delta.thinking.length > 0
-      ? { contentIndex: parsed.data.index, delta: parsed.data.delta.thinking }
-      : undefined;
+    return parsed.data.delta.thinking || undefined;
   }
   if (parsed.data.content_block.type !== "thinking") {
     return undefined;
   }
-  return parsed.data.content_block.thinking.length > 0
-    ? {
-        contentIndex: parsed.data.index,
-        delta: parsed.data.content_block.thinking,
-      }
-    : undefined;
+  return parsed.data.content_block.thinking || undefined;
 }
 
 export function extractThinkingBlocks(
   message: ClaudeAssistantMessage,
-): ClaudeReasoningBlockData[] {
-  const thinkingBlocks: ClaudeReasoningBlockData[] = [];
-  const content = parseMessageContent(message);
-  for (const [contentIndex, block] of content.entries()) {
+): string[] {
+  const thinkingBlocks: string[] = [];
+  for (const block of parseMessageContent(message)) {
     const thinkingBlock = thinkingBlockSchema.safeParse(block);
-    if (!thinkingBlock.success || thinkingBlock.data.thinking.length === 0) {
-      continue;
+    if (thinkingBlock.success && thinkingBlock.data.thinking.length > 0) {
+      thinkingBlocks.push(thinkingBlock.data.thinking);
     }
-    thinkingBlocks.push({
-      contentIndex,
-      text: thinkingBlock.data.thinking,
-    });
   }
   return thinkingBlocks;
 }
@@ -257,10 +234,6 @@ interface ClaudeResultTokenUsage {
   modelContextWindow: number | null;
 }
 
-/**
- * The result's own (per-segment) token usage. Running thread totals are the
- * delta assembler's accumulation; the bridge only reports the segment.
- */
 export function extractClaudeResultTokenUsage(
   message: ClaudeResultMessage | SDKResultMessage,
 ): ClaudeResultTokenUsage | undefined {
@@ -294,7 +267,8 @@ export function extractClaudeContextWindowUsage(
     args.message.modelUsage,
   );
   const modelContextWindow = parsedModelUsage.success
-    ? extractModelContextWindow(parsedModelUsage.data)
+    ? (extractModelContextWindow(parsedModelUsage.data) ??
+      args.fallbackModelContextWindow)
     : args.fallbackModelContextWindow;
   const usedTokens = args.latestRequestContextTokens ?? null;
 
@@ -337,6 +311,12 @@ function toTokenUsageBreakdown(
     totalTokens: inputTokens + outputTokens + cachedInputTokens,
     inputTokens,
     cachedInputTokens,
+    ...(usage.cache_read_input_tokens === undefined
+      ? {}
+      : { cacheReadInputTokens: usage.cache_read_input_tokens }),
+    ...(usage.cache_creation_input_tokens === undefined
+      ? {}
+      : { cacheWriteInputTokens: usage.cache_creation_input_tokens }),
     outputTokens,
     reasoningOutputTokens: 0,
   };
@@ -356,9 +336,15 @@ function extractModelContextWindow(
   if (!modelUsage) return null;
 
   let largestContextWindow: number | null = null;
-  for (const usage of Object.values(modelUsage)) {
-    const contextWindow = toPositiveNumber(usage.contextWindow);
-    if (contextWindow === undefined) continue;
+  for (const [model, usage] of Object.entries(modelUsage)) {
+    const reportedContextWindow = toPositiveNumber(usage.contextWindow);
+    if (reportedContextWindow === undefined) continue;
+
+    const modelContextWindow = resolveClaudeModelContextWindowHint(model);
+    const contextWindow =
+      modelContextWindow === null
+        ? reportedContextWindow
+        : Math.max(reportedContextWindow, modelContextWindow);
     if (largestContextWindow === null || contextWindow > largestContextWindow) {
       largestContextWindow = contextWindow;
     }

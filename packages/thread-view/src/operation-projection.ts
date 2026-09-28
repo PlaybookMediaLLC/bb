@@ -6,6 +6,7 @@ import type {
   EventProjectionOperationMessage,
   EventProjectionPermissionGrantLifecycleMessage,
   EventProjectionUserQuestionLifecycleMessage,
+  EventProjectionPluginFormLifecycleMessage,
 } from "./event-projection-types.js";
 import type { CompactionLifecycleEvent } from "./compaction-lifecycle.js";
 import type { EventMeta } from "./event-decode.js";
@@ -37,7 +38,6 @@ import {
 export interface OperationProjectionState {
   messages: EventProjectionMessage[];
   fileEditsByCallId: Map<string, EventProjectionFileEditMessage[]>;
-  /** Keyed by {@link scopedFileEditCallKey}, never by the bare call id. */
   fileEditStdoutBuffersByScopedCallKey: Map<string, VisibleTextBuffer>;
   openCompactionsByKey: Map<string, EventProjectionOperationMessage>;
   finalizedCompactionKeys: Set<string>;
@@ -49,6 +49,10 @@ export interface OperationProjectionState {
   userQuestionsByInteractionId: Map<
     string,
     EventProjectionUserQuestionLifecycleMessage
+  >;
+  pluginFormsByInteractionId: Map<
+    string,
+    EventProjectionPluginFormLifecycleMessage
   >;
   threadOperationsById: Map<string, EventProjectionOperationMessage>;
 }
@@ -63,6 +67,7 @@ export function createOperationProjectionState(
     provisioningOperationsByKey: new Map(),
     permissionGrantsByInteractionId: new Map(),
     userQuestionsByInteractionId: new Map(),
+    pluginFormsByInteractionId: new Map(),
     threadOperationsById: new Map(),
     fileEditsByCallId: new Map(),
     fileEditStdoutBuffersByScopedCallKey: new Map(),
@@ -97,7 +102,8 @@ type LifecycleStatus = Extract<
 type LifecycleEventProjectionMessage =
   | EventProjectionOperationMessage
   | EventProjectionPermissionGrantLifecycleMessage
-  | EventProjectionUserQuestionLifecycleMessage;
+  | EventProjectionUserQuestionLifecycleMessage
+  | EventProjectionPluginFormLifecycleMessage;
 type EventProjectionMessageScopeFields = ReturnType<
   | typeof eventProjectionMessageThreadScopeFields
   | typeof eventProjectionMessageTurnScopeFields
@@ -296,6 +302,35 @@ export function upsertUserQuestionLifecycleMessage(
   });
 }
 
+export function upsertPluginFormLifecycleMessage(
+  state: OperationProjectionState,
+  incoming: EventProjectionPluginFormLifecycleMessage,
+): void {
+  upsertKeyedLifecycleMessage({
+    index: state.pluginFormsByInteractionId,
+    incoming,
+    key: incoming.interactionId,
+    mergeExisting: mergePluginFormLifecycleMessage,
+    state,
+  });
+}
+
+function mergePluginFormLifecycleMessage(
+  existing: EventProjectionPluginFormLifecycleMessage,
+  incoming: EventProjectionPluginFormLifecycleMessage,
+): void {
+  const wasTerminal = isTerminalLifecycleStatus(existing.status);
+  existing.status = mergeLifecycleStatus(existing.status, incoming.status);
+  if (wasTerminal) {
+    return;
+  }
+  existing.lifecycle = incoming.lifecycle;
+  existing.title = incoming.title;
+  existing.statusReason = incoming.statusReason;
+  existing.presentation = incoming.presentation;
+  existing.payload = incoming.payload;
+}
+
 function mergeUserQuestionLifecycleMessage(
   existing: EventProjectionUserQuestionLifecycleMessage,
   incoming: EventProjectionUserQuestionLifecycleMessage,
@@ -371,9 +406,6 @@ function isTerminalFileEditStatus(
 export function flushPendingFileEditOutput(
   state: OperationProjectionState,
 ): void {
-  // Rows for one call id can sit in different scopes, and each scope owns its
-  // own output buffer, so resolve the buffer from the row's own scope. Each
-  // buffer flushes once, and every row of that scope then takes its text.
   const flushedBufferByScopedCallKey = new Map<
     string,
     VisibleTextBuffer | null
@@ -478,12 +510,6 @@ function fileEditScopeDiscriminator(
   return scope.kind === "turn" ? scope.turnId : "thread";
 }
 
-/**
- * The identity a file-edit call really has. A provider can reuse one call id
- * across scopes (a resumed ACP session restarts its synthetic id counter), so
- * per-call projection state must be keyed by scope as well, or two unrelated
- * calls share it.
- */
 function scopedFileEditCallKey(
   callId: string,
   scopeFields: EventProjectionMessageScopeFields,
@@ -498,11 +524,6 @@ interface ResolveScopedFileEditMessageKeyArgs {
   threadId: string;
 }
 
-/**
- * A call id reused across scopes must still mint distinct message ids, so fall
- * back to a scope-qualified key when the plain key is already taken by a
- * foreign-scope row.
- */
 function resolveScopedFileEditMessageKey(
   args: ResolveScopedFileEditMessageKeyArgs,
 ): string {
@@ -688,10 +709,6 @@ export function upsertFileEdit(
     ? eventProjectionMessageTurnScopeFields(turnId)
     : eventProjectionMessageThreadScopeFields();
   const existingRows = state.fileEditsByCallId.get(partial.callId) ?? [];
-  // Providers can reuse call ids across scopes (e.g. resumed ACP sessions
-  // restart their synthetic id counters). Merge only rows from a compatible
-  // scope and leave foreign-scope rows untouched, so each scope keeps its own
-  // file-edit message instead of failing the whole projection.
   const compatibleRows: EventProjectionFileEditMessage[] = [];
   const foreignRows: EventProjectionFileEditMessage[] = [];
   for (const row of existingRows) {
@@ -706,9 +723,6 @@ export function upsertFileEdit(
   const stdoutBuffer =
     state.fileEditStdoutBuffersByScopedCallKey.get(scopedCallKey) ??
     createVisibleTextBuffer();
-  // Provider stdout is per call, so split file-edit rows for the same call
-  // intentionally share one buffer — but only within one scope, so a reused
-  // call id cannot leak an earlier turn's output into a later turn's rows.
   state.fileEditStdoutBuffersByScopedCallKey.set(scopedCallKey, stdoutBuffer);
 
   const partialStdout = fileEditPartialStdout(partial);
@@ -729,8 +743,6 @@ export function upsertFileEdit(
   const stdout = getVisibleTextBufferText(stdoutBuffer);
   const partialChanges = fileEditPartialChanges(partial);
   if (partialChanges && partialChanges.length > 0) {
-    // A later change list is authoritative for the call: rows absent from the
-    // new list are dropped so stale split file-edit rows do not linger.
     const existingRowsByMatchKey =
       groupFileEditRowsByChangeMatchKey(compatibleRows);
     const usedRowIds = new Set<string>();
@@ -842,6 +854,8 @@ export function onCompactionBegin(
     existing.status = "pending";
     existing.title = "Compacting context";
     existing.detail = payload.detail ?? existing.detail;
+    existing.parentToolCallId =
+      payload.parentToolCallId ?? existing.parentToolCallId;
     return;
   }
 
@@ -860,6 +874,9 @@ export function onCompactionBegin(
     opType: "compaction",
     title: "Compacting context",
     detail: payload.detail,
+    ...(payload.parentToolCallId
+      ? { parentToolCallId: payload.parentToolCallId }
+      : {}),
     status: "pending",
   };
   state.openCompactionsByKey.set(payload.key, message);
@@ -881,6 +898,8 @@ export function onCompactionEnd(
     existing.status = "completed";
     existing.title = "Context compacted";
     existing.detail = payload.detail ?? existing.detail;
+    existing.parentToolCallId =
+      payload.parentToolCallId ?? existing.parentToolCallId;
     state.openCompactionsByKey.delete(payload.key);
     state.finalizedCompactionKeys.add(payload.key);
     return;
@@ -905,15 +924,14 @@ export function onCompactionEnd(
     opType: "compaction",
     title: "Context compacted",
     detail: payload.detail,
+    ...(payload.parentToolCallId
+      ? { parentToolCallId: payload.parentToolCallId }
+      : {}),
     status: "completed",
   });
   state.finalizedCompactionKeys.add(payload.key);
 }
 
-/**
- * Turn-end finalization is provisional: keep the compaction open so a later
- * explicit compaction completion can override the inferred error/interruption.
- */
 function finalizeOpenCompaction(
   message: EventProjectionOperationMessage,
   meta: EventMeta,
@@ -933,10 +951,6 @@ function finalizeOpenCompaction(
   message.detail = detail ?? message.detail;
 }
 
-/**
- * Returns true when at least one still-pending compaction row was settled, so
- * the caller knows the finalizing event now belongs to that row.
- */
 export function finalizeOpenCompactionsForTurn(
   args: FinalizeOpenCompactionsForTurnArgs,
 ): boolean {
@@ -960,7 +974,6 @@ export function finalizeOpenCompactionsForTurn(
   return settledPending;
 }
 
-/** Settle only compactions that are pending when this interruption is seen. */
 export function interruptOpenCompactions(
   args: InterruptOpenCompactionsArgs,
 ): void {

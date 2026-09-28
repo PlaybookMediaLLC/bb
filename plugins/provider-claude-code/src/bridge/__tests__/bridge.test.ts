@@ -16,10 +16,11 @@ import type {
   SDKUserMessage,
 } from "@anthropic-ai/claude-agent-sdk";
 import {
+  BRIDGE_INBOUND_REQUEST_METHODS,
+  BRIDGE_JSON_RPC_ERRORS,
   type JsonValue,
   type RuntimePermissionPolicy,
-  type ThreadEvent,
-} from "@bb/domain";
+} from "@get-bb/plugin-sdk/provider-bridge";
 
 const { forkSessionMock, queryMock } = vi.hoisted(() => ({
   forkSessionMock: vi.fn(),
@@ -34,7 +35,10 @@ vi.mock("@anthropic-ai/claude-agent-sdk", () => ({
 }));
 
 import { handleLine } from "../bridge.js";
-import { buildSessionOptions } from "../session-options.js";
+import {
+  type BuildSessionOptionsArgs,
+  buildSessionOptions,
+} from "../session-options.js";
 import {
   type ClaudePermissionMode,
   type ClaudeUserQuestionInput,
@@ -44,9 +48,10 @@ import {
   experimental_assembleCapturedThreadEvents as assembleCapturedThreadEvents,
   experimental_createBridgeJsonRpcTestHarness as createBridgeJsonRpcTestHarness,
 } from "@get-bb/plugin-sdk/provider-bridge/testing";
-import type { BridgeJsonRpcOutputMessage } from "@get-bb/plugin-sdk/provider-bridge/testing";
-
-import { BRIDGE_INBOUND_REQUEST_METHODS } from "@bb/provider-bridge-protocol";
+import type {
+  BridgeJsonRpcOutputMessage,
+  ThreadEvent,
+} from "@get-bb/plugin-sdk/provider-bridge/testing";
 
 type BridgeSessionOptions = ReturnType<typeof buildSessionOptions>;
 type BridgeSessionHooks = NonNullable<BridgeSessionOptions["hooks"]>;
@@ -56,20 +61,6 @@ type BridgeJsonRpcTestHarness = ReturnType<
   typeof createBridgeJsonRpcTestHarness
 >;
 type SdkResultUsage = Extract<SDKMessage, { type: "result" }>["usage"];
-
-interface ReadonlyBashHookArgs {
-  command: string;
-  hook: BridgePreToolUseHook;
-}
-
-interface AllowedReadonlyBashCase {
-  command: string;
-  expectedCommand: string;
-}
-
-interface DeniedReadonlyBashCase {
-  command: string;
-}
 
 interface AssistantToolUseMessageArgs {
   parentToolUseId: string | null;
@@ -99,12 +90,12 @@ interface CanUseToolPolicyCase {
   id: string;
   input: Record<string, unknown>;
   name: string;
-  /** The canonical policy the session is constructed with. */
   policy: RuntimePermissionPolicy;
   toolName: string;
 }
 
 interface ControlledClaudeQuery {
+  getContextUsage: ReturnType<typeof vi.fn>;
   applyFlagSettings: ReturnType<typeof vi.fn>;
   close: ReturnType<typeof vi.fn>;
   emit(message: SDKMessage): void;
@@ -119,6 +110,7 @@ interface ControlledClaudeQuery {
 interface ClaudeQueryCallOptions {
   canUseTool?: CanUseTool;
   env?: Record<string, string | undefined>;
+  extraArgs?: Record<string, string | null>;
   hooks?: BridgeSessionHooks;
   model?: string;
   permissionMode?: ClaudePermissionMode;
@@ -236,12 +228,6 @@ function getLatestQueryCall(): ClaudeQueryCall {
   return latestCall;
 }
 
-/**
- * Turns the bridge settled as failed. The SDK result message never reaches
- * the wire; the bridge emits semantic deltas, so the capture is run through a
- * real delta assembler (the runtime adapter's exact translation) and the
- * canonical failed-turn events are counted.
- */
 function getFailedTurns(messages: BridgeJsonRpcOutputMessage[]) {
   return assembleCapturedThreadEvents(messages, "claude-code").filter(
     (event) => event.type === "turn/completed" && event.status === "failed",
@@ -267,25 +253,6 @@ function getLastCanUseTool(): CanUseTool {
     throw new Error("Expected Claude SDK query to receive canUseTool");
   }
   return latestCall.options.canUseTool;
-}
-
-function invokeReadonlyBashHook(args: ReadonlyBashHookArgs) {
-  return args.hook(
-    {
-      hook_event_name: "PreToolUse",
-      tool_name: "Bash",
-      tool_input: {
-        command: args.command,
-        description: "Permission boundary test",
-      },
-      tool_use_id: "tool-1",
-      session_id: "session-1",
-      transcript_path: "/tmp/transcript.jsonl",
-      cwd: "/tmp/worktree",
-    },
-    "tool-1",
-    { signal: new AbortController().signal },
-  );
 }
 
 function createControlledClaudeQuery(): ControlledClaudeQuery {
@@ -342,6 +309,7 @@ function createControlledClaudeQuery(): ControlledClaudeQuery {
     finish() {
       pushResult({ value: undefined, done: true });
     },
+    getContextUsage: vi.fn().mockResolvedValue(null),
     initializationResult: vi.fn(),
     setModel: vi.fn().mockResolvedValue(undefined),
     setPermissionMode: vi.fn().mockResolvedValue(undefined),
@@ -460,6 +428,25 @@ function createAuthenticationErrorMessage(sessionId: string): SDKMessage {
   };
 }
 
+function createSuccessfulResultMessage(sessionId: string): SDKMessage {
+  return {
+    type: "result",
+    subtype: "success",
+    duration_ms: 1,
+    duration_api_ms: 1,
+    is_error: false,
+    num_turns: 1,
+    result: "ok",
+    stop_reason: "end_turn",
+    total_cost_usd: 0,
+    usage: createResultUsage(),
+    modelUsage: {},
+    permission_denials: [],
+    uuid: "00000000-0000-4000-8000-000000000004",
+    session_id: sessionId,
+  };
+}
+
 function createAssistantToolUseMessage(
   args: AssistantToolUseMessageArgs,
 ): SDKMessage {
@@ -522,11 +509,6 @@ function createBridgeUserQuestionInput(): ClaudeUserQuestionInput {
   };
 }
 
-/**
- * The canonical execution options a session-construction or turn request
- * carries. The claude-flavored knobs ride `providerOptions`, exactly as the
- * registry packs them.
- */
 function canonicalOptions(args?: {
   permissionEscalation?: "ask" | "deny";
   providerOptions?: Record<string, JsonValue>;
@@ -544,7 +526,6 @@ function canonicalOptions(args?: {
   };
 }
 
-/** Canonical turn params, keyed by the bb thread id. */
 function canonicalTurnParams(args: {
   threadId: string;
   providerThreadId?: string;
@@ -565,7 +546,6 @@ function canonicalTurnParams(args: {
   };
 }
 
-/** The prompt input the composer's `/plan` action produces for `text`. */
 function planCommandInput(text: string): JsonValue[] {
   return [
     {
@@ -594,7 +574,7 @@ async function startBridgeThread(args: StartBridgeThreadArgs): Promise<void> {
   args.bridge.sendRequest(1, "thread/start", {
     cwd: "/tmp/worktree",
     instructionMode: "append",
-    options: canonicalOptions(),
+    options: canonicalOptions({}),
     threadId: args.threadId,
   });
   await args.bridge.waitForResponse(1);
@@ -626,7 +606,6 @@ async function stopBridgeThread(args: StopBridgeThreadArgs): Promise<void> {
   await args.bridge.waitForResponse(2);
 }
 
-/** The canonical interaction payload the bridge forwarded, if any. */
 function interactionPayload(
   message: BridgeJsonRpcOutputMessage,
 ): Record<string, unknown> | undefined {
@@ -722,8 +701,154 @@ describe("bridge", () => {
   });
 
   afterEach(() => {
+    vi.useRealTimers();
     for (const tempDir of tempDirs.splice(0)) {
       rmSync(tempDir, { recursive: true, force: true });
+    }
+  });
+
+  it("publishes a context snapshot after a turn and invalidates it at compaction", async () => {
+    const bridge = createBridgeJsonRpcTestHarness(handleLine);
+    const queries: ControlledClaudeQuery[] = [];
+    queryMock.mockImplementation(() => {
+      const query = createControlledClaudeQuery();
+      query.getContextUsage.mockResolvedValue({
+        categories: [{ name: "Provider category", tokens: 450 }],
+        totalTokens: 450,
+        rawMaxTokens: 1_000,
+        model: "claude-test",
+        isAutoCompactEnabled: false,
+      });
+      queries.push(query);
+      return query;
+    });
+    const threadId = "thread-context-snapshot";
+    try {
+      bridge.sendRequest(1, "thread/start", {
+        threadId,
+        cwd: "/tmp/worktree",
+        instructionMode: "append",
+        options: {
+          permissionMode: "accept-edits",
+          permissionScope: "workspace",
+          approvalReviewer: "user",
+          permissionEscalation: "ask",
+          instructions: "test",
+          providerOptions: { workflowsEnabled: false },
+        },
+      });
+      await bridge.waitForResponse(1);
+      bridge.sendRequest(
+        2,
+        "turn/start",
+        canonicalTurnParams({
+          threadId,
+          providerThreadId: threadId,
+          input: [{ type: "text", text: "hello" }],
+        }),
+      );
+      await readNextPrompt(getLatestQueryCall());
+      await bridge.waitForResponse(2);
+      queries[0].emit(createSuccessfulResultMessage(threadId));
+      await vi.waitFor(() => {
+        const events = assembleCapturedThreadEvents(
+          bridge.messages,
+          "claude-code",
+        );
+        const snapshots = events.filter(
+          (event) =>
+            event.type === "thread/contextWindowUsage/updated" &&
+            event.contextWindowUsage.snapshot,
+        );
+        expect(snapshots).toMatchObject([
+          {
+            contextWindowUsage: {
+              usedTokens: 450,
+              modelContextWindow: 1_000,
+              estimated: true,
+              snapshot: {
+                providerSessionId: threadId,
+                providerTurnId: null,
+                usedTokens: 450,
+                categories: [
+                  {
+                    label: "Provider category",
+                    kind: "used",
+                    tokens: 450,
+                    entries: [],
+                  },
+                ],
+              },
+            },
+          },
+        ]);
+      });
+      expect(queries[0].getContextUsage).toHaveBeenCalledTimes(1);
+      queries[0].getContextUsage.mockResolvedValue(null);
+      queries[0].emit({
+        type: "system",
+        subtype: "compact_boundary",
+        uuid: "00000000-0000-4000-8000-000000000001",
+        session_id: threadId,
+        compact_metadata: {
+          trigger: "manual",
+          pre_tokens: 450,
+          post_tokens: 100,
+        },
+      });
+      await vi.waitFor(() => {
+        const usageEvents = assembleCapturedThreadEvents(
+          bridge.messages,
+          "claude-code",
+        ).filter((event) => event.type === "thread/contextWindowUsage/updated");
+        expect(usageEvents.at(-1)?.contextWindowUsage).toEqual({
+          usedTokens: null,
+          modelContextWindow: null,
+          estimated: true,
+        });
+        expect(queries[0].getContextUsage).toHaveBeenCalledTimes(2);
+      });
+    } finally {
+      await stopBridgeThread({ bridge, queries, threadId });
+      bridge.restore();
+    }
+  });
+
+  it("answers model/list with the missing-executable code when the Claude CLI is absent", async () => {
+    const bridge = createBridgeJsonRpcTestHarness(handleLine);
+    queryMock.mockReturnValue({
+      initializationResult: vi
+        .fn()
+        .mockRejectedValue(
+          new Error("Native CLI binary for darwin-arm64 not found at /tmp/cli"),
+        ),
+      close: vi.fn(),
+    });
+
+    try {
+      bridge.sendRequest(1, "model/list", {});
+      const missing = await bridge.waitForResponse(1);
+
+      expect(missing.error?.code).toBe(
+        BRIDGE_JSON_RPC_ERRORS.MISSING_EXECUTABLE,
+      );
+      expect(missing.error?.message).toContain(
+        "could not find the Claude Code CLI",
+      );
+
+      queryMock.mockReturnValue({
+        initializationResult: vi
+          .fn()
+          .mockRejectedValue(new Error("Claude SDK stream closed")),
+        close: vi.fn(),
+      });
+      bridge.sendRequest(2, "model/list", {});
+      const other = await bridge.waitForResponse(2);
+
+      expect(other.error?.code).toBe(BRIDGE_JSON_RPC_ERRORS.BRIDGE_ERROR);
+      expect(other.error?.message).toBe("Claude SDK stream closed");
+    } finally {
+      bridge.restore();
     }
   });
 
@@ -762,7 +887,6 @@ describe("bridge", () => {
         },
       });
       expect(forkSessionMock).toHaveBeenCalledWith("source-session-1", {
-        dir: "/tmp/worktree",
         upToMessageId: "assistant-message-42",
       });
     } finally {
@@ -778,12 +902,13 @@ describe("bridge", () => {
   it("keeps manager sessions on a plain string system prompt", () => {
     const options = buildSessionOptions(
       {
+        chromeEnabled: false,
+        serviceTier: "default",
         workflowsEnabled: false,
         baseInstructions: "You are a manager.",
         cwd: "/tmp/worktree",
         disallowedTools: ["ExitPlanMode", "NotebookEdit", "Task"],
         instructionMode: "replace",
-        getPermissionEscalation: () => "ask",
         permissionMode: "default",
         permissionScope: "workspace",
       },
@@ -802,12 +927,13 @@ describe("bridge", () => {
   it("decomposes ultracode into xhigh effort plus the ultracode settings flag", () => {
     const options = buildSessionOptions(
       {
+        chromeEnabled: false,
+        serviceTier: "default",
         baseInstructions: "You are a coder.",
         cwd: "/tmp/worktree",
         instructionMode: "append",
         reasoningLevel: "ultracode",
         workflowsEnabled: true,
-        getPermissionEscalation: () => "ask",
         permissionMode: "default",
         permissionScope: "workspace",
       },
@@ -819,18 +945,20 @@ describe("bridge", () => {
       autoMemoryEnabled: true,
       enableWorkflows: true,
       ultracode: true,
+      fastMode: false,
     });
   });
 
   it("enables workflows without the ultracode flag at lower efforts", () => {
     const options = buildSessionOptions(
       {
+        chromeEnabled: false,
+        serviceTier: "default",
         baseInstructions: "You are a coder.",
         cwd: "/tmp/worktree",
         instructionMode: "append",
         reasoningLevel: "high",
         workflowsEnabled: true,
-        getPermissionEscalation: () => "ask",
         permissionMode: "default",
         permissionScope: "workspace",
       },
@@ -842,18 +970,38 @@ describe("bridge", () => {
       autoMemoryEnabled: true,
       enableWorkflows: true,
       ultracode: false,
+      fastMode: false,
     });
+  });
+
+  it("sets fast mode only for the fast service tier at session start", () => {
+    const options = buildSessionOptions(
+      {
+        chromeEnabled: false,
+        workflowsEnabled: false,
+        serviceTier: "fast",
+        cwd: "/tmp/worktree",
+        instructionMode: "append",
+        permissionMode: "default",
+        permissionScope: "workspace",
+        model: "claude-opus-5",
+      },
+      {},
+    );
+
+    expect(options.settings).toMatchObject({ fastMode: true });
   });
 
   it("passes the memory setting when workflows are not enabled", () => {
     const options = buildSessionOptions(
       {
+        chromeEnabled: false,
+        serviceTier: "default",
         workflowsEnabled: false,
         baseInstructions: "You are a coder.",
         cwd: "/tmp/worktree",
         instructionMode: "append",
         reasoningLevel: "xhigh",
-        getPermissionEscalation: () => "ask",
         permissionMode: "default",
         permissionScope: "workspace",
       },
@@ -864,17 +1012,19 @@ describe("bridge", () => {
       autoMemoryEnabled: true,
       enableWorkflows: false,
       ultracode: false,
+      fastMode: false,
     });
   });
 
   it("disables Claude auto-memory reads and writes", () => {
     const options = buildSessionOptions(
       {
+        chromeEnabled: false,
+        serviceTier: "default",
         workflowsEnabled: false,
         memoryEnabled: false,
         cwd: "/tmp/worktree",
         instructionMode: "append",
-        getPermissionEscalation: () => "ask",
         permissionMode: "default",
         permissionScope: "workspace",
       },
@@ -885,18 +1035,38 @@ describe("bridge", () => {
       autoMemoryEnabled: false,
       enableWorkflows: false,
       ultracode: false,
+      fastMode: false,
     });
+  });
+
+  it("passes --chrome only when Claude in Chrome is enabled", () => {
+    const base = {
+      workflowsEnabled: false,
+      serviceTier: "default",
+      cwd: "/tmp/worktree",
+      instructionMode: "append",
+      permissionMode: "default",
+      permissionScope: "workspace",
+    } satisfies Omit<BuildSessionOptionsArgs, "chromeEnabled">;
+
+    expect(
+      buildSessionOptions({ ...base, chromeEnabled: true }, {}).extraArgs,
+    ).toEqual({ chrome: null });
+    expect(
+      buildSessionOptions({ ...base, chromeEnabled: false }, {}),
+    ).not.toHaveProperty("extraArgs");
   });
 
   it("leaves standard sessions on the default Claude tool preset", () => {
     const options = buildSessionOptions(
       {
+        chromeEnabled: false,
+        serviceTier: "default",
         workflowsEnabled: false,
         baseInstructions: "You are a coder.",
         cwd: "/tmp/worktree",
         instructionMode: "append",
         reasoningLevel: "xhigh",
-        getPermissionEscalation: () => "ask",
         permissionMode: "default",
         permissionScope: "workspace",
       },
@@ -919,11 +1089,12 @@ describe("bridge", () => {
   it("passes Claude local plugins through to the session", () => {
     const options = buildSessionOptions(
       {
+        chromeEnabled: false,
+        serviceTier: "default",
         workflowsEnabled: false,
         baseInstructions: "You are a coder.",
         cwd: "/tmp/worktree",
         instructionMode: "append",
-        getPermissionEscalation: () => "ask",
         permissionMode: "default",
         permissionScope: "workspace",
         plugins: [{ type: "local", path: "/tmp/bb-skills" }],
@@ -940,29 +1111,31 @@ describe("bridge", () => {
   it("passes the resolved Claude permission mode through to the session", () => {
     const options = buildSessionOptions(
       {
+        chromeEnabled: false,
+        serviceTier: "default",
         workflowsEnabled: false,
         baseInstructions: "You are a coder.",
         cwd: "/tmp/worktree",
         instructionMode: "append",
-        getPermissionEscalation: () => "deny",
-        permissionMode: "dontAsk",
+        permissionMode: "acceptEdits",
         permissionScope: "workspace",
       },
       {},
     );
 
-    expect(options.permissionMode).toBe("dontAsk");
+    expect(options.permissionMode).toBe("acceptEdits");
   });
 
   it("uses a Claude executable discovered from PATH for SDK sessions", () => {
     const { binDir, executablePath } = createTempClaudeExecutable();
     const options = buildSessionOptions(
       {
+        chromeEnabled: false,
+        serviceTier: "default",
         workflowsEnabled: false,
         baseInstructions: "You are a coder.",
         cwd: "/tmp/worktree",
         instructionMode: "append",
-        getPermissionEscalation: () => "ask",
         permissionMode: "default",
         permissionScope: "workspace",
       },
@@ -983,11 +1156,12 @@ describe("bridge", () => {
 
     const options = buildSessionOptions(
       {
+        chromeEnabled: false,
+        serviceTier: "default",
         workflowsEnabled: false,
         baseInstructions: "You are a coder.",
         cwd: "/tmp/worktree",
         instructionMode: "append",
-        getPermissionEscalation: () => "ask",
         permissionMode: "default",
         permissionScope: "workspace",
       },
@@ -1001,11 +1175,12 @@ describe("bridge", () => {
     const { executablePath } = createTempClaudeExecutable();
     const options = buildSessionOptions(
       {
+        chromeEnabled: false,
+        serviceTier: "default",
         workflowsEnabled: false,
         baseInstructions: "You are a coder.",
         cwd: "/tmp/worktree",
         instructionMode: "append",
-        getPermissionEscalation: () => "ask",
         permissionMode: "default",
         permissionScope: "workspace",
       },
@@ -1022,11 +1197,12 @@ describe("bridge", () => {
     const { executablePath } = createTempClaudeExecutable();
     const options = buildSessionOptions(
       {
+        chromeEnabled: false,
+        serviceTier: "default",
         workflowsEnabled: false,
         baseInstructions: "You are a coder.",
         cwd: "/tmp/worktree",
         instructionMode: "append",
-        getPermissionEscalation: () => "ask",
         permissionMode: "default",
         permissionScope: "workspace",
       },
@@ -1047,11 +1223,12 @@ describe("bridge", () => {
     expect(() =>
       buildSessionOptions(
         {
+          chromeEnabled: false,
+          serviceTier: "default",
           workflowsEnabled: false,
           baseInstructions: "You are a coder.",
           cwd: "/tmp/worktree",
           instructionMode: "append",
-          getPermissionEscalation: () => "ask",
           permissionMode: "default",
           permissionScope: "workspace",
         },
@@ -1064,41 +1241,43 @@ describe("bridge", () => {
   });
 
   it("configures acceptEdits and auto sessions with the same Claude sandbox", () => {
-    const askOptions = buildSessionOptions(
+    const acceptEditsOptions = buildSessionOptions(
       {
+        chromeEnabled: false,
+        serviceTier: "default",
         workflowsEnabled: false,
         baseInstructions: "You are a coder.",
         cwd: "/tmp/worktree",
         instructionMode: "append",
-        getPermissionEscalation: () => "ask",
         permissionMode: "acceptEdits",
         permissionScope: "workspace",
       },
       {},
     );
-    const denyOptions = buildSessionOptions(
+    const autoOptions = buildSessionOptions(
       {
+        chromeEnabled: false,
+        serviceTier: "default",
         workflowsEnabled: false,
         baseInstructions: "You are a coder.",
         cwd: "/tmp/worktree",
         instructionMode: "append",
-        getPermissionEscalation: () => "deny",
         permissionMode: "auto",
         permissionScope: "workspace",
       },
       {},
     );
 
-    expect(askOptions.permissionMode).toBe("acceptEdits");
-    expect(askOptions.sandbox).toEqual({
+    expect(acceptEditsOptions.permissionMode).toBe("acceptEdits");
+    expect(acceptEditsOptions.sandbox).toEqual({
       enabled: true,
       failIfUnavailable: false,
       autoAllowBashIfSandboxed: true,
       allowUnsandboxedCommands: true,
       network: { allowLocalBinding: true },
     });
-    expect(denyOptions.permissionMode).toBe("auto");
-    expect(denyOptions.sandbox).toEqual({
+    expect(autoOptions.permissionMode).toBe("auto");
+    expect(autoOptions.sandbox).toEqual({
       enabled: true,
       failIfUnavailable: false,
       autoAllowBashIfSandboxed: true,
@@ -1110,12 +1289,13 @@ describe("bridge", () => {
   it("keeps plan sessions on native gating without the workspace sandbox", () => {
     const options = buildSessionOptions(
       {
+        chromeEnabled: false,
+        serviceTier: "default",
         workflowsEnabled: false,
         additionalWorkspaceWriteRoots: ["/repo/.git/worktrees/bb13"],
         baseInstructions: "You are a coder.",
         cwd: "/tmp/worktree",
         instructionMode: "append",
-        getPermissionEscalation: () => "ask",
         permissionMode: "plan",
         permissionScope: "workspace",
       },
@@ -1127,281 +1307,7 @@ describe("bridge", () => {
     expect(options.additionalDirectories).toBeUndefined();
   });
 
-  it("configures auto sessions with additional writable roots", () => {
-    const options = buildSessionOptions(
-      {
-        workflowsEnabled: false,
-        additionalWorkspaceWriteRoots: [
-          "/repo/.git/worktrees/bb13",
-          "/repo/.git/objects",
-        ],
-        baseInstructions: "You are a coder.",
-        cwd: "/tmp/worktree",
-        instructionMode: "append",
-        getPermissionEscalation: () => "deny",
-        permissionMode: "auto",
-        permissionScope: "workspace",
-      },
-      {},
-    );
-
-    expect(options.additionalDirectories).toEqual([
-      "/repo/.git/worktrees/bb13",
-      "/repo/.git/objects",
-    ]);
-    expect(options.sandbox).toEqual({
-      enabled: true,
-      failIfUnavailable: false,
-      autoAllowBashIfSandboxed: true,
-      allowUnsandboxedCommands: true,
-      network: { allowLocalBinding: true },
-      filesystem: {
-        allowWrite: ["/repo/.git/worktrees/bb13", "/repo/.git/objects"],
-      },
-    });
-  });
-
-  it("configures readonly sessions with PreToolUse policy hooks", async () => {
-    const askOptions = buildSessionOptions(
-      {
-        workflowsEnabled: false,
-        baseInstructions: "You are a coder.",
-        cwd: "/tmp/worktree",
-        instructionMode: "append",
-        getPermissionEscalation: () => "ask",
-        permissionMode: "default",
-        permissionScope: "workspace",
-      },
-      {},
-    );
-    const denyOptions = buildSessionOptions(
-      {
-        workflowsEnabled: false,
-        baseInstructions: "You are a coder.",
-        cwd: "/tmp/worktree",
-        instructionMode: "append",
-        getPermissionEscalation: () => "deny",
-        permissionMode: "dontAsk",
-        permissionScope: "workspace",
-      },
-      {},
-    );
-
-    const askHook = askOptions.hooks?.PreToolUse?.[0]?.hooks[0];
-    if (!askHook) {
-      throw new Error("Expected readonly ask PreToolUse hook");
-    }
-    const allowedReadonlyBashCases = [
-      { command: "pwd", expectedCommand: "pwd" },
-      { command: "pwd -P", expectedCommand: "pwd -P" },
-      { command: "pwd -L", expectedCommand: "pwd -L" },
-      {
-        command: "git status --short",
-        expectedCommand: "git --no-optional-locks status --short",
-      },
-      {
-        command: "git --no-optional-locks status --short",
-        expectedCommand: "git --no-optional-locks status --short",
-      },
-      {
-        command: "git --no-pager status --short",
-        expectedCommand: "git --no-optional-locks --no-pager status --short",
-      },
-      {
-        command: "git diff --stat main...HEAD",
-        expectedCommand:
-          "git --no-optional-locks diff --no-ext-diff --no-textconv --stat main...HEAD",
-      },
-      {
-        command: "git diff -U3 -- package.json",
-        expectedCommand:
-          "git --no-optional-locks diff --no-ext-diff --no-textconv -U3 -- package.json",
-      },
-      {
-        command: "git diff -- file.txt",
-        expectedCommand:
-          "git --no-optional-locks diff --no-ext-diff --no-textconv -- file.txt",
-      },
-      {
-        command: "git diff -- --no-ext-diff --no-textconv package.json",
-        expectedCommand:
-          "git --no-optional-locks diff --no-ext-diff --no-textconv -- --no-ext-diff --no-textconv package.json",
-      },
-      {
-        command: "git show --stat --oneline -1 HEAD",
-        expectedCommand:
-          "git --no-optional-locks show --no-ext-diff --no-textconv --stat --oneline -1 HEAD",
-      },
-      {
-        command: "git show HEAD -- --no-ext-diff --no-textconv package.json",
-        expectedCommand:
-          "git --no-optional-locks show --no-ext-diff --no-textconv HEAD -- --no-ext-diff --no-textconv package.json",
-      },
-      {
-        command: "git merge-base main HEAD",
-        expectedCommand: "git --no-optional-locks merge-base main HEAD",
-      },
-      {
-        command: "git log --oneline --max-count=1",
-        expectedCommand:
-          "git --no-optional-locks log --no-ext-diff --no-textconv --oneline --max-count=1",
-      },
-      {
-        command: "git log -- --no-ext-diff --no-textconv package.json",
-        expectedCommand:
-          "git --no-optional-locks log --no-ext-diff --no-textconv -- --no-ext-diff --no-textconv package.json",
-      },
-      {
-        command: "git branch --show-current",
-        expectedCommand: "git --no-optional-locks branch --show-current",
-      },
-      {
-        command: "git branch --list bb/probe",
-        expectedCommand: "git --no-optional-locks branch --list bb/probe",
-      },
-      {
-        command: "git branch --merged main",
-        expectedCommand: "git --no-optional-locks branch --merged main",
-      },
-      {
-        command: "git ls-files --modified -- package.json",
-        expectedCommand:
-          "git --no-optional-locks ls-files --modified -- package.json",
-      },
-      {
-        command: "git rev-parse --show-toplevel",
-        expectedCommand: "git --no-optional-locks rev-parse --show-toplevel",
-      },
-      {
-        command: "git grep -n TODO -- package.json",
-        expectedCommand: "git --no-optional-locks grep -n TODO -- package.json",
-      },
-      {
-        command: "git blame -L1,5 package.json",
-        expectedCommand: "git --no-optional-locks blame -L1,5 package.json",
-      },
-    ] satisfies AllowedReadonlyBashCase[];
-    for (const testCase of allowedReadonlyBashCases) {
-      await expect(
-        invokeReadonlyBashHook({
-          command: testCase.command,
-          hook: askHook,
-        }),
-      ).resolves.toMatchObject({
-        hookSpecificOutput: {
-          hookEventName: "PreToolUse",
-          permissionDecision: "allow",
-          updatedInput: {
-            command: testCase.expectedCommand,
-            description: "Permission boundary test",
-          },
-        },
-      });
-    }
-
-    const deniedReadonlyBashCases = [
-      { command: "git add package.json" },
-      { command: "git reset -- package.json" },
-      { command: "git commit -m probe" },
-      { command: "git checkout main" },
-      { command: "git switch main" },
-      { command: "git restore package.json" },
-      { command: "git clean -fd" },
-      { command: "git apply patch.diff" },
-      { command: "git update-index --refresh" },
-      { command: "git stash" },
-      { command: "git fetch origin" },
-      { command: "git pull" },
-      { command: "git push" },
-      { command: "git branch bb-probe" },
-      { command: "git branch --merged main extra" },
-      { command: "git -c core.pager=cat status --short" },
-      { command: "git -C /tmp status" },
-      { command: "git --git-dir=/tmp/repo status" },
-      { command: "git diff -- ../etc/passwd" },
-      { command: "git diff -- /etc/passwd" },
-      { command: "git diff --textconv -- file.txt" },
-      { command: "git show --ext-diff HEAD" },
-      { command: "git grep -n TODO -- /etc/passwd" },
-      { command: "git blame /etc/passwd" },
-      { command: "GIT_DIR=/tmp/repo git status" },
-      { command: "VAR=1 git diff --stat" },
-      { command: "env FOO=bar git status" },
-      { command: "git status --short; cat /tmp/secret" },
-      { command: "git status --short && cat /tmp/secret" },
-      { command: "git status --short | cat" },
-      { command: "git status --short > /tmp/out" },
-      { command: "git status --short $(cat /tmp/secret)" },
-      { command: "git status --short `cat /tmp/secret`" },
-      { command: "git blame --contents /tmp/secret package.json" },
-      { command: "git blame --contents=/tmp/secret package.json" },
-      { command: "git grep -f /tmp/pattern TODO" },
-      { command: "git log --output=/tmp/log" },
-      { command: "git show --output=/tmp/out HEAD" },
-      { command: "pwd package.json" },
-    ] satisfies DeniedReadonlyBashCase[];
-    for (const testCase of deniedReadonlyBashCases) {
-      await expect(
-        invokeReadonlyBashHook({
-          command: testCase.command,
-          hook: askHook,
-        }),
-      ).resolves.toMatchObject({
-        hookSpecificOutput: {
-          hookEventName: "PreToolUse",
-          permissionDecision: "ask",
-        },
-      });
-    }
-
-    await expect(
-      askHook(
-        {
-          hook_event_name: "PreToolUse",
-          tool_name: "Agent",
-          tool_input: {},
-          tool_use_id: "tool-1",
-          session_id: "session-1",
-          transcript_path: "/tmp/transcript.jsonl",
-          cwd: "/tmp/worktree",
-        },
-        "tool-1",
-        { signal: new AbortController().signal },
-      ),
-    ).resolves.toEqual({ continue: true });
-
-    const preToolUseHook = denyOptions.hooks?.PreToolUse?.[0]?.hooks[0];
-    if (!preToolUseHook) {
-      throw new Error("Expected readonly PreToolUse hook");
-    }
-    await expect(
-      preToolUseHook(
-        {
-          hook_event_name: "PreToolUse",
-          tool_name: "Bash",
-          tool_input: {
-            command: "git reset -- package.json",
-          },
-          tool_use_id: "tool-1",
-          session_id: "session-1",
-          transcript_path: "/tmp/transcript.jsonl",
-          cwd: "/tmp/worktree",
-        },
-        "tool-1",
-        { signal: new AbortController().signal },
-      ),
-    ).resolves.toMatchObject({
-      hookSpecificOutput: {
-        hookEventName: "PreToolUse",
-        permissionDecision: "deny",
-      },
-    });
-  });
-
-  // The readonly-Bash auto-allow only applies to Claude's ask-everything
-  // modes, which no canonical policy maps onto; the hook-level suite above
-  // covers that rewrite. These cases pin what the wire can actually ask for.
-  describe("readonly Bash canUseTool policy", () => {
+  describe("Bash canUseTool policy", () => {
     const WORKSPACE_AUTO_DENY_POLICY = {
       permissionMode: "auto",
       permissionScope: "workspace",
@@ -1418,7 +1324,7 @@ describe("bridge", () => {
     const policyCases = [
       {
         id: "workspace-sandbox-deny",
-        name: "auto does not use readonly Bash auto-allow",
+        name: "auto workspace sandbox denies out-of-workspace Bash",
         policy: WORKSPACE_AUTO_DENY_POLICY,
         toolName: "Bash",
         blockedPath: "/tmp/project",
@@ -1449,7 +1355,7 @@ describe("bridge", () => {
       },
       {
         id: "full-bypass-allow",
-        name: "full bypass does not rewrite via readonly Bash auto-allow",
+        name: "full bypass allows Bash input unchanged",
         policy: FULL_POLICY,
         toolName: "Bash",
         decisionReason: "This command requires approval",
@@ -1479,8 +1385,8 @@ describe("bridge", () => {
       try {
         const startRequestId = 1;
         const stopRequestId = startRequestId + 1;
-        const threadId = `thread-readonly-bash-policy-${testCase.id}`;
-        const toolUseID = `tool-readonly-policy-${testCase.id}`;
+        const threadId = `thread-bash-policy-${testCase.id}`;
+        const toolUseID = `tool-bash-policy-${testCase.id}`;
         bridge.sendRequest(startRequestId, "thread/start", {
           threadId,
           cwd: "/tmp/worktree",
@@ -1614,9 +1520,6 @@ describe("bridge", () => {
   });
 
   it("forwards a sandbox network ask with a grantable network permission", async () => {
-    // Claude suggests a "localSettings" rule for this prompt, not a "session"
-    // one. bb used to drop that suggestion, so the prompt reached the user with
-    // nothing to grant and the server rejected every allow. See issue #1041.
     const bridge = createBridgeJsonRpcTestHarness(handleLine);
     const queries: ControlledClaudeQuery[] = [];
     queryMock.mockImplementation(() => {
@@ -1762,14 +1665,8 @@ describe("bridge", () => {
     }
   });
 
-  // Regression: ExitPlanMode reaches canUseTool with no blockedPath, no
-  // decisionReason and no suggestions, so the generic approval gate read it as
-  // "nothing to ask about" and allowed it. The SDK then told the model the user
-  // had approved a plan the user never saw, and plan mode ended silently.
   it.each([
     { permissionMode: "plan", label: "plan mode" },
-    // `/plan` overrides the preset, but a bypassPermissions session must not be
-    // able to auto-approve a plan through the blanket allow either.
     { permissionMode: "bypassPermissions", label: "bypassPermissions" },
   ])(
     "forwards ExitPlanMode for user approval in $label",
@@ -1855,10 +1752,6 @@ describe("bridge", () => {
     },
   );
 
-  // Regression for #1259: `/plan` overrides the session permission mode, and
-  // `turn/start` carries no mode, so nothing used to restore the user's preset.
-  // A full-access thread was then asked to approve every edit after the plan
-  // was approved.
   it("returns to the user's permission preset once a plan is approved", async () => {
     const bridge = createBridgeJsonRpcTestHarness(handleLine);
     const queries: ControlledClaudeQuery[] = [];
@@ -1916,7 +1809,6 @@ describe("bridge", () => {
       await expect(planPromise).resolves.toMatchObject({ behavior: "allow" });
       await bridge.flushWork();
 
-      // An edit that would otherwise prompt: full access must now allow it.
       const editResult = await canUseTool(
         "Edit",
         { file_path: "/tmp/worktree/test.md", new_string: "hi" },
@@ -1940,12 +1832,58 @@ describe("bridge", () => {
     }
   });
 
-  // Regression for #1712: `/plan` on a LATER turn of a live session. The
-  // server puts `claudeCodePermissionMode: "plan"` in providerOptions on
-  // turn/start, but the bridge only applied the permission mode at session
-  // construction. The mention was stripped from the prompt and the prompt was
-  // pushed into a session still in the user's preset mode, so Claude never
-  // entered Plan mode and never proposed a plan through ExitPlanMode.
+  it("translates tagged dollar skill mentions without changing plain dollar text", async () => {
+    const bridge = createBridgeJsonRpcTestHarness(handleLine);
+    const queries: ControlledClaudeQuery[] = [];
+    queryMock.mockImplementation(() => {
+      const query = createControlledClaudeQuery();
+      queries.push(query);
+      return query;
+    });
+
+    try {
+      const threadId = "thread-dollar-skill";
+      await startBridgeThread({ bridge, threadId });
+      const call = getLatestQueryCall();
+      bridge.sendRequest(
+        2,
+        "turn/start",
+        canonicalTurnParams({
+          threadId,
+          input: [
+            {
+              type: "text",
+              text: "Use $review but keep $PATH and $review",
+              mentions: [
+                {
+                  start: 4,
+                  end: 11,
+                  resource: {
+                    kind: "command",
+                    trigger: "$",
+                    name: "review",
+                    source: "skill",
+                    origin: "user",
+                    label: "review",
+                    argumentHint: null,
+                  },
+                },
+              ],
+            },
+          ],
+        }),
+      );
+
+      expect(await readNextPromptText(call)).toBe(
+        "Use /review but keep $PATH and $review",
+      );
+      await bridge.waitForResponse(2);
+      await stopBridgeThread({ bridge, queries, threadId });
+    } finally {
+      bridge.restore();
+    }
+  });
+
   it("switches a live session into Plan mode when a later turn carries /plan", async () => {
     const bridge = createBridgeJsonRpcTestHarness(handleLine);
     const queries: ControlledClaudeQuery[] = [];
@@ -1993,18 +1931,13 @@ describe("bridge", () => {
           providerOptions: { claudeCodePermissionMode: "plan" },
         }),
       );
-      // The prompt is only consumed after the mode switch landed: a prompt
-      // pushed first would start the turn in the preset mode.
       const prompt = await readNextPromptText(call);
       await bridge.waitForResponse(2);
       expect(query.setPermissionMode).toHaveBeenCalledWith("plan");
       expect(prompt).toBe("Create hello.txt containing hello world");
-      // The same query stays live: no session rebuild.
       expect(queries).toHaveLength(1);
       expect(query.close).not.toHaveBeenCalled();
 
-      // Approving the plan restores the user's preset exactly as for a
-      // first-turn plan (#1259).
       const canUseTool = getLastCanUseTool();
       const planPromise = canUseTool(
         "ExitPlanMode",
@@ -2039,11 +1972,6 @@ describe("bridge", () => {
     }
   });
 
-  // `bb thread tell --plan` on a busy thread lands as turn/steer. The steer
-  // path shares enterPlanModeIfRequested with turn/start; this covers what the
-  // turn/start test above does not: entering Plan mode from a steer, staying
-  // in it across a plain turn and a repeated /plan, and re-entering it after
-  // an approved plan restored the preset.
   it("enters Plan mode from a /plan steer and only re-requests it after the plan is approved", async () => {
     const bridge = createBridgeJsonRpcTestHarness(handleLine);
     const queries: ControlledClaudeQuery[] = [];
@@ -2080,8 +2008,6 @@ describe("bridge", () => {
       expect(query.setPermissionMode).toHaveBeenCalledTimes(1);
       expect(query.setPermissionMode).toHaveBeenCalledWith("plan");
 
-      // A follow-up turn without /plan keeps Plan mode: only an approved
-      // plan leaves it.
       bridge.sendRequest(
         3,
         "turn/start",
@@ -2094,7 +2020,6 @@ describe("bridge", () => {
       await bridge.waitForResponse(3);
       expect(query.setPermissionMode).toHaveBeenCalledTimes(1);
 
-      // A /plan steer while already in Plan mode is a no-op.
       bridge.sendRequest(
         4,
         "turn/steer",
@@ -2137,7 +2062,6 @@ describe("bridge", () => {
       await bridge.flushWork();
       expect(query.setPermissionMode).toHaveBeenLastCalledWith("acceptEdits");
 
-      // A later /plan steer re-enters Plan mode on the same live session.
       bridge.sendRequest(
         5,
         "turn/steer",
@@ -2190,8 +2114,6 @@ describe("bridge", () => {
         throw new Error("Expected live Claude query");
       }
 
-      // Stand in for the SDK reading its prompt stream: the prompt must never
-      // arrive, so this read only settles when the session closes.
       const promptRead = readNextPromptText(call).catch(() => undefined);
       bridge.sendRequest(
         2,
@@ -2250,11 +2172,6 @@ describe("bridge", () => {
     }
   });
 
-  // Both directions number their outgoing requests with a counter from 1, so a
-  // daemon request id routinely matches one the bridge is still waiting on. The
-  // `method` field is what separates them; without that check the request was
-  // settled as a bogus response and dropped, and the daemon only found out when
-  // it timed out 30s later.
   it("dispatches an inbound request whose id collides with a pending bb request", async () => {
     const bridge = createBridgeJsonRpcTestHarness(handleLine);
     const queries: ControlledClaudeQuery[] = [];
@@ -2322,8 +2239,6 @@ describe("bridge", () => {
     const bridge = createBridgeJsonRpcTestHarness(handleLine);
 
     try {
-      // Any params mismatch used to be dropped without a reply, so the caller
-      // learned nothing until its 30s timeout. The reply now names the field.
       bridge.sendRequest(11, "turn/start", {
         threadId: "thread-invalid-params",
         providerThreadId: "thread-invalid-params",
@@ -2542,13 +2457,8 @@ describe("bridge", () => {
     const { models, selectedOnlyModels } = await listClaudeCodeBridgeModels({
       PATH: binDir,
     });
-    // The curated catalog is always offered, so a probe reporting only Opus and
-    // Sonnet still yields every curated row; the probe's default wins.
     expect(models.map((model) => model.model)).toEqual([
-      "claude-fable-5",
       "claude-opus-5[1m]",
-      "claude-opus-4-8[1m]",
-      "claude-opus-4-7[1m]",
       "claude-sonnet-5",
     ]);
     expect(models.filter((model) => model.isDefault)).toEqual([
@@ -2569,6 +2479,22 @@ describe("bridge", () => {
         persistSession: false,
       }),
     });
+    const probeOptions = queryMock.mock.calls.at(-1)?.[0]?.options;
+    expect(probeOptions).not.toHaveProperty("allowDangerouslySkipPermissions");
+    expect(probeOptions).not.toHaveProperty("permissionMode");
+    expect(close).toHaveBeenCalledOnce();
+  });
+
+  it("treats an empty Claude model report as a discovery failure", async () => {
+    const close = vi.fn();
+    queryMock.mockReturnValueOnce({
+      initializationResult: vi.fn().mockResolvedValue({ models: [] }),
+      close,
+    });
+
+    await expect(listClaudeCodeBridgeModels()).rejects.toThrow(
+      "Claude Code reported no models.",
+    );
     expect(close).toHaveBeenCalledOnce();
   });
 
@@ -2618,8 +2544,6 @@ describe("bridge", () => {
 
       const queryOptions = getLatestQueryOptions();
       expect(queryOptions.env?.HOME).toBe("/Users/test-bb");
-      // Sessions report as the Claude CLI entrypoint (renders `sdk-cli` on the
-      // wire), with no `client-app/...` user-agent segment.
       expect(queryOptions.env?.CLAUDE_CODE_ENTRYPOINT).toBe("cli");
       expect(queryOptions.env?.CLAUDE_AGENT_SDK_CLIENT_APP).toBeUndefined();
       expect(queryOptions.settingSources).toEqual(["user", "project", "local"]);
@@ -3109,6 +3033,101 @@ describe("bridge", () => {
     }
   });
 
+  it("restarts the Claude process before the next turn when the Chrome setting changes", async () => {
+    const bridge = createBridgeJsonRpcTestHarness(handleLine);
+    const queries: ControlledClaudeQuery[] = [];
+    queryMock.mockImplementation(() => {
+      const query = createControlledClaudeQuery();
+      queries.push(query);
+      return query;
+    });
+    const threadId = "thread-chrome-setting";
+
+    try {
+      bridge.sendRequest(1, "thread/start", {
+        threadId,
+        cwd: "/tmp/worktree",
+        instructionMode: "append",
+        options: {
+          permissionMode: "accept-edits",
+          permissionScope: "workspace",
+          approvalReviewer: "user",
+          permissionEscalation: "ask",
+          instructions: "test",
+          providerOptions: { workflowsEnabled: false, chromeEnabled: true },
+        },
+      });
+      await bridge.waitForResponse(1);
+      expect(getLatestQueryOptions().extraArgs).toEqual({
+        chrome: null,
+        "replay-user-messages": null,
+      });
+
+      bridge.sendRequest(
+        2,
+        "turn/start",
+        canonicalTurnParams({
+          threadId,
+          providerThreadId: threadId,
+          input: [{ type: "text", text: "same chrome setting" }],
+          providerOptions: { chromeEnabled: true },
+        }),
+      );
+      await readNextPrompt(getLatestQueryCall());
+      await bridge.waitForResponse(2);
+      expect(queries).toHaveLength(1);
+      queries[0]?.emit(createSuccessfulResultMessage(threadId));
+      await bridge.flushWork();
+
+      bridge.sendRequest(
+        3,
+        "turn/start",
+        canonicalTurnParams({
+          threadId,
+          providerThreadId: threadId,
+          input: [{ type: "text", text: "chrome turned off" }],
+          providerOptions: { chromeEnabled: false },
+        }),
+      );
+      await bridge.flushWork();
+      expect(queries).toHaveLength(2);
+      expect(queries[0]?.close).toHaveBeenCalled();
+      expect(getLatestQueryOptions()).toMatchObject({ resume: threadId });
+      expect(getLatestQueryOptions().extraArgs).toEqual({
+        "replay-user-messages": null,
+      });
+      await expect(readNextPromptText(getLatestQueryCall())).resolves.toBe(
+        "chrome turned off",
+      );
+      await bridge.waitForResponse(3);
+      expect(
+        bridge.messages.filter(
+          (message) => message.method === "session/replaced",
+        ),
+      ).toContainEqual(
+        expect.objectContaining({
+          params: expect.objectContaining({
+            contextLost: false,
+            providerThreadId: threadId,
+            threadId,
+          }),
+        }),
+      );
+    } finally {
+      bridge.sendRequest(4, "thread/stop", {
+        threadId,
+        providerThreadId: threadId,
+        intent: "interrupt",
+        activeTurnId: null,
+      });
+      await bridge.flushWork();
+      queries.at(-1)?.finish();
+      await bridge.waitForResponse(4);
+      queries.forEach((query) => query.finish());
+      bridge.restore();
+    }
+  });
+
   it("applies turn model, reasoning, memory, workflow, and subagent settings live", async () => {
     const bridge = createBridgeJsonRpcTestHarness(handleLine);
     const queries: ControlledClaudeQuery[] = [];
@@ -3160,6 +3179,7 @@ describe("bridge", () => {
           permissionEscalation: "ask",
           model: "claude-opus-5[1m]",
           reasoningLevel: "max",
+          serviceTier: "fast",
           providerOptions: {
             workflowsEnabled: true,
             memoryEnabled: false,
@@ -3178,6 +3198,7 @@ describe("bridge", () => {
         enableWorkflows: true,
         effortLevel: "max",
         ultracode: false,
+        fastMode: true,
       });
 
       for (const toolName of ["Agent", "Task"]) {
@@ -3236,6 +3257,7 @@ describe("bridge", () => {
           permissionEscalation: "ask",
           model: "claude-opus-5[1m]",
           reasoningLevel: "xhigh",
+          serviceTier: "default",
           providerOptions: {
             workflowsEnabled: false,
             memoryEnabled: true,
@@ -3252,6 +3274,7 @@ describe("bridge", () => {
         enableWorkflows: false,
         effortLevel: "xhigh",
         ultracode: false,
+        fastMode: false,
       });
       const enabledSubagentOutputs = await invokeBridgeHooks(
         hooks.PreToolUse,
@@ -3573,9 +3596,6 @@ describe("bridge", () => {
     }
   });
 
-  // A resume names the session it reopens; the bridge has no way to reopen
-  // "whatever this thread had", so a null identity is a params error, not a
-  // silent fresh session.
   it("refuses a thread/resume with no provider thread id", async () => {
     const bridge = createBridgeJsonRpcTestHarness(handleLine);
     queryMock.mockImplementation(() => createControlledClaudeQuery());
@@ -3856,9 +3876,6 @@ describe("bridge", () => {
       expect(getFailedTurns(bridge.messages)).toHaveLength(1);
       expect(queries).toHaveLength(1);
       expect(queries[0]?.close).not.toHaveBeenCalled();
-      // The failure is typed for the runtime: one unsolicited authRequired
-      // hint beside the turn's provider.error row, and nothing on a request
-      // (no request failed here).
       expect(
         bridge.messages
           .filter((message) => message.method === "provider/recovery")
@@ -4037,8 +4054,6 @@ describe("bridge", () => {
       await bridge.flushWork();
 
       expect(queries).toHaveLength(1);
-      // The stale resume settles the turn as failed rather than silently
-      // starting a fresh session behind the user's back.
       expect(getFailedTurns(bridge.messages)).toHaveLength(1);
       expect(
         bridge.messages.some((message) => message.method === "error"),
@@ -4506,9 +4521,6 @@ describe("bridge", () => {
 });
 
 describe("canonical skills/configure", () => {
-  // Canonical sessions carry no skill roots in their options; the roots the
-  // runtime configures once per process must reach every session the bridge
-  // builds afterwards, or injected skills are silently dropped.
   const canonicalOptions = {
     permissionMode: "full",
     permissionScope: "full",
@@ -4524,7 +4536,6 @@ describe("canonical skills/configure", () => {
       queries.push(query);
       return query;
     });
-    // Generic roots: skills directories, one subdirectory per skill.
     const stagedRoot = mkdtempSync(join(tmpdir(), "bb-claude-skill-roots-"));
     const rootA = join(stagedRoot, "a", "skills");
     const rootB = join(stagedRoot, "b", "skills");
@@ -4558,8 +4569,6 @@ describe("canonical skills/configure", () => {
       });
       await bridge.waitForResponse(2);
 
-      // Claude gets local plugins the bridge assembled around each root: a
-      // manifest pointing at `./skills`, and `skills` linking to the root.
       const options = getLatestQueryOptions() as {
         plugins?: { type: string; path: string }[];
       };
@@ -4594,7 +4603,6 @@ describe("canonical skills/configure", () => {
       queries[0]?.finish();
       await bridge.waitForResponse(3);
     } finally {
-      // The latch is process-scoped; clear it so later tests see no plugins.
       bridge.sendRequest(99, "skills/configure", { roots: [] });
       queries[0]?.finish();
       bridge.restore();
@@ -4611,13 +4619,84 @@ describe("canonical model context-window hint", () => {
     permissionEscalation: null,
   };
 
-  // Claude reports `modelUsage.contextWindow` on some results and omits it on
-  // others. The legacy adapter seeded a model-derived fallback on every
-  // command plan that carried a model; the canonical bridge has no command
-  // plan, so it seeds the translator at session construction instead. Without
-  // that seeding, capacity read as unknown for every result Claude sent
-  // without the field — notably the 1M `[1m]` aliases.
-  it("seeds the model-derived context window for canonical sessions", async () => {
+  it("rebuilds with the same provider session when the turn environment changes", async () => {
+    const bridge = createBridgeJsonRpcTestHarness(handleLine);
+    const queries: ControlledClaudeQuery[] = [];
+    queryMock.mockImplementation(() => {
+      const query = createControlledClaudeQuery();
+      queries.push(query);
+      return query;
+    });
+
+    try {
+      const threadId = "thread-env-change";
+      bridge.sendRequest(1, "thread/start", {
+        threadId,
+        cwd: "/tmp/worktree",
+        instructionMode: "append",
+        options: {
+          ...canonicalOptions,
+          envVars: { PLUGIN_ACCESS_TOKEN: "first" },
+        },
+      });
+      const startResponse = await bridge.waitForResponse(1);
+      const providerThreadId = getProviderThreadIdFromResult(startResponse);
+
+      bridge.sendRequest(2, "turn/start", {
+        threadId,
+        providerThreadId,
+        clientRequestId: "creq_23456789ab",
+        input: [{ type: "text", text: "continue", mentions: [] }],
+        options: {
+          ...canonicalOptions,
+          envVars: { PLUGIN_ACCESS_TOKEN: "second" },
+        },
+      });
+      await bridge.flushWork();
+
+      expect(queries).toHaveLength(2);
+      expect(queries[0]?.close).toHaveBeenCalledOnce();
+      expect(getLatestQueryOptions()).toMatchObject({
+        env: { PLUGIN_ACCESS_TOKEN: "second" },
+        resume: providerThreadId,
+      });
+      await expect(readNextPromptText(getLatestQueryCall())).resolves.toBe(
+        "continue",
+      );
+      await bridge.waitForResponse(2);
+      expect(
+        bridge.messages.filter(
+          (message) => message.method === "session/replaced",
+        ),
+      ).toContainEqual(
+        expect.objectContaining({
+          params: expect.objectContaining({
+            contextLost: false,
+            providerThreadId,
+            reason:
+              "Execution settings changed; the Claude session was rebuilt to apply them.",
+            showRuntimeNote: true,
+            threadId,
+          }),
+        }),
+      );
+
+      bridge.sendRequest(3, "thread/stop", {
+        threadId,
+        providerThreadId,
+        intent: "interrupt",
+        activeTurnId: null,
+      });
+      await bridge.flushWork();
+      queries[1]?.finish();
+      await bridge.waitForResponse(3);
+    } finally {
+      queries.forEach((query) => query.finish());
+      bridge.restore();
+    }
+  });
+
+  it("uses Fable's Claude Code capacity through a custom API endpoint", async () => {
     const bridge = createBridgeJsonRpcTestHarness(handleLine);
     const queries: ControlledClaudeQuery[] = [];
     queryMock.mockImplementation(() => {
@@ -4631,22 +4710,30 @@ describe("canonical model context-window hint", () => {
         threadId: "thread-context-hint",
         cwd: "/tmp/worktree",
         instructionMode: "append",
-        options: { ...canonicalOptions, model: "claude-opus-4-7[1m]" },
+        options: {
+          ...canonicalOptions,
+          model: "claude-fable-5",
+          envVars: {
+            ANTHROPIC_BASE_URL: "http://127.0.0.1:8317",
+          },
+        },
       });
       await bridge.waitForResponse(1);
+
+      expect(getLatestQueryOptions().env?.ANTHROPIC_BASE_URL).toBe(
+        "http://127.0.0.1:8317",
+      );
 
       bridge.sendRequest(2, "turn/start", {
         threadId: "thread-context-hint",
         providerThreadId: "thread-context-hint",
         clientRequestId: "creq_23456789ab",
         input: [{ type: "text", text: "hello", mentions: [] }],
-        options: { ...canonicalOptions, model: "claude-opus-4-7[1m]" },
+        options: { ...canonicalOptions, model: "claude-fable-5" },
       });
       await readNextPrompt(getLatestQueryCall());
       await bridge.waitForResponse(2);
 
-      // A result with token usage but no `modelUsage`: the only capacity
-      // source left is the seeded hint.
       queries[0]?.emit({
         type: "result",
         subtype: "success",
@@ -4662,6 +4749,11 @@ describe("canonical model context-window hint", () => {
           output_tokens: 20,
           cache_creation_input_tokens: 30,
           cache_read_input_tokens: 40,
+        },
+        modelUsage: {
+          "claude-fable-5": {
+            contextWindow: 200_000,
+          },
         },
         session_id: "session-1",
       } as unknown as SDKMessage);
@@ -4680,6 +4772,21 @@ describe("canonical model context-window hint", () => {
       );
 
       expect(contextWindowEvents.at(-1)?.contextWindowUsage).toMatchObject({
+        modelContextWindow: 1_000_000,
+      });
+
+      const tokenUsageEvents = assembleCapturedThreadEvents(
+        bridge.messages,
+        "claude-code",
+      ).filter(
+        (
+          event,
+        ): event is Extract<
+          ThreadEvent,
+          { type: "thread/tokenUsage/updated" }
+        > => event.type === "thread/tokenUsage/updated",
+      );
+      expect(tokenUsageEvents.at(-1)?.tokenUsage).toMatchObject({
         modelContextWindow: 1_000_000,
       });
     } finally {

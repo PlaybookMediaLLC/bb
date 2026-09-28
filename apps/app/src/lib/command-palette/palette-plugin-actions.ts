@@ -1,13 +1,13 @@
-import type { PluginCommandPaletteActionContext } from "@get-bb/plugin-sdk";
+import type { PluginCommandContext } from "@get-bb/plugin-sdk";
 import type { PluginThreadPanelOpenHandler } from "@/components/plugin/plugin-thread-panel-navigation";
 import type { PluginCommandPaletteActionSlot } from "@/lib/plugin-slots";
+import { getPluginDisplayName } from "@/lib/plugin-logos";
 import type { PaletteAction } from "./palette-action";
 
 export interface BuildPluginPaletteActionsArgs {
   slots: readonly PluginCommandPaletteActionSlot[];
   threadId: string | null;
   projectId: string | null;
-  /** The focused thread view's opener, or null when no thread is on screen. */
   openThreadPanel: PluginThreadPanelOpenHandler | null;
 }
 
@@ -18,7 +18,7 @@ function describeError(error: unknown): string {
 function actionContext(
   slot: PluginCommandPaletteActionSlot,
   args: BuildPluginPaletteActionsArgs,
-): PluginCommandPaletteActionContext {
+): PluginCommandContext {
   return {
     threadId: args.threadId,
     projectId: args.projectId,
@@ -34,13 +34,6 @@ function actionContext(
   };
 }
 
-/**
- * Plugin `commandPaletteAction` rows for the surface the palette opened on.
- *
- * `isAvailable` and `run` are plugin code running inside host chrome, so both
- * are contained: a row whose `isAvailable` throws is treated as unavailable
- * rather than taking the palette down with it.
- */
 export function buildPluginPaletteActions(
   args: BuildPluginPaletteActionsArgs,
 ): PaletteAction[] {
@@ -61,7 +54,8 @@ export function buildPluginPaletteActions(
     }
     actions.push({
       id: `plugin:${slot.pluginId}/${slot.id}`,
-      group: "Plugins",
+      bucket: "Plugins",
+      group: getPluginDisplayName(slot.pluginId),
       title: slot.title,
       shortcut: null,
       run: () => {

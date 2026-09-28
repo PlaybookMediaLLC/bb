@@ -9,6 +9,15 @@ interface RewriteLocalhostLinkHrefArgs {
 }
 
 const LOOPBACK_LINK_HOSTNAMES = new Set(["127.0.0.1", "localhost"]);
+const IGNORED_REWRITE_HOSTNAME_PATTERNS = [
+  /^(?:.+\.)?getbb\.app$/i,
+];
+
+function isIgnoredRewriteHostname(hostname: string): boolean {
+  return IGNORED_REWRITE_HOSTNAME_PATTERNS.some((pattern) =>
+    pattern.test(hostname),
+  );
+}
 
 function isRewriteableLoopbackLink(url: URL): boolean {
   return (
@@ -17,17 +26,17 @@ function isRewriteableLoopbackLink(url: URL): boolean {
   );
 }
 
-/**
- * Rewrites loopback links an agent emitted (`http://localhost:5173`) to the
- * host the client reached the bb server on, so links open on the machine that
- * is actually serving them when bb is used remotely.
- */
 export function rewriteLocalhostLinkHref({
   currentHostname,
   enabled,
   href,
 }: RewriteLocalhostLinkHrefArgs): string | undefined {
-  if (!enabled || href === undefined || currentHostname === undefined) {
+  if (
+    !enabled ||
+    href === undefined ||
+    currentHostname === undefined ||
+    isIgnoredRewriteHostname(currentHostname)
+  ) {
     return href;
   }
 
@@ -38,7 +47,7 @@ export function rewriteLocalhostLinkHref({
     return href;
   }
 
-  if (!isRewriteableLoopbackLink(url)) {
+  if (!isRewriteableLoopbackLink(url) || url.hostname === currentHostname) {
     return href;
   }
 

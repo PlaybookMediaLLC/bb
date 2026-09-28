@@ -19,9 +19,11 @@ import { dirname, join, resolve } from "node:path";
 import { fileURLToPath, pathToFileURL } from "node:url";
 import { describe, expect, it, vi } from "vitest";
 import { z } from "zod";
+import { waitForProcessExit } from "@bb/config/child-process-exit";
 import { resolvePortFromEnv } from "@bb/config/runtime";
 import {
   assertBbAppArtifacts,
+  assertBbHostArtifacts,
   completeFullStackSupervision,
   createDaemonEnv,
   createHostEnrollKeyRequestBody,
@@ -36,11 +38,11 @@ import {
   resolveServerListenerUrl,
   resolveWorktreeRuntimePolicy,
   runBbApp,
+  shouldRunSourceAppUpdateShim,
   runBundledCliCommand,
   superviseFullStackProcesses,
   terminateManagedFullStackProcesses,
   waitForHostDaemonStatus,
-  waitForProcessExit,
 } from "../src/launcher.js";
 import type {
   BbAppStartContext,
@@ -52,6 +54,7 @@ import type {
   ManagedProcessRun,
   NamedProcessExitResult,
   ProcessExitResult,
+  ReadServerMovedFileFn,
 } from "../src/launcher.js";
 
 interface DelayArgs {
@@ -124,21 +127,13 @@ interface FakeSupervisor {
 }
 
 const invalidConfigCommandCases: InvalidConfigCommandCase[] = [
-  {
-    expectedError: /BB_INFERENCE must use provider\/model format/u,
-    key: "BB_INFERENCE",
-    value: "gpt-4o-mini",
-  },
-  {
-    expectedError: /BB_INFERENCE_FALLBACK must use provider\/model format/u,
-    key: "BB_INFERENCE_FALLBACK",
-    value: "gpt-5.4-mini",
-  },
-  {
-    expectedError: /BB_TRANSCRIPTION must use provider\/model format/u,
-    key: "BB_TRANSCRIPTION",
-    value: "gpt-4o-mini-transcribe",
-  },
+  ...["BB_INFERENCE", "BB_INFERENCE_FALLBACK", "BB_TRANSCRIPTION"].map(
+    (key) => ({
+      expectedError: /were removed\. Choose AI services in Settings/u,
+      key,
+      value: "codex/gpt-5.6-luna",
+    }),
+  ),
   {
     expectedError: /BB_APP_URL must be a valid URL/u,
     key: "BB_APP_URL",
@@ -165,11 +160,6 @@ const startupOnlyManagedEnvCases: StartupOnlyManagedEnvCase[] = [
   { key: "BB_FF_PLACEHOLDER", value: "true" },
   { key: "BB_FF_TIMELINE_WINDOW_EVENT_BUDGET", value: "2000" },
   { key: "BB_HOST_DAEMON_PORT", value: "48887" },
-  { key: "BB_INFERENCE", value: "codex/test-inference" },
-  {
-    key: "BB_INFERENCE_FALLBACK",
-    value: "codex/test-inference-fallback",
-  },
   { key: "BB_INHERITED_SKILLS_ROOTS", value: "/tmp/bb-skills" },
   { key: "BB_LOG_LEVEL", value: "debug" },
   { key: "BB_MANAGED_DEV_BUILTIN_PLUGIN_HOT_RELOAD", value: "1" },
@@ -177,7 +167,6 @@ const startupOnlyManagedEnvCases: StartupOnlyManagedEnvCase[] = [
   { key: "BB_SERVER_BIND_HOST", value: "127.0.0.1" },
   { key: "BB_SERVER_PORT", value: "48886" },
   { key: "BB_TELEMETRY", value: "false" },
-  { key: "BB_TRANSCRIPTION", value: "codex/test-transcription" },
 ];
 
 const packageMetadataSchema = z.object({
@@ -244,6 +233,12 @@ function delay(args: DelayArgs): Promise<DelayResult> {
 const immediateDelay: DelayMillisecondsFn = () => {
   return Promise.resolve();
 };
+
+const noServerMovedFile: ReadServerMovedFileFn = async () => null;
+
+async function unexpectedServerMove(): Promise<FullStackSupervisionResult> {
+  throw new Error("Unexpected server move");
+}
 
 function createTestStartContext(): BbAppStartContext {
   return {
@@ -745,8 +740,6 @@ describe("bb-app launcher", () => {
         "host_remote",
         "--host-daemon-port",
         "48887",
-        "--host-type",
-        "persistent",
         "--auto-update",
       ]),
     ).toEqual({
@@ -756,13 +749,23 @@ describe("bb-app launcher", () => {
         help: false,
         hostDaemonPort: "48887",
         hostId: "host_remote",
-        hostType: "persistent",
         joinCode: "bbde_supplied",
         json: false,
         serverUrl: "https://bb.example.test",
       },
       positionals: ["host-daemon", "join"],
     });
+  });
+
+  it("runs the source update shim only for a start with --in-app-updates", () => {
+    expect(shouldRunSourceAppUpdateShim(["--in-app-updates"])).toBe(true);
+    expect(shouldRunSourceAppUpdateShim(["start", "--in-app-updates"])).toBe(
+      true,
+    );
+    expect(shouldRunSourceAppUpdateShim(["start"])).toBe(false);
+    expect(shouldRunSourceAppUpdateShim(["stop", "--in-app-updates"])).toBe(
+      false,
+    );
   });
 
   it("reports the server bind host separately from the loopback connection URL", async () => {
@@ -808,7 +811,11 @@ describe("bb-app launcher", () => {
     expect(runtime.serverEnv.BB_THREAD_STORAGE).toBeUndefined();
     expect(runtime.serverEnv.BB_PROJECT_ID).toBe("proj_parent");
 
-    const daemonEnv = createDaemonEnv(runtime.context, runtime.env);
+    const daemonEnv = createDaemonEnv({
+      context: runtime.context,
+      env: runtime.env,
+      serverUrl: runtime.context.serverUrl,
+    });
     expect(daemonEnv.BB_ENVIRONMENT_ID).toBeUndefined();
     expect(daemonEnv.BB_THREAD_ID).toBeUndefined();
     expect(daemonEnv.BB_THREAD_STORAGE).toBeUndefined();
@@ -841,6 +848,26 @@ describe("bb-app launcher", () => {
     await expect(
       runBbApp(["--data-dir", dataDir, "--server-bind-host", "localhost"]),
     ).rejects.toThrow('BB_SERVER_BIND_HOST must be "127.0.0.1" or "0.0.0.0"');
+  });
+
+  it("tells the bundled CLI where the server's machine installer is", async () => {
+    const dataDir = mkdtempSync(join(tmpdir(), "bb-app-cli-installer-"));
+    const outputPath = join(dataDir, "installer-path.txt");
+
+    const exitCode = await runBundledCliCommand({
+      args: [
+        "-e",
+        "require('node:fs').writeFileSync(process.argv[1], process.env.BB_MACHINE_INSTALLER ?? 'missing')",
+        outputPath,
+      ],
+      context: { ...createTestStartContext(), dataDir },
+      env: { BB_CLI: process.execPath },
+    });
+
+    expect(exitCode).toBe(0);
+    expect(readFileSync(outputPath, "utf8")).toBe(
+      "/tmp/bb-app-test/server/dist/assets/install-machine.sh",
+    );
   });
 
   it("uses a supplied join code without requesting a loopback enroll key", async () => {
@@ -1099,16 +1126,8 @@ describe("bb-app launcher", () => {
       dataDir,
       "config",
       "set",
-      "BB_INFERENCE",
-      "anthropic/claude-sonnet-4-5",
-    ]);
-    await runBbApp([
-      "--data-dir",
-      dataDir,
-      "config",
-      "set",
-      "BB_INFERENCE_FALLBACK",
-      "codex/gpt-5.4-mini",
+      "BB_LOG_LEVEL",
+      "debug",
     ]);
     await runBbApp([
       "--data-dir",
@@ -1124,8 +1143,7 @@ describe("bb-app launcher", () => {
     ).toEqual({
       config: {
         BB_APP_URL: "https://bb.example.test",
-        BB_INFERENCE: "anthropic/claude-sonnet-4-5",
-        BB_INFERENCE_FALLBACK: "codex/gpt-5.4-mini",
+        BB_LOG_LEVEL: "debug",
       },
     });
     expect(JSON.parse(readFileSync(join(dataDir, "env.json"), "utf8"))).toEqual(
@@ -1301,8 +1319,6 @@ describe("bb-app launcher", () => {
       "https://bb.example.test",
     ]);
 
-    // The parser skips the invalid entry with a warning, but a config write
-    // must keep the user's raw file contents intact.
     expect(
       JSON.parse(readFileSync(join(dataDir, "config.json"), "utf8")),
     ).toEqual({
@@ -1968,8 +1984,11 @@ describe("bb-app launcher", () => {
     const supervision = superviseFullStackProcesses({
       context: createTestStartContext(),
       delayMilliseconds: immediateDelay,
+      isHealthyServerAnswering: async () => false,
       isShutdownRequested: supervisor.shutdownRequested,
+      onServerMoved: unexpectedServerMove,
       processes: supervisor.processes,
+      readServerMovedFile: noServerMovedFile,
       startDaemon: supervisor.daemonStart,
       startServer: supervisor.serverStart,
     });
@@ -2000,8 +2019,11 @@ describe("bb-app launcher", () => {
     const supervision = superviseFullStackProcesses({
       context: createTestStartContext(),
       delayMilliseconds: immediateDelay,
+      isHealthyServerAnswering: async () => false,
       isShutdownRequested: supervisor.shutdownRequested,
+      onServerMoved: unexpectedServerMove,
       processes: supervisor.processes,
+      readServerMovedFile: noServerMovedFile,
       startDaemon: supervisor.daemonStart,
       startServer: supervisor.serverStart,
     });
@@ -2032,8 +2054,11 @@ describe("bb-app launcher", () => {
     const supervision = superviseFullStackProcesses({
       context: createTestStartContext(),
       delayMilliseconds: immediateDelay,
+      isHealthyServerAnswering: async () => false,
       isShutdownRequested: supervisor.shutdownRequested,
+      onServerMoved: unexpectedServerMove,
       processes: supervisor.processes,
+      readServerMovedFile: noServerMovedFile,
       startDaemon: supervisor.daemonStart,
       startServer: supervisor.serverStart,
     });
@@ -2059,8 +2084,11 @@ describe("bb-app launcher", () => {
     const supervision = superviseFullStackProcesses({
       context: createTestStartContext(),
       delayMilliseconds: immediateDelay,
+      isHealthyServerAnswering: async () => false,
       isShutdownRequested: supervisor.shutdownRequested,
+      onServerMoved: unexpectedServerMove,
       processes: supervisor.processes,
+      readServerMovedFile: noServerMovedFile,
       startDaemon: supervisor.daemonStart,
       startServer: supervisor.serverStart,
     });
@@ -2094,8 +2122,11 @@ describe("bb-app launcher", () => {
     const supervision = superviseFullStackProcesses({
       context: createTestStartContext(),
       delayMilliseconds: (args) => restartThrottle.delayMilliseconds(args),
+      isHealthyServerAnswering: async () => false,
       isShutdownRequested: supervisor.shutdownRequested,
+      onServerMoved: unexpectedServerMove,
       processes: supervisor.processes,
+      readServerMovedFile: noServerMovedFile,
       startDaemon: supervisor.daemonStart,
       startServer: supervisor.serverStart,
     });
@@ -2145,17 +2176,12 @@ describe("bb-app launcher", () => {
     expect(metadata.files).toContain(
       "host-daemon/dist/bb-plugin-host-worker.mjs",
     );
-    // The CLI entry imports its command groups from this chunk directory.
     expect(metadata.files).toContain("host-daemon/dist/bb");
     expect(metadata.files).toContain("host-daemon/dist/bb-chunks");
     expect(metadata.os).toEqual(["darwin", "linux"]);
   });
 
   it("requires the bundled CLI's chunk directory next to host-daemon/dist/bb", () => {
-    // A packaged layout (entrypoint under <packageRoot>/dist) with every
-    // artifact the launcher checked before the CLI was code-split. Without
-    // bb-chunks the artifact check used to pass and `bb --version` then died
-    // in Node's ESM loader with a raw ERR_MODULE_NOT_FOUND stack.
     const packageRoot = mkdtempSync(join(tmpdir(), "bb-app-artifacts-"));
     try {
       const context = resolveBbAppStartContext({
@@ -2180,22 +2206,25 @@ describe("bb-app launcher", () => {
         /^Missing bundled bb CLI chunks at .*\/host-daemon\/dist\/bb-chunks\. Rebuild bb-app/;
       expect(() => assertBbAppArtifacts(context)).toThrow(missingChunks);
 
-      // An empty directory (a copy interrupted after mkdir, say) fails the
-      // entry's static chunk import exactly like a missing one.
       const chunkDir = join(context.daemonBundleDir, "bb-chunks");
       mkdirSync(chunkDir);
       expect(() => assertBbAppArtifacts(context)).toThrow(missingChunks);
 
       writeFileSync(join(chunkDir, "chunk-AAAAAAAA.js"), "");
       expect(() => assertBbAppArtifacts(context)).not.toThrow();
+
+      rmSync(context.serverEntry);
+      rmSync(join(context.appDistDir, "index.html"));
+      expect(() => assertBbHostArtifacts(context)).not.toThrow();
+      expect(() => assertBbAppArtifacts(context)).toThrow(
+        /^Missing server entry/u,
+      );
     } finally {
       rmSync(packageRoot, { recursive: true, force: true });
     }
   });
 
   it("prunes stale bb CLI chunks from package build output", () => {
-    // `bb-app#build` runs this cleanup after copying the host-daemon output.
-    // Keep the graph tiny here so the expected publication inventory is clear.
     const pruneScript = resolve(
       dirname(fileURLToPath(import.meta.url)),
       "..",
@@ -2245,4 +2274,34 @@ describe("bb-app launcher", () => {
     expect(webServerEnv.BB_APP_SURFACE).toBe("web");
     expect(invalidSurfaceServerEnv.BB_APP_SURFACE).toBe("web");
   });
+});
+
+it("preserves machine identity and access headers through real config set and unset", async () => {
+  const dataDir = mkdtempSync(join(tmpdir(), "bb-app-config-machine-"));
+  const identity = {
+    serverUrl: "https://machine.example",
+    serverHeaders: { "x-bb-connect-machine": "private-machine-access" },
+    machineCredential: "legacy-private",
+    connectMachineId: "cloud-device",
+  };
+  try {
+    writeFileSync(join(dataDir, "config.json"), JSON.stringify(identity));
+    await runBbApp([
+      "--data-dir",
+      dataDir,
+      "config",
+      "set",
+      "BB_APP_URL",
+      "https://other.example",
+    ]);
+    expect(
+      JSON.parse(readFileSync(join(dataDir, "config.json"), "utf8")),
+    ).toMatchObject(identity);
+    await runBbApp(["--data-dir", dataDir, "config", "unset", "BB_APP_URL"]);
+    expect(
+      JSON.parse(readFileSync(join(dataDir, "config.json"), "utf8")),
+    ).toEqual(identity);
+  } finally {
+    rmSync(dataDir, { recursive: true, force: true });
+  }
 });

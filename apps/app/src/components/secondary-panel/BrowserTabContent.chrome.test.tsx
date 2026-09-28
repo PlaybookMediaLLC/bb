@@ -163,7 +163,35 @@ describe("BrowserTabContent persistent navigation", () => {
     expect(harness.goBack).toHaveBeenCalledWith("browser:test");
   });
 
-  it("restores native focus to the logical pane and reports page focus", async () => {
+  it.each(["Stop", "Take over"])(
+    "releases native control with %s",
+    async (action) => {
+      const harness = createBrowserChromeHarness();
+      const releaseControl = vi.fn();
+      harness.api.releaseControl = releaseControl;
+      harness.api.getControl = async () => ({
+        tabId: "browser:test",
+        threadId: "thread-1",
+        control: {
+          leaseId: "lease-1",
+          controllerLabel: "Browser agent",
+          expiresAt: Date.now() + 60_000,
+        },
+      });
+      renderBrowserChrome(harness, "https://example.com/docs");
+      const button = await screen.findByRole("button", {
+        name: action,
+      });
+      harness.focus.mockClear();
+      fireEvent.click(button);
+      expect(releaseControl).toHaveBeenCalledWith("browser:test");
+      if (action === "Take over")
+        expect(harness.focus).toHaveBeenCalledWith("browser:test");
+      else expect(harness.focus).not.toHaveBeenCalled();
+    },
+  );
+
+  it("restores a browser without taking focus and still reports explicit page focus", async () => {
     const harness = createBrowserChromeHarness();
     const onNativeFocus = vi.fn();
     renderBrowserChrome(harness, "https://example.com/docs", {
@@ -173,8 +201,9 @@ describe("BrowserTabContent persistent navigation", () => {
     });
 
     await waitFor(() =>
-      expect(harness.focus).toHaveBeenCalledWith("browser:test"),
+      expect(screen.getByLabelText("Address and search bar")).not.toBeNull(),
     );
+    expect(harness.focus).not.toHaveBeenCalled();
     act(() => harness.emitNativeFocus("browser:other"));
     expect(onNativeFocus).not.toHaveBeenCalled();
     act(() => harness.emitNativeFocus("browser:test"));

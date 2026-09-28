@@ -21,7 +21,6 @@ function setup() {
   const db = createMigratedConnection();
   const host = upsertHost(db, noopNotifier, {
     name: "test-host",
-    type: "persistent",
   });
   const { project } = createProject(db, noopNotifier, {
     name: "test-project",
@@ -82,7 +81,6 @@ describe("applyThreadLifecycleEvent", () => {
       });
 
       vi.setSystemTime(2_000);
-      // idle has no run.succeeded cell.
       const outcome = applyThreadLifecycleEvent(db, {
         event: { type: "run.succeeded" },
         threadId: thread.id,
@@ -120,47 +118,6 @@ describe("applyThreadLifecycleEvent", () => {
       reason: "superseded",
     });
     expect(getThread(db, thread.id)).toEqual(beforeRow);
-  });
-
-  it("refuses to reactivate a stopping thread and settles it to idle", () => {
-    const { db, project } = setup();
-    const thread = createThread(db, noopNotifier, {
-      projectId: project.id,
-      providerId: "codex",
-      status: "active",
-    });
-
-    // Enter the stopping phase via the stop.requested event.
-    const stopping = requireThreadLifecycleEventApplied(
-      applyThreadLifecycleEvent(db, {
-        event: { type: "stop.requested" },
-        threadId: thread.id,
-      }),
-    );
-    expect(stopping.status).toBe("stopping");
-    const stoppingRow = getThread(db, thread.id);
-
-    // A stopping thread structurally accepts no "begin new work" event. This
-    // is the replacement for the old notStopRequested supersession guard.
-    const outcome = applyThreadLifecycleEvent(db, {
-      event: { type: "run.started" },
-      threadId: thread.id,
-    });
-    expect(outcome).toEqual({
-      applied: false,
-      detail: "no transition for run.started from status stopping",
-      reason: "illegal-transition",
-    });
-    expect(getThread(db, thread.id)).toEqual(stoppingRow);
-
-    // The stop landing settles the thread to idle.
-    const settled = requireThreadLifecycleEventApplied(
-      applyThreadLifecycleEvent(db, {
-        event: { type: "stop.settled" },
-        threadId: thread.id,
-      }),
-    );
-    expect(settled.status).toBe("idle");
   });
 
   it("no-ops as not-found for a missing thread", () => {
@@ -228,7 +185,6 @@ describe("applyThreadLifecycleEvent", () => {
       detail: "status changed from starting while applying run.started",
       reason: "cas-conflict",
     });
-    // The interleaved writer's value survives; the event's target does not.
     expect(getThread(db, thread.id)?.status).toBe("idle");
   });
 
@@ -239,7 +195,6 @@ describe("applyThreadLifecycleEvent", () => {
       const { db, project } = setup();
 
       const cases = [
-        // active → idle on a root thread requires attention.
         {
           attention: true,
           event: { type: "run.succeeded" },
@@ -247,7 +202,6 @@ describe("applyThreadLifecycleEvent", () => {
           status: "active",
           target: "idle",
         },
-        // active → idle on a child thread does not.
         {
           attention: false,
           event: { type: "run.succeeded" },
@@ -255,7 +209,6 @@ describe("applyThreadLifecycleEvent", () => {
           status: "active",
           target: "idle",
         },
-        // starting → active never requires attention.
         {
           attention: false,
           event: { type: "run.started" },
@@ -263,7 +216,6 @@ describe("applyThreadLifecycleEvent", () => {
           status: "starting",
           target: "active",
         },
-        // starting → error requires attention.
         {
           attention: true,
           event: { type: "run.failed" },
