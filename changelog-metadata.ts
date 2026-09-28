@@ -4,6 +4,14 @@ type ReleaseMeta = {
 };
 
 export const RELEASE_META: Record<string, ReleaseMeta> = {
+  "0.39.2": {
+    date: "August 26, 2026",
+    headline: "marketing-harness release fixes and a faster CLI",
+  },
+  "0.39.1": {
+    date: "August 22, 2026",
+    headline: "Automated marketing-harness release pull requests",
+  },
   "0.44.0": {
     date: "September 25, 2026",
     headline: "Diff filtering, safer archiving, and plugin safe mode",
