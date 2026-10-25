@@ -8,21 +8,15 @@
 - Linux persistent host
 - Windows via Ubuntu on WSL2
 
-Minimum runtime: Node.js 22.19. Pi no longer sets the floor: its bridge is a
-plugin and the `pi` CLI is user-installed like `codex` and `claude`, so the
-22.19 line is bb's own tested floor (`install-machine.sh` and the root
-`engines` gate on it). A lower floor needs its own test pass before it moves.
+Supported Node.js runtimes include the October 2026 security fixes:
 
-Tested npm package runtimes:
+- Node.js 22.23.4 or newer in the Node.js 22 release line
+- Node.js 24.22.1 or newer in the Node.js 24 release line
+- Node.js 26.12.1 or newer in the Node.js 26 release line
 
-- Node.js 22.19 or newer in the Node.js 22 release line
-- Node.js 24 LTS
-- Node.js 26 Current
-
-Newer release lines are not blocked. `install-machine.sh` gates on the 22.19
-floor only, so a release line we have not tested yet still installs rather than
-failing hard on the day it ships. The `bb-app` npm `engines` field lists the
-tested lines, which npm surfaces as a warning rather than an install failure.
+The machine installer and CLI reject older or unsupported release lines before
+stopping an existing service. The root and `bb-app` package engines use the same
+security minimums.
 
 Windows support means the Linux stack runs entirely inside WSL2:
 

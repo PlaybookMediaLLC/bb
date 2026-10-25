@@ -275,12 +275,12 @@ bb there refuses to start the old server and runs as a regular machine.
 `bb server delete-old-copy` deletes the server files left behind and keeps that
 lock. The desktop app installs the persistent, self-updating service a
 CLI-installed machine gets as soon as its server moves, and on later launches
-if the service is missing; until that succeeds (it needs Node.js 22.19 or newer
+if the service is missing; until that succeeds (it needs Node.js 22.23.4+, 24.22.1+, or 26.12.1+
 on the PATH), the app keeps that machine connected only while it is open and
 explains why once. After a move from `bb-app`, or to retry by hand,
 `bb server install-machine-service [--data-dir <dir>] [--yes] [--json]` installs
 the same service: it needs
-Node.js 22.19 or newer on the PATH, stops bb running from that directory, and
+Node.js 22.23.4+, 24.22.1+, or 26.12.1+ on the PATH, stops bb running from that directory, and
 runs `install-machine.sh --adopt --data-dir <dir>`, which keeps the machine ID,
 downloads the new server's bb-app package, and installs the launchd or systemd
 service (`--json` prints `dataDir`, `serverUrl`, `toHostName`, and
