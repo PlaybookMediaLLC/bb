@@ -4,6 +4,7 @@ on:
   pull_request:
     types: [opened, synchronize, reopened, edited]
     branches: [develop, main]
+  workflow_dispatch:
 
 permissions:
   contents: read
@@ -15,16 +16,16 @@ jobs:
     steps:
       - name: Validate the target branch
         env:
-          BASE_REF: ${{ github.base_ref }}
-          HEAD_REF: ${{ github.head_ref }}
-          HEAD_REPOSITORY: ${{ github.event.pull_request.head.repo.full_name }}
+          BASE_REF: ${{ github.base_ref || 'main' }}
+          HEAD_REF: ${{ github.head_ref || github.ref_name }}
+          HEAD_REPOSITORY: ${{ github.event.pull_request.head.repo.full_name || github.repository }}
           BASE_REPOSITORY: ${{ github.repository }}
         run: |
           if [[ "$BASE_REF" == "develop" ]]; then
             exit 0
           fi
-          if [[ "$BASE_REF" == "main" && ( "$HEAD_REF" == "develop" || "$HEAD_REF" == "upstream" ) && "$HEAD_REPOSITORY" == "$BASE_REPOSITORY" ]]; then
+          if [[ "$BASE_REF" == "main" && ( "$HEAD_REF" == "develop" || "$HEAD_REF" == "upstream" || "$HEAD_REF" == "release-please--branches--main--components--marketing-harness" ) && "$HEAD_REPOSITORY" == "$BASE_REPOSITORY" ]]; then
             exit 0
           fi
-          echo "Work pull requests must target develop. Only this repository's develop or upstream branch may target main."
+          echo "Work pull requests must target develop. Only this repository's develop, upstream, or marketing-harness release branch may target main."
           exit 1

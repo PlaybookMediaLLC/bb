@@ -43,6 +43,7 @@ jobs:
           RELEASE_BRANCH="$(node -e 'const pr = JSON.parse(process.env.RELEASE_PR); process.stdout.write(pr.headBranchName)')"
           gh workflow run ci.yml --ref "$RELEASE_BRANCH"
           gh workflow run version-lockstep.yml --ref "$RELEASE_BRANCH"
+          gh workflow run branch-policy.yml --ref "$RELEASE_BRANCH"
 
       # A tag created with GITHUB_TOKEN does not trigger tag workflows. Start
       # the existing stable desktop publisher explicitly after release-please
