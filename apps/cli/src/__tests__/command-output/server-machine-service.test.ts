@@ -192,38 +192,41 @@ describe("bb server install-machine-service", () => {
     await expect(readFile(fixture.installerLog, "utf8")).rejects.toThrow();
   });
 
-  it("leaves bb running when node on the PATH is too old for the service", async () => {
-    const fixture = await createFixture();
-    const bb = await startRecordedBb(fixture);
-    const binDir = join(fixture.root, "bin");
-    await mkdir(binDir);
-    await writeFile(
-      join(binDir, "node"),
-      "#!/bin/sh\nprintf '%s\\n' 20.18.1\n",
-    );
-    await chmod(join(binDir, "node"), 0o755);
-    vi.stubEnv("PATH", [binDir, "/usr/bin", "/bin"].join(delimiter));
+  it.each(["20.18.1", "22.23.3", "24.22.0", "26.12.0", "23.11.0", "25.9.0"])(
+    "leaves bb running when Node %s on PATH is unsupported",
+    async (version) => {
+      const fixture = await createFixture();
+      const bb = await startRecordedBb(fixture);
+      const binDir = join(fixture.root, "bin");
+      await mkdir(binDir);
+      await writeFile(
+        join(binDir, "node"),
+        `#!/bin/sh\nprintf '%s\\n' ${version}\n`,
+      );
+      await chmod(join(binDir, "node"), 0o755);
+      vi.stubEnv("PATH", [binDir, "/usr/bin", "/bin"].join(delimiter));
 
-    await expect(
-      runCommand(
-        [
-          "server",
-          "install-machine-service",
-          "--data-dir",
-          fixture.dataDir,
-          "--yes",
-        ],
-        register,
-      ),
-    ).rejects.toThrow("process.exit:1");
+      await expect(
+        runCommand(
+          [
+            "server",
+            "install-machine-service",
+            "--data-dir",
+            fixture.dataDir,
+            "--yes",
+          ],
+          register,
+        ),
+      ).rejects.toThrow("process.exit:1");
 
-    expect(collectLogPayloads(vi.mocked(console.error))).toEqual([
-      "Error: The background service runs bb with the node on your PATH, which is Node.js 20.18.1. Install Node.js 22.19 or newer, then run this command again.",
-    ]);
-    expect(bb.exitCode).toBeNull();
-    expect(bb.signalCode).toBeNull();
-    await expect(readFile(fixture.installerLog, "utf8")).rejects.toThrow();
-  });
+      expect(collectLogPayloads(vi.mocked(console.error))).toEqual([
+        `Error: The background service runs bb with the node on your PATH, which is Node.js ${version}. Install Node.js 22.23.4+, 24.22.1+, or 26.12.1+, then run this command again.`,
+      ]);
+      expect(bb.exitCode).toBeNull();
+      expect(bb.signalCode).toBeNull();
+      await expect(readFile(fixture.installerLog, "utf8")).rejects.toThrow();
+    },
+  );
 
   it("reports an installer failure", async () => {
     const fixture = await createFixture();

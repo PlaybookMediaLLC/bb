@@ -60,7 +60,7 @@ jobs:
         if: ${{ inputs.build == 'true' }}
         uses: ./.github/actions/setup-workspace
         with:
-          node-version: "22.x"
+          node-version: "22.23.4"
           pnpm-version: ${{ env.PNPM_VERSION }}
           cache-prefix: mobile-probe
           turbo-cache: "false"
