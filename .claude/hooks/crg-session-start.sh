@@ -1,17 +1,4 @@
 #!/bin/bash
-# SessionStart hook for Claude Code cloud sessions: builds the code-review-graph
-# index in the background.
-#
-# The graph database (.code-review-graph/graph.db) is gitignored, so every new
-# cloud container starts without one. A full build from the CLI takes about
-# five minutes on a 4-core container (the MCP tool's single-threaded build
-# takes over ten), well past the 60s MCP tool timeout, and while it runs the
-# MCP tools answer from a partial graph without saying so. Starting the build
-# detached here means the graph is usually ready by the time an agent needs
-# it, and the context message below tells the agent how to check.
-#
-# Local sessions are left alone: developers run code-review-graph's own
-# install, watch and update hooks there.
 set -euo pipefail
 
 export PATH="$HOME/.local/bin:$PATH"
@@ -22,8 +9,6 @@ else
   crg=(uvx code-review-graph)
 fi
 
-# Runs detached from the hook. The lock stops a resume or compaction from
-# starting a second build while the first is still writing to the database.
 run_worker() {
   local repo="$1"
   exec 9>"$repo/.code-review-graph/session-build.lock"
@@ -32,8 +17,6 @@ run_worker() {
     return 0
   fi
 
-  # An interrupted build leaves a database that `update` would only patch,
-  # so anything short of a complete graph gets a full rebuild.
   local mode=build
   if "${crg[@]}" status --json --repo "$repo" 2>/dev/null |
     jq -e '.files > 0 and (.build_incomplete | not)' >/dev/null 2>&1; then
@@ -72,8 +55,6 @@ had_graph=false
 [ -f "$graph_dir/graph.db" ] && had_graph=true
 mkdir -p "$graph_dir"
 
-# Every descriptor is redirected so the hook returns at once instead of
-# waiting on the build's output.
 setsid nohup "${BASH_SOURCE[0]}" --worker "$repo" </dev/null >>"$log" 2>&1 &
 
 if [ "$had_graph" = true ]; then
